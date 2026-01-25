@@ -471,23 +471,8 @@ func generateRedisStatefulSet(rf *redisfailoverv1.RedisFailover, labels map[stri
 			},
 		)
 
-		// Add REDIS_PASSWORD env var for instance manager health checks
-		if rf.Spec.Auth.SecretPath != "" {
-			ss.Spec.Template.Spec.Containers[0].Env = append(
-				ss.Spec.Template.Spec.Containers[0].Env,
-				corev1.EnvVar{
-					Name: "REDIS_PASSWORD",
-					ValueFrom: &corev1.EnvVarSource{
-						SecretKeyRef: &corev1.SecretKeySelector{
-							LocalObjectReference: corev1.LocalObjectReference{
-								Name: rf.Spec.Auth.SecretPath,
-							},
-							Key: "password",
-						},
-					},
-				},
-			)
-		}
+		// Note: REDIS_PASSWORD env var is added by getRedisEnv() when auth is configured.
+		// The instance manager health server reads this env var to authenticate to Redis.
 	}
 
 	if rf.Spec.Redis.CustomLivenessProbe != nil {
