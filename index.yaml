@@ -465,6 +465,23 @@ entries:
     - https://github.com/spotahome/redis-operator/releases/download/Chart-3.1.2/redis-operator-3.1.2.tgz
     version: 3.1.2
   - apiVersion: v1
+    appVersion: v1.7.0
+    created: "2026-01-25T07:14:37.201742195Z"
+    description: A Helm chart for the Saremox Redis Operator
+    digest: 74b474427c83ab1bc7df4135d70bd59a3b979ead08ba4cac87a2a53a747bd29f
+    home: https://github.com/saremox/redis-operator
+    keywords:
+    - golang
+    - operator
+    - cluster
+    kubeVersion: '>=1.21.0-0'
+    name: redis-operator
+    sources:
+    - https://github.com/saremox/redis-operator
+    urls:
+    - https://github.com/buildio/redis-operator/releases/download/redis-operator-1.7.0/redis-operator-1.7.0.tgz
+    version: 1.7.0
+  - apiVersion: v1
     appVersion: v1.6.1
     created: "2026-01-25T03:09:24.13125416Z"
     description: A Helm chart for the Saremox Redis Operator
@@ -498,4 +515,4 @@ entries:
     urls:
     - https://github.com/buildio/redis-operator/releases/download/redis-operator-1.6.0/redis-operator-1.6.0.tgz
     version: 1.6.0
-generated: "2026-01-25T07:09:11.952021319Z"
+generated: "2026-01-25T07:14:37.201973505Z"
