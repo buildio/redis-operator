@@ -211,7 +211,11 @@ func TestSetMasterOnAllMakeMasterError(t *testing.T) {
 	assert.Error(err)
 }
 
-func TestSetMasterOnAllMakeSlaveOfError(t *testing.T) {
+// A slave that cannot be reached (MakeSlaveOf fails) is skipped rather than
+// aborting the heal, so the reachable slaves are still repointed at the new
+// master. The unreachable pod re-syncs via sentinel once its node recovers.
+// Part of the #674 fix.
+func TestSetMasterOnAllMakeSlaveOfErrorIsSkipped(t *testing.T) {
 	assert := assert.New(t)
 
 	rf := generateRF()
@@ -220,12 +224,17 @@ func TestSetMasterOnAllMakeSlaveOfError(t *testing.T) {
 		Items: []corev1.Pod{
 			{
 				Status: corev1.PodStatus{
-					PodIP: "0.0.0.0",
+					PodIP: "0.0.0.0", // new master
 				},
 			},
 			{
 				Status: corev1.PodStatus{
-					PodIP: "1.1.1.1",
+					PodIP: "1.1.1.1", // unreachable old master
+				},
+			},
+			{
+				Status: corev1.PodStatus{
+					PodIP: "2.2.2.2", // reachable slave
 				},
 			},
 		},
@@ -236,12 +245,15 @@ func TestSetMasterOnAllMakeSlaveOfError(t *testing.T) {
 	ms.On("UpdatePodLabels", namespace, mock.AnythingOfType("string"), mock.Anything).Return(nil)
 	mr := &mRedisService.Client{}
 	mr.On("IsMaster", "0.0.0.0", "0", "").Return(true, nil)
-	mr.On("MakeSlaveOfWithPort", "1.1.1.1", "0.0.0.0", "0", "").Once().Return(errors.New(""))
+	mr.On("MakeSlaveOfWithPort", "1.1.1.1", "0.0.0.0", "0", "").Once().Return(errors.New("i/o timeout"))
+	// The reachable slave must still be repointed even though the previous pod failed.
+	mr.On("MakeSlaveOfWithPort", "2.2.2.2", "0.0.0.0", "0", "").Once().Return(nil)
 
 	healer := rfservice.NewRedisFailoverHealer(ms, mr, log.DummyLogger{})
 
 	err := healer.SetMasterOnAll("0.0.0.0", rf)
-	assert.Error(err)
+	assert.NoError(err)
+	mr.AssertExpectations(t) // proves the reachable slave was still reconfigured
 }
 
 func TestSetMasterOnAll(t *testing.T) {
@@ -275,6 +287,70 @@ func TestSetMasterOnAll(t *testing.T) {
 
 	err := healer.SetMasterOnAll("0.0.0.0", rf)
 	assert.NoError(err)
+}
+
+func TestSetMasterOnAllRejectsIPNotOwnedByRF(t *testing.T) {
+	assert := assert.New(t)
+
+	rf := generateRF()
+
+	// None of this RedisFailover's own pods have this IP: it could be a stale
+	// value resolved earlier in the reconcile that's since been reassigned to
+	// an unrelated pod, possibly in a different namespace/RedisFailover. See
+	// https://github.com/spotahome/redis-operator/issues/698.
+	pods := &corev1.PodList{
+		Items: []corev1.Pod{
+			{Status: corev1.PodStatus{PodIP: "1.1.1.1"}},
+			{Status: corev1.PodStatus{PodIP: "2.2.2.2"}},
+		},
+	}
+
+	ms := &mK8SService.Services{}
+	ms.On("GetStatefulSetPods", namespace, rfservice.GetRedisName(rf)).Once().Return(pods, nil)
+	mr := &mRedisService.Client{}
+
+	healer := rfservice.NewRedisFailoverHealer(ms, mr, log.DummyLogger{})
+
+	err := healer.SetMasterOnAll("9.9.9.9", rf)
+	assert.Error(err, "should refuse to act on an IP that isn't currently one of this RedisFailover's own pods")
+	ms.AssertExpectations(t)
+	mr.AssertExpectations(t) // no IsMaster/MakeSlaveOfWithPort calls should have happened
+}
+
+func TestSetMasterOnAllSlaveAlreadyLabeled(t *testing.T) {
+	assert := assert.New(t)
+
+	rf := generateRF()
+
+	pods := &corev1.PodList{
+		Items: []corev1.Pod{
+			{
+				Status: corev1.PodStatus{
+					PodIP: "0.0.0.0",
+				},
+			},
+			{
+				ObjectMeta: metav1.ObjectMeta{
+					Labels: map[string]string{"redisfailovers-role": "slave"},
+				},
+				Status: corev1.PodStatus{
+					PodIP: "1.1.1.1",
+				},
+			},
+		},
+	}
+
+	ms := &mK8SService.Services{}
+	ms.On("GetStatefulSetPods", namespace, rfservice.GetRedisName(rf)).Once().Return(pods, nil)
+	mr := &mRedisService.Client{}
+	mr.On("IsMaster", "0.0.0.0", "0", "").Return(true, nil)
+	mr.On("MakeSlaveOfWithPort", "1.1.1.1", "0.0.0.0", "0", "").Once().Return(nil)
+
+	healer := rfservice.NewRedisFailoverHealer(ms, mr, log.DummyLogger{})
+
+	err := healer.SetMasterOnAll("0.0.0.0", rf)
+	assert.NoError(err)
+	ms.AssertExpectations(t) // pod already has the slave label, so UpdatePodLabels must not be called
 }
 
 func TestSetExternalMasterOnAll(t *testing.T) {
@@ -351,6 +427,201 @@ func TestSetExternalMasterOnAll(t *testing.T) {
 	}
 }
 
+func TestPromoteBestReplicaSuccess(t *testing.T) {
+	assert := assert.New(t)
+	rf := generateRF()
+
+	newMasterIP := "1.1.1.1"
+	replicaIP := "2.2.2.2"
+
+	pods := &corev1.PodList{
+		Items: []corev1.Pod{
+			{
+				ObjectMeta: metav1.ObjectMeta{Name: "pod-master"},
+				Status: corev1.PodStatus{
+					PodIP: newMasterIP,
+					Phase: corev1.PodRunning,
+				},
+			},
+			{
+				ObjectMeta: metav1.ObjectMeta{Name: "pod-replica"},
+				Status: corev1.PodStatus{
+					PodIP: replicaIP,
+					Phase: corev1.PodRunning,
+				},
+			},
+		},
+	}
+
+	ms := &mK8SService.Services{}
+	ms.On("GetStatefulSetPods", namespace, rfservice.GetRedisName(rf)).Once().Return(pods, nil)
+	ms.On("UpdatePodLabels", namespace, mock.AnythingOfType("string"), mock.Anything).Return(nil)
+
+	mr := &mRedisService.Client{}
+	mr.On("MakeMaster", newMasterIP, "0", "").Once().Return(nil)
+	mr.On("MakeSlaveOfWithPort", replicaIP, newMasterIP, "0", "").Once().Return(nil)
+
+	healer := rfservice.NewRedisFailoverHealer(ms, mr, log.DummyLogger{})
+
+	err := healer.PromoteBestReplica(newMasterIP, rf)
+	assert.NoError(err)
+	ms.AssertExpectations(t)
+	mr.AssertExpectations(t)
+}
+
+func TestPromoteBestReplicaReplicaRepointerFails(t *testing.T) {
+	assert := assert.New(t)
+	rf := generateRF()
+
+	newMasterIP := "1.1.1.1"
+	replicaIP := "2.2.2.2"
+
+	pods := &corev1.PodList{
+		Items: []corev1.Pod{
+			{
+				ObjectMeta: metav1.ObjectMeta{Name: "pod-master"},
+				Status: corev1.PodStatus{
+					PodIP: newMasterIP,
+					Phase: corev1.PodRunning,
+				},
+			},
+			{
+				ObjectMeta: metav1.ObjectMeta{Name: "pod-replica"},
+				Status: corev1.PodStatus{
+					PodIP: replicaIP,
+					Phase: corev1.PodRunning,
+				},
+			},
+		},
+	}
+
+	ms := &mK8SService.Services{}
+	ms.On("GetStatefulSetPods", namespace, rfservice.GetRedisName(rf)).Once().Return(pods, nil)
+	ms.On("UpdatePodLabels", namespace, "pod-master", mock.Anything).Return(nil)
+
+	mr := &mRedisService.Client{}
+	mr.On("MakeMaster", newMasterIP, "0", "").Once().Return(nil)
+	mr.On("MakeSlaveOfWithPort", replicaIP, newMasterIP, "0", "").Once().Return(errors.New("replica repoint failed"))
+
+	healer := rfservice.NewRedisFailoverHealer(ms, mr, log.DummyLogger{})
+
+	err := healer.PromoteBestReplica(newMasterIP, rf)
+	assert.Error(err, "partial failover should not be reported as success")
+	assert.True(errors.Is(err, rfservice.ErrPartialReconciliation), "replica repoint failure should be wrapped as ErrPartialReconciliation")
+	ms.AssertExpectations(t)
+	mr.AssertExpectations(t)
+}
+
+func TestPromoteBestReplicaLabelUpdateFails(t *testing.T) {
+	assert := assert.New(t)
+	rf := generateRF()
+
+	newMasterIP := "1.1.1.1"
+	replicaIP := "2.2.2.2"
+
+	pods := &corev1.PodList{
+		Items: []corev1.Pod{
+			{
+				ObjectMeta: metav1.ObjectMeta{Name: "pod-master"},
+				Status: corev1.PodStatus{
+					PodIP: newMasterIP,
+					Phase: corev1.PodRunning,
+				},
+			},
+			{
+				ObjectMeta: metav1.ObjectMeta{Name: "pod-replica"},
+				Status: corev1.PodStatus{
+					PodIP: replicaIP,
+					Phase: corev1.PodRunning,
+				},
+			},
+		},
+	}
+
+	ms := &mK8SService.Services{}
+	ms.On("GetStatefulSetPods", namespace, rfservice.GetRedisName(rf)).Once().Return(pods, nil)
+	ms.On("UpdatePodLabels", namespace, "pod-master", mock.Anything).Return(nil)
+	ms.On("UpdatePodLabels", namespace, "pod-replica", mock.Anything).Return(errors.New("label update failed"))
+
+	mr := &mRedisService.Client{}
+	mr.On("MakeMaster", newMasterIP, "0", "").Once().Return(nil)
+	mr.On("MakeSlaveOfWithPort", replicaIP, newMasterIP, "0", "").Once().Return(nil)
+
+	healer := rfservice.NewRedisFailoverHealer(ms, mr, log.DummyLogger{})
+
+	err := healer.PromoteBestReplica(newMasterIP, rf)
+	assert.Error(err, "label update failure should not be reported as success")
+	assert.True(errors.Is(err, rfservice.ErrPartialReconciliation), "slave label update failure should be wrapped as ErrPartialReconciliation")
+	ms.AssertExpectations(t)
+	mr.AssertExpectations(t)
+}
+
+func TestPromoteBestReplicaMakeMasterFails(t *testing.T) {
+	assert := assert.New(t)
+	rf := generateRF()
+
+	newMasterIP := "1.1.1.1"
+
+	pods := &corev1.PodList{
+		Items: []corev1.Pod{
+			{
+				ObjectMeta: metav1.ObjectMeta{Name: "pod-master"},
+				Status: corev1.PodStatus{
+					PodIP: newMasterIP,
+					Phase: corev1.PodRunning,
+				},
+			},
+		},
+	}
+
+	ms := &mK8SService.Services{}
+	ms.On("GetStatefulSetPods", namespace, rfservice.GetRedisName(rf)).Once().Return(pods, nil)
+	mr := &mRedisService.Client{}
+	mr.On("MakeMaster", newMasterIP, "0", "").Once().Return(errors.New("promotion failed"))
+
+	healer := rfservice.NewRedisFailoverHealer(ms, mr, log.DummyLogger{})
+
+	err := healer.PromoteBestReplica(newMasterIP, rf)
+	assert.Error(err, "MakeMaster failure should return an error")
+	assert.False(errors.Is(err, rfservice.ErrPartialReconciliation), "full promotion failure should not be wrapped as ErrPartialReconciliation")
+	ms.AssertExpectations(t)
+	mr.AssertExpectations(t)
+}
+
+func TestPromoteBestReplicaRejectsIPNotOwnedByRF(t *testing.T) {
+	assert := assert.New(t)
+	rf := generateRF()
+
+	// newMasterIP isn't a pod of this RedisFailover: refuse to promote it
+	// rather than blindly issuing MakeMaster against a possibly-foreign
+	// instance. See https://github.com/spotahome/redis-operator/issues/698.
+	newMasterIP := "9.9.9.9"
+
+	pods := &corev1.PodList{
+		Items: []corev1.Pod{
+			{
+				ObjectMeta: metav1.ObjectMeta{Name: "pod-replica"},
+				Status: corev1.PodStatus{
+					PodIP: "2.2.2.2",
+					Phase: corev1.PodRunning,
+				},
+			},
+		},
+	}
+
+	ms := &mK8SService.Services{}
+	ms.On("GetStatefulSetPods", namespace, rfservice.GetRedisName(rf)).Once().Return(pods, nil)
+	mr := &mRedisService.Client{}
+
+	healer := rfservice.NewRedisFailoverHealer(ms, mr, log.DummyLogger{})
+
+	err := healer.PromoteBestReplica(newMasterIP, rf)
+	assert.Error(err, "should refuse to promote an IP that isn't currently one of this RedisFailover's own pods")
+	assert.False(errors.Is(err, rfservice.ErrPartialReconciliation))
+	ms.AssertExpectations(t)
+	mr.AssertExpectations(t) // no MakeMaster call should have happened
+}
+
 func TestNewSentinelMonitor(t *testing.T) {
 	tests := []struct {
 		name                string
@@ -393,6 +664,350 @@ func TestNewSentinelMonitor(t *testing.T) {
 			mr.AssertExpectations(t)
 		})
 	}
+}
+
+func TestNewSentinelMonitorPasswordError(t *testing.T) {
+	assert := assert.New(t)
+
+	rf := generateRF()
+	rf.Spec.Auth.SecretPath = "redis-secret"
+
+	ms := &mK8SService.Services{}
+	ms.On("GetSecret", namespace, "redis-secret").Once().Return(nil, errors.New("secret unavailable"))
+	mr := &mRedisService.Client{}
+
+	healer := rfservice.NewRedisFailoverHealer(ms, mr, log.DummyLogger{})
+
+	err := healer.NewSentinelMonitor("0.0.0.0", "1.1.1.1", rf)
+	assert.Error(err)
+	mr.AssertExpectations(t) // no MonitorRedisWithPort call should have happened
+}
+
+func TestNewSentinelMonitorWithPortPasswordError(t *testing.T) {
+	assert := assert.New(t)
+
+	rf := generateRF()
+	rf.Spec.Auth.SecretPath = "redis-secret"
+
+	ms := &mK8SService.Services{}
+	ms.On("GetSecret", namespace, "redis-secret").Once().Return(nil, errors.New("secret unavailable"))
+	mr := &mRedisService.Client{}
+
+	healer := rfservice.NewRedisFailoverHealer(ms, mr, log.DummyLogger{})
+
+	err := healer.NewSentinelMonitorWithPort("0.0.0.0", "1.1.1.1", "6379", rf)
+	assert.Error(err)
+	mr.AssertExpectations(t) // no MonitorRedisWithPort call should have happened
+}
+
+// --- MakeMaster ---
+
+func TestMakeMasterPasswordError(t *testing.T) {
+	assert := assert.New(t)
+
+	rf := generateRF()
+	rf.Spec.Auth.SecretPath = "redis-secret"
+
+	ms := &mK8SService.Services{}
+	ms.On("GetSecret", namespace, "redis-secret").Once().Return(nil, errors.New("secret unavailable"))
+	mr := &mRedisService.Client{}
+
+	healer := rfservice.NewRedisFailoverHealer(ms, mr, log.DummyLogger{})
+
+	err := healer.MakeMaster("1.1.1.1", rf)
+	assert.Error(err)
+	ms.AssertExpectations(t)
+	mr.AssertExpectations(t) // no redis MakeMaster call should have happened
+}
+
+func TestMakeMasterRedisClientError(t *testing.T) {
+	assert := assert.New(t)
+
+	rf := generateRF()
+
+	ms := &mK8SService.Services{}
+	mr := &mRedisService.Client{}
+	mr.On("MakeMaster", "1.1.1.1", "0", "").Once().Return(errors.New("redis unreachable"))
+
+	healer := rfservice.NewRedisFailoverHealer(ms, mr, log.DummyLogger{})
+
+	err := healer.MakeMaster("1.1.1.1", rf)
+	assert.Error(err)
+	ms.AssertExpectations(t) // no GetStatefulSetPods call should have happened
+}
+
+func TestMakeMasterGetStatefulSetPodsError(t *testing.T) {
+	assert := assert.New(t)
+
+	rf := generateRF()
+
+	ms := &mK8SService.Services{}
+	ms.On("GetStatefulSetPods", namespace, rfservice.GetRedisName(rf)).Once().Return(nil, errors.New("boom"))
+	mr := &mRedisService.Client{}
+	mr.On("MakeMaster", "1.1.1.1", "0", "").Once().Return(nil)
+
+	healer := rfservice.NewRedisFailoverHealer(ms, mr, log.DummyLogger{})
+
+	err := healer.MakeMaster("1.1.1.1", rf)
+	assert.Error(err)
+}
+
+func TestMakeMasterSetsLabelOnMatchingPod(t *testing.T) {
+	assert := assert.New(t)
+
+	rf := generateRF()
+
+	pods := &corev1.PodList{
+		Items: []corev1.Pod{
+			{
+				ObjectMeta: metav1.ObjectMeta{Name: "redis-0"},
+				Status:     corev1.PodStatus{PodIP: "1.1.1.1"},
+			},
+			{
+				ObjectMeta: metav1.ObjectMeta{Name: "redis-1"},
+				Status:     corev1.PodStatus{PodIP: "2.2.2.2"},
+			},
+		},
+	}
+
+	ms := &mK8SService.Services{}
+	ms.On("GetStatefulSetPods", namespace, rfservice.GetRedisName(rf)).Once().Return(pods, nil)
+	ms.On("UpdatePodLabels", namespace, "redis-0", mock.Anything).Once().Return(nil)
+	mr := &mRedisService.Client{}
+	mr.On("MakeMaster", "1.1.1.1", "0", "").Once().Return(nil)
+
+	healer := rfservice.NewRedisFailoverHealer(ms, mr, log.DummyLogger{})
+
+	err := healer.MakeMaster("1.1.1.1", rf)
+	assert.NoError(err)
+	ms.AssertExpectations(t) // label update must target the matching pod only
+}
+
+func TestMakeMasterSkipsLabelUpdateWhenAlreadyMaster(t *testing.T) {
+	assert := assert.New(t)
+
+	rf := generateRF()
+
+	pods := &corev1.PodList{
+		Items: []corev1.Pod{
+			{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:   "redis-0",
+					Labels: map[string]string{"redisfailovers-role": "master"},
+				},
+				Status: corev1.PodStatus{PodIP: "1.1.1.1"},
+			},
+		},
+	}
+
+	ms := &mK8SService.Services{}
+	ms.On("GetStatefulSetPods", namespace, rfservice.GetRedisName(rf)).Once().Return(pods, nil)
+	mr := &mRedisService.Client{}
+	mr.On("MakeMaster", "1.1.1.1", "0", "").Once().Return(nil)
+
+	healer := rfservice.NewRedisFailoverHealer(ms, mr, log.DummyLogger{})
+
+	err := healer.MakeMaster("1.1.1.1", rf)
+	assert.NoError(err)
+	ms.AssertExpectations(t) // no UpdatePodLabels call should have happened, the pod is already labeled master
+}
+
+func TestMakeMasterLabelUpdateError(t *testing.T) {
+	assert := assert.New(t)
+
+	rf := generateRF()
+
+	pods := &corev1.PodList{
+		Items: []corev1.Pod{
+			{
+				ObjectMeta: metav1.ObjectMeta{Name: "redis-0"},
+				Status:     corev1.PodStatus{PodIP: "1.1.1.1"},
+			},
+		},
+	}
+
+	ms := &mK8SService.Services{}
+	ms.On("GetStatefulSetPods", namespace, rfservice.GetRedisName(rf)).Once().Return(pods, nil)
+	ms.On("UpdatePodLabels", namespace, "redis-0", mock.Anything).Once().Return(errors.New("label update failed"))
+	mr := &mRedisService.Client{}
+	mr.On("MakeMaster", "1.1.1.1", "0", "").Once().Return(nil)
+
+	healer := rfservice.NewRedisFailoverHealer(ms, mr, log.DummyLogger{})
+
+	err := healer.MakeMaster("1.1.1.1", rf)
+	assert.Error(err)
+}
+
+func TestMakeMasterNoMatchingPodReturnsNil(t *testing.T) {
+	assert := assert.New(t)
+
+	rf := generateRF()
+
+	pods := &corev1.PodList{
+		Items: []corev1.Pod{
+			{
+				ObjectMeta: metav1.ObjectMeta{Name: "redis-0"},
+				Status:     corev1.PodStatus{PodIP: "9.9.9.9"},
+			},
+		},
+	}
+
+	ms := &mK8SService.Services{}
+	ms.On("GetStatefulSetPods", namespace, rfservice.GetRedisName(rf)).Once().Return(pods, nil)
+	mr := &mRedisService.Client{}
+	mr.On("MakeMaster", "1.1.1.1", "0", "").Once().Return(nil)
+
+	healer := rfservice.NewRedisFailoverHealer(ms, mr, log.DummyLogger{})
+
+	err := healer.MakeMaster("1.1.1.1", rf)
+	assert.NoError(err)
+	ms.AssertExpectations(t) // no UpdatePodLabels call should have happened, no pod matched the ip
+}
+
+// --- RestoreSentinel ---
+
+func TestRestoreSentinel(t *testing.T) {
+	assert := assert.New(t)
+
+	ms := &mK8SService.Services{}
+	mr := &mRedisService.Client{}
+	mr.On("ResetSentinel", "1.1.1.1").Once().Return(nil)
+
+	healer := rfservice.NewRedisFailoverHealer(ms, mr, log.DummyLogger{})
+
+	err := healer.RestoreSentinel("1.1.1.1")
+	assert.NoError(err)
+}
+
+func TestRestoreSentinelError(t *testing.T) {
+	assert := assert.New(t)
+
+	ms := &mK8SService.Services{}
+	mr := &mRedisService.Client{}
+	mr.On("ResetSentinel", "1.1.1.1").Once().Return(errors.New("reset failed"))
+
+	healer := rfservice.NewRedisFailoverHealer(ms, mr, log.DummyLogger{})
+
+	err := healer.RestoreSentinel("1.1.1.1")
+	assert.Error(err)
+}
+
+// --- SetSentinelCustomConfig ---
+
+func TestSetSentinelCustomConfig(t *testing.T) {
+	assert := assert.New(t)
+
+	rf := generateRF()
+	rf.Spec.Sentinel.CustomConfig = []string{"down-after-milliseconds 5000"}
+
+	ms := &mK8SService.Services{}
+	mr := &mRedisService.Client{}
+	mr.On("SetCustomSentinelConfig", "1.1.1.1", []string{"down-after-milliseconds 5000"}).Once().Return(nil)
+
+	healer := rfservice.NewRedisFailoverHealer(ms, mr, log.DummyLogger{})
+
+	err := healer.SetSentinelCustomConfig("1.1.1.1", rf)
+	assert.NoError(err)
+}
+
+func TestSetSentinelCustomConfigError(t *testing.T) {
+	assert := assert.New(t)
+
+	rf := generateRF()
+	rf.Spec.Sentinel.CustomConfig = []string{"down-after-milliseconds 5000"}
+
+	ms := &mK8SService.Services{}
+	mr := &mRedisService.Client{}
+	mr.On("SetCustomSentinelConfig", "1.1.1.1", []string{"down-after-milliseconds 5000"}).Once().Return(errors.New("set failed"))
+
+	healer := rfservice.NewRedisFailoverHealer(ms, mr, log.DummyLogger{})
+
+	err := healer.SetSentinelCustomConfig("1.1.1.1", rf)
+	assert.Error(err)
+}
+
+// --- SetRedisCustomConfig ---
+
+func TestSetRedisCustomConfigPasswordError(t *testing.T) {
+	assert := assert.New(t)
+
+	rf := generateRF()
+	rf.Spec.Auth.SecretPath = "redis-secret"
+	rf.Spec.Redis.CustomConfig = []string{"maxmemory 100mb"}
+
+	ms := &mK8SService.Services{}
+	ms.On("GetSecret", namespace, "redis-secret").Once().Return(nil, errors.New("secret unavailable"))
+	mr := &mRedisService.Client{}
+
+	healer := rfservice.NewRedisFailoverHealer(ms, mr, log.DummyLogger{})
+
+	err := healer.SetRedisCustomConfig("1.1.1.1", rf)
+	assert.Error(err)
+	mr.AssertExpectations(t) // no SetCustomRedisConfig call should have happened
+}
+
+func TestSetRedisCustomConfig(t *testing.T) {
+	assert := assert.New(t)
+
+	rf := generateRF()
+	rf.Spec.Redis.CustomConfig = []string{"maxmemory 100mb"}
+
+	ms := &mK8SService.Services{}
+	mr := &mRedisService.Client{}
+	mr.On("SetCustomRedisConfig", "1.1.1.1", "0", []string{"maxmemory 100mb"}, "").Once().Return(nil)
+
+	healer := rfservice.NewRedisFailoverHealer(ms, mr, log.DummyLogger{})
+
+	err := healer.SetRedisCustomConfig("1.1.1.1", rf)
+	assert.NoError(err)
+}
+
+func TestSetRedisCustomConfigError(t *testing.T) {
+	assert := assert.New(t)
+
+	rf := generateRF()
+	rf.Spec.Redis.CustomConfig = []string{"maxmemory 100mb"}
+
+	ms := &mK8SService.Services{}
+	mr := &mRedisService.Client{}
+	mr.On("SetCustomRedisConfig", "1.1.1.1", "0", []string{"maxmemory 100mb"}, "").Once().Return(errors.New("set failed"))
+
+	healer := rfservice.NewRedisFailoverHealer(ms, mr, log.DummyLogger{})
+
+	err := healer.SetRedisCustomConfig("1.1.1.1", rf)
+	assert.Error(err)
+}
+
+// --- DeletePod ---
+
+func TestDeletePod(t *testing.T) {
+	assert := assert.New(t)
+
+	rf := generateRF()
+
+	ms := &mK8SService.Services{}
+	ms.On("DeletePod", namespace, "redis-0").Once().Return(nil)
+	mr := &mRedisService.Client{}
+
+	healer := rfservice.NewRedisFailoverHealer(ms, mr, log.DummyLogger{})
+
+	err := healer.DeletePod("redis-0", rf)
+	assert.NoError(err)
+}
+
+func TestDeletePodError(t *testing.T) {
+	assert := assert.New(t)
+
+	rf := generateRF()
+
+	ms := &mK8SService.Services{}
+	ms.On("DeletePod", namespace, "redis-0").Once().Return(errors.New("delete failed"))
+	mr := &mRedisService.Client{}
+
+	healer := rfservice.NewRedisFailoverHealer(ms, mr, log.DummyLogger{})
+
+	err := healer.DeletePod("redis-0", rf)
+	assert.Error(err)
 }
 
 func TestNewSentinelMonitorWithPort(t *testing.T) {

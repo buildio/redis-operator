@@ -2,6 +2,8 @@ package service
 
 import (
 	"bytes"
+	"crypto/hmac"
+	"crypto/sha256"
 	"fmt"
 	"strings"
 	"text/template"
@@ -62,7 +64,7 @@ func generateSentinelService(rf *redisfailoverv1.RedisFailover, labels map[strin
 	selectorLabels := generateSelectorLabels(sentinelRoleName, rf.Name)
 	labels = util.MergeLabels(labels, selectorLabels)
 
-	return &corev1.Service{
+	svc := &corev1.Service{
 		ObjectMeta: metav1.ObjectMeta{
 			Name:            name,
 			Namespace:       namespace,
@@ -82,6 +84,19 @@ func generateSentinelService(rf *redisfailoverv1.RedisFailover, labels map[strin
 			},
 		},
 	}
+
+	// The sentinel exporter sidecar listens on sentinelExporterPort, but without
+	// a matching service port there is no way to scrape it through the service.
+	if rf.Spec.Sentinel.Exporter.Enabled {
+		svc.Spec.Ports = append(svc.Spec.Ports, corev1.ServicePort{
+			Name:       "metrics",
+			Port:       sentinelExporterPort,
+			TargetPort: intstr.FromInt(sentinelExporterPort),
+			Protocol:   corev1.ProtocolTCP,
+		})
+	}
+
+	return svc
 }
 
 func generateRedisService(rf *redisfailoverv1.RedisFailover, labels map[string]string, ownerRefs []metav1.OwnerReference) *corev1.Service {
@@ -217,7 +232,7 @@ func generateSentinelConfigMap(rf *redisfailoverv1.RedisFailover, labels map[str
 	}
 }
 
-func generateRedisConfigMap(rf *redisfailoverv1.RedisFailover, labels map[string]string, ownerRefs []metav1.OwnerReference, password string) *corev1.ConfigMap {
+func generateRedisConfigMap(rf *redisfailoverv1.RedisFailover, labels map[string]string, ownerRefs []metav1.OwnerReference) *corev1.ConfigMap {
 	name := GetRedisName(rf)
 	labels = util.MergeLabels(labels, generateSelectorLabels(redisRoleName, rf.Name))
 
@@ -231,11 +246,10 @@ func generateRedisConfigMap(rf *redisfailoverv1.RedisFailover, labels map[string
 		panic(err)
 	}
 
+	// The password is intentionally NOT written here. requirepass/masterauth are
+	// passed to redis-server as command-line args from the REDIS_PASSWORD env
+	// (see getRedisCommand) so the secret never lands in this ConfigMap.
 	redisConfigFileContent := tplOutput.String()
-
-	if password != "" {
-		redisConfigFileContent = fmt.Sprintf("%s\nmasterauth %s\nrequirepass %s", redisConfigFileContent, password, password)
-	}
 
 	return &corev1.ConfigMap{
 		ObjectMeta: metav1.ObjectMeta{
@@ -257,13 +271,37 @@ func generateRedisShutdownConfigMap(rf *redisfailoverv1.RedisFailover, labels ma
 	rfName := strings.ReplaceAll(strings.ToUpper(rf.Name), "-", "_")
 
 	labels = util.MergeLabels(labels, generateSelectorLabels(redisRoleName, rf.Name))
-
 	var shutdownContent string
 	if rf.SentinelEnabled() {
-		// Standard shutdown with Sentinel failover
-		shutdownContent = fmt.Sprintf(`master=$(redis-cli -h ${RFS_%[1]v_SERVICE_HOST} -p ${RFS_%[1]v_SERVICE_PORT_SENTINEL} --csv SENTINEL get-master-addr-by-name mymaster | tr ',' ' ' | tr -d '\"' |cut -d' ' -f1)
+		// Runs as the preStop hook under /bin/sh, which is BusyBox ash on the
+		// alpine redis images, so this has to stay POSIX: no "let", no "[[ ]]".
+		// A single failed sentinel query used to be enough to skip the failover
+		// and shut the master down anyway, so both sentinel calls are retried.
+		shutdownContent = fmt.Sprintf(`master=""
+retries=0
+while [ -z "$master" ] && [ "$retries" -lt 3 ]; do
+	retries=$((retries + 1))
+	master=$(redis-cli -h ${RFS_%[1]v_SERVICE_HOST} -p ${RFS_%[1]v_SERVICE_PORT_SENTINEL} --csv SENTINEL get-master-addr-by-name mymaster | tr ',' ' ' | tr -d '\"' |cut -d' ' -f1)
+	if [ -z "$master" ]; then
+		sleep 3
+	fi
+done
+if [ -z "$master" ]; then
+	echo "shutdown.sh: could not resolve the master from sentinel after $retries attempts" >&2
+fi
 if [ "$master" = "$(hostname -i)" ]; then
-  redis-cli -h ${RFS_%[1]v_SERVICE_HOST} -p ${RFS_%[1]v_SERVICE_PORT_SENTINEL} SENTINEL failover mymaster
+  failover=""
+  retries=0
+  while [ "$failover" != "OK" ] && [ "$retries" -lt 3 ]; do
+  	retries=$((retries + 1))
+  	failover=$(redis-cli -h ${RFS_%[1]v_SERVICE_HOST} -p ${RFS_%[1]v_SERVICE_PORT_SENTINEL} SENTINEL failover mymaster)
+  	if [ "$failover" != "OK" ]; then
+  		sleep 3
+  	fi
+  done
+  if [ "$failover" != "OK" ]; then
+  	echo "shutdown.sh: sentinel did not accept the failover after $retries attempts: $failover" >&2
+  fi
   sleep 31
 fi
 cmd="redis-cli -p %[2]v"
@@ -356,7 +394,7 @@ esac`, port)
 	}
 }
 
-func generateRedisStatefulSet(rf *redisfailoverv1.RedisFailover, labels map[string]string, ownerRefs []metav1.OwnerReference) *appsv1.StatefulSet {
+func generateRedisStatefulSet(rf *redisfailoverv1.RedisFailover, labels map[string]string, ownerRefs []metav1.OwnerReference, password string) *appsv1.StatefulSet {
 	name := GetRedisName(rf)
 	namespace := rf.Namespace
 
@@ -364,6 +402,13 @@ func generateRedisStatefulSet(rf *redisfailoverv1.RedisFailover, labels map[stri
 	selectorLabels := generateSelectorLabels(redisRoleName, rf.Name)
 	labels = util.MergeLabels(labels, selectorLabels)
 	labels = util.MergeLabels(labels, generateRedisDefaultRoleLabel())
+
+	mac := hmac.New(sha256.New, []byte(rf.Namespace+"/"+rf.Name))
+	_, _ = mac.Write([]byte(password))
+	authSecretChecksum := fmt.Sprintf("%x", mac.Sum(nil))
+	podAnnotations := util.MergeAnnotations(rf.Spec.Redis.PodAnnotations, map[string]string{
+		redisAuthSecretChecksumAnnotation: authSecretChecksum,
+	})
 
 	volumeMounts := getRedisVolumeMounts(rf)
 	volumes := getRedisVolumes(rf)
@@ -390,7 +435,7 @@ func generateRedisStatefulSet(rf *redisfailoverv1.RedisFailover, labels map[stri
 			Template: corev1.PodTemplateSpec{
 				ObjectMeta: metav1.ObjectMeta{
 					Labels:      labels,
-					Annotations: rf.Spec.Redis.PodAnnotations,
+					Annotations: podAnnotations,
 				},
 				Spec: corev1.PodSpec{
 					Affinity:                      getAffinity(rf.Spec.Redis.Affinity, labels),
@@ -570,6 +615,11 @@ func generateSentinelDeployment(rf *redisfailoverv1.RedisFailover, labels map[st
 	volumeMounts := getSentinelVolumeMounts(rf)
 	volumes := getSentinelVolumes(rf, configMapName)
 
+	serviceAccountName := rf.Spec.Sentinel.ServiceAccountName
+	if serviceAccountName == "" {
+		serviceAccountName = GetSentinelServiceAccountName(rf)
+	}
+
 	sd := &appsv1.Deployment{
 		ObjectMeta: metav1.ObjectMeta{
 			Name:            name,
@@ -597,7 +647,7 @@ func generateSentinelDeployment(rf *redisfailoverv1.RedisFailover, labels map[st
 					DNSPolicy:                 getDnsPolicy(rf.Spec.Sentinel.DNSPolicy),
 					ImagePullSecrets:          rf.Spec.Sentinel.ImagePullSecrets,
 					PriorityClassName:         rf.Spec.Sentinel.PriorityClassName,
-					ServiceAccountName:        rf.Spec.Sentinel.ServiceAccountName,
+					ServiceAccountName:        serviceAccountName,
 					EnableServiceLinks:        ptrBool(false),
 					InitContainers: []corev1.Container{
 						{
@@ -682,10 +732,19 @@ func generateSentinelDeployment(rf *redisfailoverv1.RedisFailover, labels map[st
 			TimeoutSeconds:      5,
 			ProbeHandler: corev1.ProbeHandler{
 				Exec: &corev1.ExecAction{
+					// The first check (unchanged) gates readiness until this
+					// sentinel has been configured with a real master. The
+					// second check (SENTINEL CKQUORUM) additionally fails
+					// readiness if this sentinel can't currently reach enough
+					// peer sentinels to authorize a failover - e.g. during a
+					// network partition, where the original check alone would
+					// keep reporting Ready from a stale cached master address
+					// even though this sentinel is effectively isolated (see
+					// https://github.com/spotahome/redis-operator/issues/663).
 					Command: []string{
 						"sh",
 						"-c",
-						"redis-cli -h $(hostname) -p 26379 sentinel get-master-addr-by-name mymaster | head -n 1 | grep -vq '127.0.0.1'",
+						"redis-cli -h $(hostname) -p 26379 sentinel get-master-addr-by-name mymaster | head -n 1 | grep -vq '127.0.0.1' && redis-cli -h $(hostname) -p 26379 sentinel ckquorum mymaster | grep -q '^OK'",
 					},
 				},
 			},
@@ -723,7 +782,26 @@ func generateSentinelDeployment(rf *redisfailoverv1.RedisFailover, labels map[st
 	return sd
 }
 
-func generatePodDisruptionBudget(name string, namespace string, labels map[string]string, ownerRefs []metav1.OwnerReference, minAvailable intstr.IntOrString) *policyv1.PodDisruptionBudget {
+// generateSentinelServiceAccount builds the ServiceAccount that is auto-provisioned
+// for the Sentinel Deployment when the user hasn't set rf.Spec.Sentinel.ServiceAccountName
+// themselves. Like every other generate* function it is a pure read of rf that produces
+// a k8s object -- it never mutates rf.
+func generateSentinelServiceAccount(rf *redisfailoverv1.RedisFailover, labels map[string]string, ownerRefs []metav1.OwnerReference) *corev1.ServiceAccount {
+	name := GetSentinelServiceAccountName(rf)
+	selectorLabels := generateSelectorLabels(sentinelRoleName, rf.Name)
+	labels = util.MergeLabels(labels, selectorLabels)
+
+	return &corev1.ServiceAccount{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:            name,
+			Namespace:       rf.Namespace,
+			Labels:          labels,
+			OwnerReferences: ownerRefs,
+		},
+	}
+}
+
+func generatePodDisruptionBudget(name string, namespace string, labels map[string]string, ownerRefs []metav1.OwnerReference, minAvailable intstr.IntOrString, selectorLabels map[string]string) *policyv1.PodDisruptionBudget {
 	return &policyv1.PodDisruptionBudget{
 		ObjectMeta: metav1.ObjectMeta{
 			Name:            name,
@@ -734,7 +812,7 @@ func generatePodDisruptionBudget(name string, namespace string, labels map[strin
 		Spec: policyv1.PodDisruptionBudgetSpec{
 			MinAvailable: &minAvailable,
 			Selector: &metav1.LabelSelector{
-				MatchLabels: labels,
+				MatchLabels: selectorLabels,
 			},
 		},
 	}
@@ -849,15 +927,14 @@ func getAffinity(affinity *corev1.Affinity, labels map[string]string) *corev1.Af
 	}
 }
 
+// getSecurityContext returns the operator's default pod security context, with
+// any field the user set on secctx taking precedence. A partial user context
+// only overrides the fields it specifies instead of dropping all the defaults.
 func getSecurityContext(secctx *corev1.PodSecurityContext) *corev1.PodSecurityContext {
-	if secctx != nil {
-		return secctx
-	}
-
 	defaultUserAndGroup := int64(1000)
 	runAsNonRoot := true
 
-	return &corev1.PodSecurityContext{
+	result := &corev1.PodSecurityContext{
 		RunAsUser:    &defaultUserAndGroup,
 		RunAsGroup:   &defaultUserAndGroup,
 		RunAsNonRoot: &runAsNonRoot,
@@ -866,13 +943,33 @@ func getSecurityContext(secctx *corev1.PodSecurityContext) *corev1.PodSecurityCo
 			Type: corev1.SeccompProfileTypeRuntimeDefault,
 		},
 	}
-}
-
-func getContainerSecurityContext(secctx *corev1.SecurityContext) *corev1.SecurityContext {
-	if secctx != nil {
-		return secctx
+	if secctx == nil {
+		return result
 	}
 
+	// Start from the user's context (so fields the operator has no default for
+	// are preserved) and only fall back to a default where the user left it unset.
+	merged := secctx.DeepCopy()
+	if merged.RunAsUser == nil {
+		merged.RunAsUser = result.RunAsUser
+	}
+	if merged.RunAsGroup == nil {
+		merged.RunAsGroup = result.RunAsGroup
+	}
+	if merged.RunAsNonRoot == nil {
+		merged.RunAsNonRoot = result.RunAsNonRoot
+	}
+	if merged.FSGroup == nil {
+		merged.FSGroup = result.FSGroup
+	}
+	return merged
+}
+
+// getContainerSecurityContext returns the operator's default container security
+// context, with any field the user set on secctx taking precedence. A partial
+// user context only overrides the fields it specifies instead of dropping all
+// the defaults.
+func getContainerSecurityContext(secctx *corev1.SecurityContext) *corev1.SecurityContext {
 	capabilities := &corev1.Capabilities{
 		Add: []corev1.Capability{},
 		Drop: []corev1.Capability{
@@ -885,7 +982,7 @@ func getContainerSecurityContext(secctx *corev1.SecurityContext) *corev1.Securit
 	allowPrivilegeEscalation := false
 	readOnlyRootFilesystem := true
 
-	return &corev1.SecurityContext{
+	result := &corev1.SecurityContext{
 		Capabilities:             capabilities,
 		Privileged:               &privileged,
 		RunAsUser:                &defaultUserAndGroup,
@@ -894,6 +991,33 @@ func getContainerSecurityContext(secctx *corev1.SecurityContext) *corev1.Securit
 		ReadOnlyRootFilesystem:   &readOnlyRootFilesystem,
 		AllowPrivilegeEscalation: &allowPrivilegeEscalation,
 	}
+	if secctx == nil {
+		return result
+	}
+
+	merged := secctx.DeepCopy()
+	if merged.Capabilities == nil {
+		merged.Capabilities = result.Capabilities
+	}
+	if merged.Privileged == nil {
+		merged.Privileged = result.Privileged
+	}
+	if merged.RunAsUser == nil {
+		merged.RunAsUser = result.RunAsUser
+	}
+	if merged.RunAsGroup == nil {
+		merged.RunAsGroup = result.RunAsGroup
+	}
+	if merged.RunAsNonRoot == nil {
+		merged.RunAsNonRoot = result.RunAsNonRoot
+	}
+	if merged.ReadOnlyRootFilesystem == nil {
+		merged.ReadOnlyRootFilesystem = result.ReadOnlyRootFilesystem
+	}
+	if merged.AllowPrivilegeEscalation == nil {
+		merged.AllowPrivilegeEscalation = result.AllowPrivilegeEscalation
+	}
+	return merged
 }
 
 func getDnsPolicy(dnspolicy corev1.DNSPolicy) corev1.DNSPolicy {
@@ -1137,8 +1261,13 @@ func getRedisCommand(rf *redisfailoverv1.RedisFailover) []string {
 	if len(rf.Spec.Redis.Command) > 0 {
 		return rf.Spec.Redis.Command
 	}
-	// Instance manager runs as PID 1 (CNPG model)
-	// This is required in v4.0.0+ - legacy mode is removed
+	// Instance manager runs as PID 1 (CNPG model).
+	// This is required in v4.0.0+ - legacy mode is removed.
+	//
+	// The password is NOT baked into redis.conf (upstream #135). The manager
+	// reads REDIS_PASSWORD and appends --requirepass/--masterauth when it execs
+	// redis-server, so the secret stays out of every cluster object and the
+	// manager remains PID 1 for signal handling.
 	return []string{
 		fmt.Sprintf("%s/%s", instanceManagerMountPath, instanceManagerBinaryName),
 		"run",

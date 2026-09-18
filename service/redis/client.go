@@ -460,6 +460,7 @@ func (c *client) SetCustomRedisConfig(ip string, port string, configs []string, 
 		}
 	}(rClient)
 
+	needsACLLoad := false
 	for _, config := range configs {
 		param, value, err := c.getConfigParameters(config)
 		if err != nil {
@@ -470,10 +471,40 @@ func (c *client) SetCustomRedisConfig(ip string, port string, configs []string, 
 		if strings.TrimSpace(param) == "" {
 			continue
 		}
+		// `aclfile` is an immutable config in real Redis - `CONFIG SET aclfile <path>`
+		// is always rejected at runtime, even when the value matches the path Redis
+		// was already started with; changing it requires a restart. The only way to
+		// pick up ACL users at runtime is `ACL LOAD`, which re-reads whatever aclfile
+		// Redis already has configured, so the CONFIG SET for this parameter is
+		// skipped entirely rather than sent (and failed) against the server.
+		if strings.EqualFold(param, "aclfile") {
+			needsACLLoad = true
+			continue
+		}
 		if err := c.applyRedisConfig(param, value, rClient); err != nil {
 			return err
 		}
 	}
+	if needsACLLoad {
+		if err := c.applyACLLoad(rClient); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func (c *client) applyACLLoad(rClient *rediscli.Client) error {
+	cmd := rediscli.NewStatusCmd(context.TODO(), "ACL", "LOAD")
+	err := rClient.Process(context.TODO(), cmd)
+	if err != nil {
+		c.metricsRecorder.RecordRedisOperation(metrics.KIND_REDIS, strings.Split(rClient.Options().Addr, ":")[0], metrics.APPLY_REDIS_CONFIG, metrics.FAIL, getRedisError(err))
+		return err
+	}
+	if _, err := cmd.Result(); err != nil {
+		c.metricsRecorder.RecordRedisOperation(metrics.KIND_REDIS, strings.Split(rClient.Options().Addr, ":")[0], metrics.APPLY_REDIS_CONFIG, metrics.FAIL, getRedisError(err))
+		return err
+	}
+	c.metricsRecorder.RecordRedisOperation(metrics.KIND_REDIS, strings.Split(rClient.Options().Addr, ":")[0], metrics.APPLY_REDIS_CONFIG, metrics.SUCCESS, metrics.NOT_APPLICABLE)
 	return nil
 }
 
@@ -618,4 +649,27 @@ func getRedisError(err error) string {
 	} else {
 		return "MISC"
 	}
+}
+
+// IsUnreachableError reports whether err means the redis node could not be
+// reached (dial/timeout/reset), as opposed to the node being reached and
+// rejecting the command. Callers use it to skip a down node instead of aborting
+// the whole reconcile, while still surfacing genuine command errors (bad config,
+// auth failures).
+func IsUnreachableError(err error) bool {
+	if err == nil {
+		return false
+	}
+
+	var netErr net.Error
+	if errors.As(err, &netErr) {
+		return true
+	}
+
+	msg := err.Error()
+	return strings.Contains(msg, "i/o timeout") ||
+		strings.Contains(msg, "connection refused") ||
+		strings.Contains(msg, "no route to host") ||
+		strings.Contains(msg, "network is unreachable") ||
+		strings.Contains(msg, "connection reset")
 }

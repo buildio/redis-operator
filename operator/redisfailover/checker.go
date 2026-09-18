@@ -10,6 +10,8 @@ import (
 
 	redisfailoverv1 "github.com/saremox/redis-operator/api/redisfailover/v1"
 	"github.com/saremox/redis-operator/metrics"
+	rfservice "github.com/saremox/redis-operator/operator/redisfailover/service"
+	"github.com/saremox/redis-operator/service/redis"
 )
 
 // UpdateRedisesPods if the running version of pods is equal to the statefulset one
@@ -78,6 +80,27 @@ func (r *RedisFailoverHandler) UpdateRedisesPods(rf *redisfailoverv1.RedisFailov
 			return err
 		}
 		if masterRevision != ssUR {
+			// Deleting the master makes sentinel run a failover. Only do that once
+			// every sentinel has a quorum (majority) of the freshly (re)started
+			// slaves in memory - the redis-side readiness checked above is not
+			// enough, because sentinel fails over from its own view and its slave
+			// discovery lags. Replacing the master before then leaves the failover
+			// with no promotable replica and it dies with NOGOODSLAVE until manual
+			// repair. A quorum, rather than the full expected count, is required
+			// so one permanently unavailable replica (e.g. a PVC stuck in a dead
+			// zone) cannot block master replacement forever when a safe failover
+			// is available via the reachable majority.
+			sentinels, err := r.rfChecker.GetSentinelsIPs(rf)
+			if err != nil {
+				return err
+			}
+			for _, sip := range sentinels {
+				if err := r.rfChecker.CheckSentinelSlavesNumberQuorumInMemory(sip, rf); err != nil {
+					r.logger.WithField("redisfailover", rf.ObjectMeta.Name).WithField("namespace", rf.ObjectMeta.Namespace).Infof("Waiting for sentinels to see a quorum of slaves before replacing the master: %s", err.Error())
+					return nil
+				}
+			}
+
 			err = r.rfHealer.DeletePod(master, rf)
 			if err != nil {
 				return err
@@ -120,25 +143,29 @@ func (r *RedisFailoverHandler) CheckAndHeal(rf *redisfailoverv1.RedisFailover) e
 	// Sentinel has not death nodes
 	// Sentinel knows the correct slave number
 
-	if !r.rfChecker.IsRedisRunning(rf) {
-		errorMsg := "not all replicas running"
+	// Heal as long as a quorum (majority) of pods is running rather than requiring
+	// the full set. A single Pending pod (unschedulable affinity, AZ loss) must not
+	// block master election and sentinel reconfiguration for the survivors; the
+	// downstream heal logic already operates only on the running/reachable pods.
+	if !r.rfChecker.IsRedisRunningQuorum(rf) {
+		errorMsg := "redis quorum not running"
 		rf.Status = redisfailoverv1.RedisFailoverStatus{
 			State:   redisfailoverv1.NotHealthyState,
 			Message: errorMsg,
 		}
 		setRedisCheckerMetrics(r.mClient, "redis", rf.Namespace, rf.Name, metrics.REDIS_REPLICA_MISMATCH, metrics.NOT_APPLICABLE, errors.New(errorMsg))
-		r.logger.WithField("redisfailover", rf.ObjectMeta.Name).WithField("namespace", rf.ObjectMeta.Namespace).Debugf("Number of redis mismatch, waiting for redis statefulset reconcile")
+		r.logger.WithField("redisfailover", rf.ObjectMeta.Name).WithField("namespace", rf.ObjectMeta.Namespace).Debugf("Redis quorum not running, waiting for redis statefulset reconcile")
 		return nil
 	}
 
-	if !r.rfChecker.IsSentinelRunning(rf) {
-		errorMsg := "not all replicas running"
+	if !r.rfChecker.IsSentinelRunningQuorum(rf) {
+		errorMsg := "sentinel quorum not running"
 		rf.Status = redisfailoverv1.RedisFailoverStatus{
 			State:   redisfailoverv1.NotHealthyState,
 			Message: errorMsg,
 		}
 		setRedisCheckerMetrics(r.mClient, "sentinel", rf.Namespace, rf.Name, metrics.SENTINEL_REPLICA_MISMATCH, metrics.NOT_APPLICABLE, errors.New(errorMsg))
-		r.logger.WithField("redisfailover", rf.ObjectMeta.Name).WithField("namespace", rf.ObjectMeta.Namespace).Debugf("Number of sentinel mismatch, waiting for sentinel deployment reconcile")
+		r.logger.WithField("redisfailover", rf.ObjectMeta.Name).WithField("namespace", rf.ObjectMeta.Namespace).Debugf("Sentinel quorum not running, waiting for sentinel deployment reconcile")
 		return nil
 	}
 
@@ -263,7 +290,19 @@ func (r *RedisFailoverHandler) CheckAndHeal(rf *redisfailoverv1.RedisFailover) e
 	setRedisCheckerMetrics(r.mClient, "redis", rf.Namespace, rf.Name, metrics.SLAVE_WRONG_MASTER, metrics.NOT_APPLICABLE, err)
 	if err != nil {
 		r.logger.WithField("redisfailover", rf.ObjectMeta.Name).WithField("namespace", rf.ObjectMeta.Namespace).Warningf("Slave not associated to master: %s", err.Error())
-		if err = r.rfHealer.SetMasterOnAll(master, rf); err != nil {
+		// Re-resolve master right before acting on it: `master` was captured
+		// above and pod churn since then could have moved it. Narrowing this
+		// window reduces how often SetMasterOnAll's own ownership check has
+		// to reject a stale IP and wait for the next reconcile.
+		freshMaster, ferr := r.rfChecker.GetMasterIP(rf)
+		if ferr != nil {
+			rf.Status = redisfailoverv1.RedisFailoverStatus{
+				State:   redisfailoverv1.NotHealthyState,
+				Message: "unable to re-verify master IP",
+			}
+			return ferr
+		}
+		if err = r.rfHealer.SetMasterOnAll(freshMaster, rf); err != nil {
 			rf.Status = redisfailoverv1.RedisFailoverStatus{
 				State: redisfailoverv1.NotHealthyState,
 			}
@@ -300,12 +339,29 @@ func (r *RedisFailoverHandler) CheckAndHeal(rf *redisfailoverv1.RedisFailover) e
 	}
 
 	port := getRedisPort(rf.Spec.Redis.Port)
+	// `master` may be stale by now (resolved above, before applyRedisCustomConfig
+	// and UpdateRedisesPods ran). Re-resolve it lazily, once, only if a sentinel
+	// actually needs fixing, and reuse that fresh value for the rest of the loop.
+	sentinelMonitorMaster := master
+	masterRefreshed := false
 	for _, sip := range sentinels {
 		err = r.rfChecker.CheckSentinelMonitor(sip, master, port)
 		setRedisCheckerMetrics(r.mClient, "sentinel", rf.Namespace, rf.Name, metrics.SENTINEL_WRONG_MASTER, sip, err)
 		if err != nil {
 			r.logger.WithField("redisfailover", rf.ObjectMeta.Name).WithField("namespace", rf.ObjectMeta.Namespace).Warningf("Fixing sentinel not monitoring expected master: %s", err.Error())
-			if err := r.rfHealer.NewSentinelMonitor(sip, master, rf); err != nil {
+			if !masterRefreshed {
+				freshMaster, ferr := r.rfChecker.GetMasterIP(rf)
+				if ferr != nil {
+					rf.Status = redisfailoverv1.RedisFailoverStatus{
+						State:   redisfailoverv1.NotHealthyState,
+						Message: "unable to re-verify master IP",
+					}
+					return ferr
+				}
+				sentinelMonitorMaster = freshMaster
+				masterRefreshed = true
+			}
+			if err := r.rfHealer.NewSentinelMonitor(sip, sentinelMonitorMaster, rf); err != nil {
 				rf.Status = redisfailoverv1.RedisFailoverStatus{
 					State: redisfailoverv1.NotHealthyState,
 				}
@@ -365,9 +421,13 @@ func (r *RedisFailoverHandler) checkAndHealOperatorManagedMode(rf *redisfailover
 			err = r.rfHealer.PromoteBestReplica(bestReplica.IP, rf)
 			setRedisCheckerMetrics(r.mClient, "redis", rf.Namespace, rf.Name, metrics.NO_MASTER, metrics.NOT_APPLICABLE, err)
 			if err != nil {
+				msg := "failed to promote replica"
+				if errors.Is(err, rfservice.ErrPartialReconciliation) {
+					msg = "failover incomplete: replica reconfiguration failed"
+				}
 				rf.Status = redisfailoverv1.RedisFailoverStatus{
 					State:   redisfailoverv1.NotHealthyState,
-					Message: "failed to promote replica",
+					Message: msg,
 				}
 				return err
 			}
@@ -403,9 +463,13 @@ func (r *RedisFailoverHandler) checkAndHealOperatorManagedMode(rf *redisfailover
 
 			err = r.rfHealer.PromoteBestReplica(bestReplica.IP, rf)
 			if err != nil {
+				msg := "failover failed"
+				if errors.Is(err, rfservice.ErrPartialReconciliation) {
+					msg = "failover incomplete: replica reconfiguration failed"
+				}
 				rf.Status = redisfailoverv1.RedisFailoverStatus{
 					State:   redisfailoverv1.NotHealthyState,
-					Message: "failover failed",
+					Message: msg,
 				}
 				return err
 			}
@@ -478,6 +542,7 @@ func (r *RedisFailoverHandler) checkAndHealBootstrapMode(rf *redisfailoverv1.Red
 			State:   redisfailoverv1.NotHealthyState,
 			Message: "unable to update Redis PODs",
 		}
+		return err
 	}
 	err = r.applyRedisCustomConfig(rf)
 	setRedisCheckerMetrics(r.mClient, "redis", rf.Namespace, rf.Name, metrics.APPLY_REDIS_CONFIG, metrics.NOT_APPLICABLE, err)
@@ -549,6 +614,14 @@ func (r *RedisFailoverHandler) applyRedisCustomConfig(rf *redisfailoverv1.RedisF
 	}
 	for _, rip := range redises {
 		if err := r.rfHealer.SetRedisCustomConfig(rip, rf); err != nil {
+			// A pod on a downed node cannot be configured; skip it rather than
+			// aborting the whole reconcile, so the reachable pods and the rest of
+			// the heal still run. A non-connection error (bad config value, auth)
+			// is a real problem and still stops here.
+			if redis.IsUnreachableError(err) {
+				r.logger.WithField("redisfailover", rf.ObjectMeta.Name).WithField("namespace", rf.ObjectMeta.Namespace).Warningf("Skipping custom config on unreachable redis %s: %s", rip, err.Error())
+				continue
+			}
 			return err
 		}
 	}
@@ -562,6 +635,10 @@ func (r *RedisFailoverHandler) checkAndHealSentinels(rf *redisfailoverv1.RedisFa
 		if err != nil {
 			r.logger.WithField("redisfailover", rf.ObjectMeta.Name).WithField("namespace", rf.ObjectMeta.Namespace).Warningf("Sentinel %s mismatch number of sentinels in memory. resetting", sip)
 			if err := r.rfHealer.RestoreSentinel(sip); err != nil {
+				rf.Status = redisfailoverv1.RedisFailoverStatus{
+					State:   redisfailoverv1.NotHealthyState,
+					Message: "unable to restore sentinel",
+				}
 				return err
 			}
 		}
@@ -573,6 +650,10 @@ func (r *RedisFailoverHandler) checkAndHealSentinels(rf *redisfailoverv1.RedisFa
 		if err != nil {
 			r.logger.WithField("redisfailover", rf.ObjectMeta.Name).WithField("namespace", rf.ObjectMeta.Namespace).Warningf("Sentinel %s mismatch number of expected slaves in memory. resetting", sip)
 			if err := r.rfHealer.RestoreSentinel(sip); err != nil {
+				rf.Status = redisfailoverv1.RedisFailoverStatus{
+					State:   redisfailoverv1.NotHealthyState,
+					Message: "unable to restore sentinel",
+				}
 				return err
 			}
 		}
@@ -581,6 +662,10 @@ func (r *RedisFailoverHandler) checkAndHealSentinels(rf *redisfailoverv1.RedisFa
 		err := r.rfHealer.SetSentinelCustomConfig(sip, rf)
 		setRedisCheckerMetrics(r.mClient, "sentinel", rf.Namespace, rf.Name, metrics.APPLY_SENTINEL_CONFIG, sip, err)
 		if err != nil {
+			rf.Status = redisfailoverv1.RedisFailoverStatus{
+				State:   redisfailoverv1.NotHealthyState,
+				Message: "unable to set sentinel custom config",
+			}
 			return err
 		}
 	}

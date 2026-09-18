@@ -1,11 +1,11 @@
-VERSION := v1.5.0
+VERSION := 4.1.0
 
 # Name of this service/application
 SERVICE_NAME := redis-operator
 
 # Docker image name for this project - derived from git remote
 # Extracts owner/repo from git@github.com:owner/repo.git or https://github.com/owner/repo.git
-IMAGE_NAME := $(shell git remote get-url origin 2>/dev/null | sed -E 's|.*github.com[:/]||; s|\.git$$||')
+IMAGE_NAME := $(shell git remote get-url origin 2>/dev/null | sed -E 's|.*github.com[:/]||; s|\.git$$||' | tr '[:upper:]' '[:lower:]')
 ifeq ($(IMAGE_NAME),)
   IMAGE_NAME := local/$(SERVICE_NAME)
 endif
@@ -49,6 +49,14 @@ PORT := 9710
 
 # CMDs
 UNIT_TEST_CMD := go test `go list ./... | grep -v /vendor/` -v
+# Packages that actually contain test files (in-package or external "_test"
+# packages), respecting build tags (e.g. excludes test/integration, which is
+# gated behind the "integration" build tag). Coverage is scoped to these so
+# generated/no-test packages (client/k8s clientset, mocks, cmd/*, ...) aren't
+# fed through the coverage instrumentation, which otherwise trips
+# `go: no such tool "covdata"` on toolchains that don't ship it.
+UNIT_TEST_COVERAGE_PKGS_CMD := go list -f '{{if or .TestGoFiles .XTestGoFiles}}{{.ImportPath}}{{end}}' ./... | grep -v /vendor/
+UNIT_TEST_COVERAGE_CMD := go test `$(UNIT_TEST_COVERAGE_PKGS_CMD)` -v -coverprofile=coverage.out -covermode=atomic
 GO_GENERATE_CMD := go generate `go list ./... | grep -v /vendor/`
 GO_INTEGRATION_TEST_CMD := go test `go list ./... | grep test/integration` -v -tags='integration'
 GET_DEPS_CMD := dep ensure
@@ -143,6 +151,12 @@ unit-test: docker-build
 .PHONY: ci-unit-test
 ci-unit-test:
 	$(UNIT_TEST_CMD)
+
+# Same unit tests as ci-unit-test, but also produces coverage.out for
+# uploading to Codecov. Used by the CI unit-test job.
+.PHONY: ci-unit-test-coverage
+ci-unit-test-coverage:
+	$(UNIT_TEST_COVERAGE_CMD)
 
 .PHONY: ci-integration-test
 ci-integration-test:

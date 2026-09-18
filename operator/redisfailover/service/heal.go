@@ -2,6 +2,7 @@ package service
 
 import (
 	"errors"
+	"fmt"
 	"sort"
 	"strconv"
 
@@ -11,6 +12,12 @@ import (
 	"github.com/saremox/redis-operator/service/redis"
 	v1 "k8s.io/api/core/v1"
 )
+
+// ErrPartialReconciliation is returned by PromoteBestReplica when the new
+// master was promoted successfully but one or more replicas could not be
+// repointed or relabelled.  The caller should treat this as an incomplete
+// failover, not a total failure.
+var ErrPartialReconciliation = errors.New("promotion succeeded but replica reconciliation incomplete")
 
 // RedisFailoverHeal defines the interface able to fix the problems on the redis failovers
 type RedisFailoverHeal interface {
@@ -144,10 +151,35 @@ func (r *RedisFailoverHealer) SetOldestAsMaster(rf *redisfailoverv1.RedisFailove
 	}
 }
 
+// podIPBelongsTo reports whether ip is currently the PodIP of one of the
+// given pods. GetStatefulSetPods scopes its List() call by namespace and by
+// the owning StatefulSet's own label selector, so a freshly-fetched pods
+// list can only ever contain this RedisFailover's own pods: Kubernetes never
+// hands the same live IP to two Running pods at once. Checking membership
+// against a list fetched right before a mutating call therefore closes the
+// window where a master/replica IP resolved earlier in the reconcile could
+// since have been reassigned (e.g. after node churn) to an unrelated pod,
+// possibly belonging to a different RedisFailover in another namespace. See
+// https://github.com/spotahome/redis-operator/issues/698.
+func podIPBelongsTo(pods *v1.PodList, ip string) bool {
+	for _, pod := range pods.Items {
+		if pod.Status.PodIP == ip {
+			return true
+		}
+	}
+	return false
+}
+
 // SetMasterOnAll puts all redis nodes as a slave of a given master
 func (r *RedisFailoverHealer) SetMasterOnAll(masterIP string, rf *redisfailoverv1.RedisFailover) error {
 	ssp, err := r.k8sService.GetStatefulSetPods(rf.Namespace, GetRedisName(rf))
 	if err != nil {
+		return err
+	}
+
+	if !podIPBelongsTo(ssp, masterIP) {
+		err := fmt.Errorf("refusing to set master %s: it is not currently a pod of %s/%s, bailing out this round", masterIP, rf.Namespace, rf.Name)
+		r.logger.WithField("redisfailover", rf.Name).WithField("namespace", rf.Namespace).Error(err.Error())
 		return err
 	}
 
@@ -169,8 +201,11 @@ func (r *RedisFailoverHealer) SetMasterOnAll(masterIP string, rf *redisfailoverv
 			}
 			r.logger.WithField("redisfailover", rf.Name).WithField("namespace", rf.Namespace).Infof("Making pod %s slave of %s", pod.Name, masterIP)
 			if err := r.redisClient.MakeSlaveOfWithPort(pod.Status.PodIP, masterIP, port, password); err != nil {
+				// The pod is unreachable - typically the old master on a downed
+				// node. Skip it and keep repointing the reachable slaves instead
+				// of aborting; it will re-sync via sentinel once its node is back.
 				r.logger.WithField("redisfailover", rf.Name).WithField("namespace", rf.Namespace).Errorf("Make slave failed, slave ip: %s, master ip: %s, error: %v", pod.Status.PodIP, masterIP, err)
-				return err
+				continue
 			}
 
 			err = r.setSlaveLabelIfNecessary(rf.Namespace, pod)
@@ -271,6 +306,21 @@ func (r *RedisFailoverHealer) PromoteBestReplica(newMasterIP string, rf *redisfa
 
 	port := getRedisPort(rf.Spec.Redis.Port)
 
+	// Fetch this RedisFailover's own pods fresh, immediately before acting on
+	// newMasterIP, and verify it's still one of them. This closes the race
+	// where newMasterIP was resolved earlier in the reconcile and has since
+	// been reassigned to an unrelated pod, possibly in a different
+	// namespace/RedisFailover. See https://github.com/spotahome/redis-operator/issues/698.
+	rps, err := r.k8sService.GetStatefulSetPods(rf.Namespace, GetRedisName(rf))
+	if err != nil {
+		return err
+	}
+	if !podIPBelongsTo(rps, newMasterIP) {
+		err := fmt.Errorf("refusing to promote %s: it is not currently a pod of %s/%s, bailing out this round", newMasterIP, rf.Namespace, rf.Name)
+		r.logger.WithField("redisfailover", rf.Name).WithField("namespace", rf.Namespace).Error(err.Error())
+		return err
+	}
+
 	// Step 1: Promote the selected replica to master
 	r.logger.WithField("redisfailover", rf.Name).WithField("namespace", rf.Namespace).
 		Infof("Promoting replica %s to master", newMasterIP)
@@ -282,11 +332,6 @@ func (r *RedisFailoverHealer) PromoteBestReplica(newMasterIP string, rf *redisfa
 	}
 
 	// Step 2: Update pod labels for the new master
-	rps, err := r.k8sService.GetStatefulSetPods(rf.Namespace, GetRedisName(rf))
-	if err != nil {
-		return err
-	}
-
 	for _, rp := range rps.Items {
 		if rp.Status.PodIP == newMasterIP {
 			if err := r.setMasterLabelIfNecessary(rf.Namespace, rp); err != nil {
@@ -302,6 +347,7 @@ func (r *RedisFailoverHealer) PromoteBestReplica(newMasterIP string, rf *redisfa
 	r.logger.WithField("redisfailover", rf.Name).WithField("namespace", rf.Namespace).
 		Infof("Reconfiguring replicas to use new master %s", newMasterIP)
 
+	var reconcileErrs []error
 	for _, rp := range rps.Items {
 		if rp.Status.PodIP == newMasterIP {
 			continue
@@ -316,15 +362,19 @@ func (r *RedisFailoverHealer) PromoteBestReplica(newMasterIP string, rf *redisfa
 		if err := r.redisClient.MakeSlaveOfWithPort(rp.Status.PodIP, newMasterIP, port, password); err != nil {
 			r.logger.WithField("redisfailover", rf.Name).WithField("namespace", rf.Namespace).
 				Errorf("Failed to make %s slave of %s: %v", rp.Status.PodIP, newMasterIP, err)
-			// Continue with other replicas even if one fails
+			reconcileErrs = append(reconcileErrs, err)
 			continue
 		}
 
 		if err := r.setSlaveLabelIfNecessary(rf.Namespace, rp); err != nil {
 			r.logger.WithField("redisfailover", rf.Name).WithField("namespace", rf.Namespace).
 				Errorf("Failed to set slave label on pod %s: %v", rp.Name, err)
-			// Continue with other replicas even if label update fails
+			reconcileErrs = append(reconcileErrs, err)
 		}
+	}
+
+	if joinedErr := errors.Join(reconcileErrs...); joinedErr != nil {
+		return fmt.Errorf("%w: %w", ErrPartialReconciliation, joinedErr)
 	}
 
 	r.logger.WithField("redisfailover", rf.Name).WithField("namespace", rf.Namespace).

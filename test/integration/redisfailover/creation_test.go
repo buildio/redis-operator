@@ -6,7 +6,9 @@ import (
 	"context"
 	"fmt"
 	"net"
+	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -144,8 +146,13 @@ func TestRedisFailover(t *testing.T) {
 	stopC := make(chan struct{})
 	errC := make(chan error)
 
+	kubeconfig := os.Getenv("KUBECONFIG")
+	if kubeconfig == "" {
+		kubeconfig = filepath.Join(homedir.HomeDir(), ".kube", "config")
+	}
+
 	flags := &utils.CMDFlags{
-		KubeConfig:  filepath.Join(homedir.HomeDir(), ".kube", "config"),
+		KubeConfig:  kubeconfig,
 		Development: true,
 	}
 
@@ -356,11 +363,17 @@ func (c *clients) testAuth(t *testing.T) {
 
 	redisCfg, err := c.k8sClient.CoreV1().ConfigMaps(namespace).Get(context.Background(), fmt.Sprintf("rfr-%s", name), metav1.GetOptions{})
 	assert.NoError(err)
-	assert.Contains(redisCfg.Data["redis.conf"], "requirepass "+testPass)
-	assert.Contains(redisCfg.Data["redis.conf"], "masterauth "+testPass)
+	// The password must not be embedded in the ConfigMap; auth is passed to
+	// redis-server via env-backed command args instead.
+	assert.NotContains(redisCfg.Data["redis.conf"], "requirepass")
+	assert.NotContains(redisCfg.Data["redis.conf"], "masterauth")
 
 	redisSS, err := c.k8sClient.AppsV1().StatefulSets(namespace).Get(context.Background(), fmt.Sprintf("rfr-%s", name), metav1.GetOptions{})
 	assert.NoError(err)
+
+	redisCmd := strings.Join(redisSS.Spec.Template.Spec.Containers[0].Command, " ")
+	assert.Contains(redisCmd, `--requirepass "$REDIS_PASSWORD"`)
+	assert.Contains(redisCmd, `--masterauth "$REDIS_PASSWORD"`)
 
 	assert.Len(redisSS.Spec.Template.Spec.Containers, 2)
 	assert.Equal(redisSS.Spec.Template.Spec.Containers[1].Env[1].Name, "REDIS_ADDR")

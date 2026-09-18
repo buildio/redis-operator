@@ -1,6 +1,7 @@
 package k8s_test
 
 import (
+	"context"
 	"errors"
 	"testing"
 
@@ -36,6 +37,150 @@ func newStatefulSetGetAction(ns, name string) kubetesting.GetActionImpl {
 
 func newStatefulSetCreateAction(ns string, statefulSet *appsv1.StatefulSet) kubetesting.CreateActionImpl {
 	return kubetesting.NewCreateAction(statefulSetsGroup, ns, statefulSet)
+}
+
+// TestStatefulSetServiceGetStatefulSetPods exercises the real selector-building
+// logic in GetStatefulSetPods: it must list only the pods that belong to the
+// named StatefulSet, scoped by both the StatefulSet's own MatchLabels selector
+// and namespace. This is the exact property a recent fix relies on to prevent
+// replicas from attaching to the wrong RedisFailover's master after pod-IP
+// reuse across namespaces, so it uses a real fake clientset (not hand-rolled
+// reactors) to get genuine label-selector and namespace filtering semantics.
+func TestStatefulSetServiceGetStatefulSetPods(t *testing.T) {
+	testns := "testns"
+	otherns := "otherns"
+	stsName := "teststatefulset"
+
+	testStatefulSet := &appsv1.StatefulSet{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      stsName,
+			Namespace: testns,
+		},
+		Spec: appsv1.StatefulSetSpec{
+			Selector: &metav1.LabelSelector{
+				MatchLabels: map[string]string{
+					"app":       "redis",
+					"component": "master",
+				},
+			},
+		},
+	}
+
+	matchingPod1 := &v1.Pod{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "matching-pod-1",
+			Namespace: testns,
+			Labels: map[string]string{
+				"app":       "redis",
+				"component": "master",
+			},
+		},
+	}
+	matchingPod2 := &v1.Pod{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "matching-pod-2",
+			Namespace: testns,
+			Labels: map[string]string{
+				"app":       "redis",
+				"component": "master",
+				"extra":     "label-should-not-matter",
+			},
+		},
+	}
+	// Same namespace, but does not carry all of the StatefulSet's selector labels.
+	nonMatchingLabelsPod := &v1.Pod{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "non-matching-labels-pod",
+			Namespace: testns,
+			Labels: map[string]string{
+				"app":       "redis",
+				"component": "slave",
+			},
+		},
+	}
+	// Different namespace, but carries the exact same labels as the matching pods.
+	// This proves the selector is correctly namespace-scoped: same labels alone
+	// must not be enough to match across namespaces (the #698-class fix property).
+	crossNamespacePod := &v1.Pod{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "cross-namespace-pod",
+			Namespace: otherns,
+			Labels: map[string]string{
+				"app":       "redis",
+				"component": "master",
+			},
+		},
+	}
+
+	mcli := kubernetes.NewClientset(
+		testStatefulSet,
+		matchingPod1,
+		matchingPod2,
+		nonMatchingLabelsPod,
+		crossNamespacePod,
+	)
+
+	service := k8s.NewStatefulSetService(mcli, log.Dummy, metrics.Dummy)
+
+	t.Run("returns exactly the pods matching selector and namespace", func(t *testing.T) {
+		assertTest := assert.New(t)
+
+		podList, err := service.GetStatefulSetPods(testns, stsName)
+		assertTest.NoError(err)
+		assertTest.NotNil(podList)
+
+		gotNames := map[string]bool{}
+		for _, p := range podList.Items {
+			gotNames[p.Name] = true
+		}
+
+		assertTest.Len(podList.Items, 2)
+		assertTest.True(gotNames["matching-pod-1"])
+		assertTest.True(gotNames["matching-pod-2"])
+		assertTest.False(gotNames["non-matching-labels-pod"], "pod with a different label value must be excluded")
+		assertTest.False(gotNames["cross-namespace-pod"], "pod in a different namespace with identical labels must be excluded")
+	})
+
+	t.Run("propagates the error when the StatefulSet itself does not exist", func(t *testing.T) {
+		assertTest := assert.New(t)
+
+		podList, err := service.GetStatefulSetPods(testns, "does-not-exist")
+		assertTest.Error(err)
+		assertTest.Nil(podList)
+	})
+
+	t.Run("an empty MatchLabels selector matches every pod in the namespace", func(t *testing.T) {
+		// This documents the actual behavior of GetStatefulSetPods when
+		// Spec.Selector.MatchLabels is empty: the joined selector string is
+		// empty, which k8s treats as "select everything" (no restriction),
+		// so every pod in the namespace is returned -- not zero pods.
+		assertTest := assert.New(t)
+
+		emptySelectorSts := &appsv1.StatefulSet{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:      "empty-selector-sts",
+				Namespace: testns,
+			},
+			Spec: appsv1.StatefulSetSpec{
+				Selector: &metav1.LabelSelector{
+					MatchLabels: map[string]string{},
+				},
+			},
+		}
+
+		mcli2 := kubernetes.NewClientset(
+			emptySelectorSts,
+			matchingPod1,
+			matchingPod2,
+			nonMatchingLabelsPod,
+		)
+		service2 := k8s.NewStatefulSetService(mcli2, log.Dummy, metrics.Dummy)
+
+		podList, err := service2.GetStatefulSetPods(testns, "empty-selector-sts")
+		assertTest.NoError(err)
+		assertTest.NotNil(podList)
+		assertTest.Len(podList.Items, 3, "an empty selector matches every pod in the namespace")
+	})
 }
 
 func TestStatefulSetServiceGetCreateOrUpdate(t *testing.T) {
@@ -220,4 +365,55 @@ func TestStatefulSetServiceGetCreateOrUpdate(t *testing.T) {
 			assertTest.NoError(err)
 		})
 	}
+}
+
+func TestStatefulSetServiceDeleteStatefulSet(t *testing.T) {
+	testns := "testns"
+
+	t.Run("deletes an existing StatefulSet", func(t *testing.T) {
+		assertTest := assert.New(t)
+
+		sts := &appsv1.StatefulSet{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:      "teststatefulset",
+				Namespace: testns,
+			},
+		}
+		mcli := kubernetes.NewClientset(sts)
+		service := k8s.NewStatefulSetService(mcli, log.Dummy, metrics.Dummy)
+
+		err := service.DeleteStatefulSet(testns, "teststatefulset")
+		assertTest.NoError(err)
+
+		_, err = mcli.AppsV1().StatefulSets(testns).Get(context.TODO(), "teststatefulset", metav1.GetOptions{})
+		assertTest.Error(err)
+		assertTest.True(kubeerrors.IsNotFound(err))
+	})
+
+	t.Run("returns an error when deleting a non-existent StatefulSet", func(t *testing.T) {
+		assertTest := assert.New(t)
+
+		mcli := kubernetes.NewClientset()
+		service := k8s.NewStatefulSetService(mcli, log.Dummy, metrics.Dummy)
+
+		err := service.DeleteStatefulSet(testns, "does-not-exist")
+		assertTest.Error(err)
+		assertTest.True(kubeerrors.IsNotFound(err))
+	})
+}
+
+func TestStatefulSetServiceListStatefulSets(t *testing.T) {
+	assertTest := assert.New(t)
+	testns := "testns"
+
+	sts1 := &appsv1.StatefulSet{ObjectMeta: metav1.ObjectMeta{Name: "sts1", Namespace: testns}}
+	sts2 := &appsv1.StatefulSet{ObjectMeta: metav1.ObjectMeta{Name: "sts2", Namespace: testns}}
+	otherNsSts := &appsv1.StatefulSet{ObjectMeta: metav1.ObjectMeta{Name: "sts3", Namespace: "otherns"}}
+
+	mcli := kubernetes.NewClientset(sts1, sts2, otherNsSts)
+	service := k8s.NewStatefulSetService(mcli, log.Dummy, metrics.Dummy)
+
+	list, err := service.ListStatefulSets(testns)
+	assertTest.NoError(err)
+	assertTest.Len(list.Items, 2)
 }
