@@ -19,7 +19,7 @@ spec:
       serviceAccountName: redisoperator
       enableServiceLinks: false
       containers:
-        - image: ghcr.io/buildio/redis-operator:4.0.0
+        - image: ghcr.io/buildio/redis-operator:4.1.0
           imagePullPolicy: IfNotPresent
           name: app
           securityContext:
@@ -74,6 +74,7 @@ rules:
       - endpoints
       - events
       - configmaps
+      - serviceaccounts
       - persistentvolumeclaims
       - persistentvolumeclaims/finalizers
     verbs:

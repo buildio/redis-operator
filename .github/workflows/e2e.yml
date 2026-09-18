@@ -2,7 +2,6 @@ name: E2E Tests
 
 on:
   pull_request:
-    branches: [main]
   workflow_dispatch:
 
 jobs:
@@ -11,21 +10,15 @@ jobs:
     steps:
       - uses: actions/checkout@v6
 
-      - name: Set up Go
-        uses: actions/setup-go@v5
-        with:
-          go-version: '1.24'
-          cache: true
-
       - name: Set up minikube
         uses: medyagh/setup-minikube@v0.0.21
         with:
-          kubernetes-version: v1.30.0
+          kubernetes-version: v1.32.0
 
       - name: Build operator image
         run: |
-          eval $(minikube docker-env)
           docker build -t ghcr.io/buildio/redis-operator:test -f docker/app/Dockerfile .
+          minikube image load ghcr.io/buildio/redis-operator:test
 
       - name: Install CRD
         run: kubectl apply --server-side -f manifests/databases.spotahome.com_redisfailovers.yaml
@@ -356,21 +349,15 @@ jobs:
     steps:
       - uses: actions/checkout@v6
 
-      - name: Set up Go
-        uses: actions/setup-go@v5
-        with:
-          go-version: '1.24'
-          cache: true
-
       - name: Set up minikube
         uses: medyagh/setup-minikube@v0.0.21
         with:
-          kubernetes-version: v1.30.0
+          kubernetes-version: v1.32.0
 
       - name: Build operator image
         run: |
-          eval $(minikube docker-env)
           docker build -t ghcr.io/buildio/redis-operator:test -f docker/app/Dockerfile .
+          minikube image load ghcr.io/buildio/redis-operator:test
 
       - name: Install CRD
         run: kubectl apply --server-side -f manifests/databases.spotahome.com_redisfailovers.yaml
@@ -621,21 +608,15 @@ jobs:
     steps:
       - uses: actions/checkout@v6
 
-      - name: Set up Go
-        uses: actions/setup-go@v5
-        with:
-          go-version: '1.24'
-          cache: true
-
       - name: Set up minikube
         uses: medyagh/setup-minikube@v0.0.21
         with:
-          kubernetes-version: v1.30.0
+          kubernetes-version: v1.32.0
 
       - name: Build operator image
         run: |
-          eval $(minikube docker-env)
           docker build -t ghcr.io/buildio/redis-operator:test -f docker/app/Dockerfile .
+          minikube image load ghcr.io/buildio/redis-operator:test
 
       - name: Install CRD
         run: kubectl apply --server-side -f manifests/databases.spotahome.com_redisfailovers.yaml

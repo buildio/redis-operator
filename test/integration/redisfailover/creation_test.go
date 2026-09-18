@@ -6,7 +6,9 @@ import (
 	"context"
 	"fmt"
 	"net"
+	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -23,6 +25,7 @@ import (
 
 	_ "k8s.io/client-go/plugin/pkg/client/auth/oidc"
 	"k8s.io/client-go/util/homedir"
+	"k8s.io/utils/ptr"
 
 	redisfailoverv1 "github.com/saremox/redis-operator/api/redisfailover/v1"
 	redisfailoverclientset "github.com/saremox/redis-operator/client/k8s/clientset/versioned"
@@ -49,10 +52,6 @@ type clients struct {
 	rfClient    redisfailoverclientset.Interface
 	aeClient    apiextensionsclientset.Interface
 	redisClient redis.Client
-}
-
-func boolPtr(b bool) *bool {
-	return &b
 }
 
 // waitForPodsReady waits for all pods matching the label selector to be Ready
@@ -144,8 +143,13 @@ func TestRedisFailover(t *testing.T) {
 	stopC := make(chan struct{})
 	errC := make(chan error)
 
+	kubeconfig := os.Getenv("KUBECONFIG")
+	if kubeconfig == "" {
+		kubeconfig = filepath.Join(homedir.HomeDir(), ".kube", "config")
+	}
+
 	flags := &utils.CMDFlags{
-		KubeConfig:  filepath.Join(homedir.HomeDir(), ".kube", "config"),
+		KubeConfig:  kubeconfig,
 		Development: true,
 	}
 
@@ -269,7 +273,7 @@ func (c *clients) testCRCreation(t *testing.T) {
 				Replicas:        sentinelSize,
 				ImagePullPolicy: corev1.PullIfNotPresent, // Allow pulling redis image from registry
 				// Sentinel must be explicitly enabled in v4.0.0+ (default is false)
-				Enabled: boolPtr(true),
+				Enabled: ptr.To(true),
 			},
 			Auth: redisfailoverv1.AuthSettings{
 				SecretPath: authSecretPath,
@@ -356,11 +360,36 @@ func (c *clients) testAuth(t *testing.T) {
 
 	redisCfg, err := c.k8sClient.CoreV1().ConfigMaps(namespace).Get(context.Background(), fmt.Sprintf("rfr-%s", name), metav1.GetOptions{})
 	assert.NoError(err)
-	assert.Contains(redisCfg.Data["redis.conf"], "requirepass "+testPass)
-	assert.Contains(redisCfg.Data["redis.conf"], "masterauth "+testPass)
+	// The password must not be embedded in the ConfigMap; auth is passed to
+	// redis-server via env-backed command args instead.
+	assert.NotContains(redisCfg.Data["redis.conf"], "requirepass")
+	assert.NotContains(redisCfg.Data["redis.conf"], "masterauth")
 
 	redisSS, err := c.k8sClient.AppsV1().StatefulSets(namespace).Get(context.Background(), fmt.Sprintf("rfr-%s", name), metav1.GetOptions{})
 	assert.NoError(err)
+
+	// Since v4.0.0 the redis container runs the instance manager as PID 1. The
+	// manager reads REDIS_PASSWORD from the env and appends --requirepass and
+	// --masterauth when it execs redis-server, so neither the ConfigMap nor the
+	// pod command ever holds the password. See cmd/instance/run.
+	redisCmd := strings.Join(redisSS.Spec.Template.Spec.Containers[0].Command, " ")
+	assert.Contains(redisCmd, "redis-instance")
+	assert.Contains(redisCmd, "run")
+	assert.Contains(redisCmd, "--redis-conf")
+	assert.NotContains(redisCmd, testPass, "the password must not appear in the pod command")
+
+	// The manager can only add those flags if the secret is wired into the env.
+	var redisPassEnv *corev1.EnvVar
+	for i, e := range redisSS.Spec.Template.Spec.Containers[0].Env {
+		if e.Name == "REDIS_PASSWORD" {
+			redisPassEnv = &redisSS.Spec.Template.Spec.Containers[0].Env[i]
+			break
+		}
+	}
+	if assert.NotNil(redisPassEnv, "redis container must receive REDIS_PASSWORD") {
+		assert.Equal("password", redisPassEnv.ValueFrom.SecretKeyRef.Key)
+		assert.Equal(authSecretPath, redisPassEnv.ValueFrom.SecretKeyRef.LocalObjectReference.Name)
+	}
 
 	assert.Len(redisSS.Spec.Template.Spec.Containers, 2)
 	assert.Equal(redisSS.Spec.Template.Spec.Containers[1].Env[1].Name, "REDIS_ADDR")

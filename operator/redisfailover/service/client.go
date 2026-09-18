@@ -87,10 +87,20 @@ func (r *RedisFailoverKubeClient) EnsureSentinelConfigMap(rf *redisfailoverv1.Re
 // EnsureSentinelDeployment makes sure the sentinel deployment exists in the desired state
 func (r *RedisFailoverKubeClient) EnsureSentinelDeployment(rf *redisfailoverv1.RedisFailover, labels map[string]string, ownerRefs []metav1.OwnerReference) error {
 	if !rf.Spec.Sentinel.DisablePodDisruptionBudget {
-		if err := r.ensurePodDisruptionBudget(rf, sentinelName, sentinelRoleName, labels, ownerRefs); err != nil {
+		if err := r.ensurePodDisruptionBudget(rf, sentinelName, sentinelRoleName, labels, ownerRefs, rf.Spec.Sentinel.Replicas); err != nil {
 			return err
 		}
 	}
+
+	// Only auto-provision a ServiceAccount when the user hasn't set one themselves:
+	// if they did, it's their responsibility to have already created it, and we must
+	// not touch it.
+	if rf.Spec.Sentinel.ServiceAccountName == "" {
+		if err := r.ensureSentinelServiceAccount(rf, labels, ownerRefs); err != nil {
+			return err
+		}
+	}
+
 	d := generateSentinelDeployment(rf, labels, ownerRefs)
 	err := r.K8SService.CreateOrUpdateDeployment(rf.Namespace, d)
 
@@ -98,15 +108,29 @@ func (r *RedisFailoverKubeClient) EnsureSentinelDeployment(rf *redisfailoverv1.R
 	return err
 }
 
+// ensureSentinelServiceAccount makes sure the auto-provisioned Sentinel ServiceAccount exists.
+func (r *RedisFailoverKubeClient) ensureSentinelServiceAccount(rf *redisfailoverv1.RedisFailover, labels map[string]string, ownerRefs []metav1.OwnerReference) error {
+	sa := generateSentinelServiceAccount(rf, labels, ownerRefs)
+	err := r.K8SService.CreateOrUpdateServiceAccount(rf.Namespace, sa)
+	r.setEnsureOperationMetrics(sa.Namespace, sa.Name, "ServiceAccount", rf.Name, err)
+	return err
+}
+
 // EnsureRedisStatefulset makes sure the redis statefulset exists in the desired state
 func (r *RedisFailoverKubeClient) EnsureRedisStatefulset(rf *redisfailoverv1.RedisFailover, labels map[string]string, ownerRefs []metav1.OwnerReference) error {
 	if !rf.Spec.Redis.DisablePodDisruptionBudget {
-		if err := r.ensurePodDisruptionBudget(rf, redisName, redisRoleName, labels, ownerRefs); err != nil {
+		if err := r.ensurePodDisruptionBudget(rf, redisName, redisRoleName, labels, ownerRefs, rf.Spec.Redis.Replicas); err != nil {
 			return err
 		}
 	}
-	ss := generateRedisStatefulSet(rf, labels, ownerRefs)
-	err := r.K8SService.CreateOrUpdateStatefulSet(rf.Namespace, ss)
+
+	password, err := k8s.GetRedisPassword(r.K8SService, rf)
+	if err != nil {
+		return err
+	}
+
+	ss := generateRedisStatefulSet(rf, labels, ownerRefs, password)
+	err = r.K8SService.CreateOrUpdateStatefulSet(rf.Namespace, ss)
 
 	r.setEnsureOperationMetrics(ss.Namespace, ss.Name, "StatefulSet", rf.Name, err)
 	return err
@@ -114,14 +138,10 @@ func (r *RedisFailoverKubeClient) EnsureRedisStatefulset(rf *redisfailoverv1.Red
 
 // EnsureRedisConfigMap makes sure the Redis ConfigMap exists
 func (r *RedisFailoverKubeClient) EnsureRedisConfigMap(rf *redisfailoverv1.RedisFailover, labels map[string]string, ownerRefs []metav1.OwnerReference) error {
-
-	password, err := k8s.GetRedisPassword(r.K8SService, rf)
-	if err != nil {
-		return err
-	}
-
-	cm := generateRedisConfigMap(rf, labels, ownerRefs, password)
-	err = r.K8SService.CreateOrUpdateConfigMap(rf.Namespace, cm)
+	// The password is passed to redis-server via env-backed command args, not
+	// written into this ConfigMap, so it is not fetched here.
+	cm := generateRedisConfigMap(rf, labels, ownerRefs)
+	err := r.K8SService.CreateOrUpdateConfigMap(rf.Namespace, cm)
 
 	r.setEnsureOperationMetrics(cm.Namespace, cm.Name, "ConfigMap", rf.Name, err)
 	return err
@@ -229,19 +249,21 @@ func (r *RedisFailoverKubeClient) EnsureRedisSlaveService(rf *redisfailoverv1.Re
 	return err
 }
 
-// EnsureRedisStatefulset makes sure the pdb exists in the desired state
-func (r *RedisFailoverKubeClient) ensurePodDisruptionBudget(rf *redisfailoverv1.RedisFailover, name string, component string, labels map[string]string, ownerRefs []metav1.OwnerReference) error {
+// ensurePodDisruptionBudget creates or updates a PDB for the given component.
+// replicas must be the replica count of the component being protected (not a different component).
+func (r *RedisFailoverKubeClient) ensurePodDisruptionBudget(rf *redisfailoverv1.RedisFailover, name string, component string, labels map[string]string, ownerRefs []metav1.OwnerReference, replicas int32) error {
 	name = generateName(name, rf.Name)
 	namespace := rf.Namespace
 
 	minAvailable := intstr.FromInt(2)
-	if rf.Spec.Redis.Replicas <= 2 {
+	if replicas <= 2 {
 		minAvailable = intstr.FromInt(1)
 	}
 
-	labels = util.MergeLabels(labels, generateSelectorLabels(component, rf.Name))
+	selectorLabels := generateSelectorLabels(component, rf.Name)
+	metaLabels := util.MergeLabels(labels, selectorLabels)
 
-	pdb := generatePodDisruptionBudget(name, namespace, labels, ownerRefs, minAvailable)
+	pdb := generatePodDisruptionBudget(name, namespace, metaLabels, ownerRefs, minAvailable, selectorLabels)
 	err := r.K8SService.CreateOrUpdatePodDisruptionBudget(namespace, pdb)
 	r.setEnsureOperationMetrics(pdb.Namespace, pdb.Name, "PodDisruptionBudget" /* pdb.TypeMeta.Kind isnt working;  pdb.Kind isnt working either */, rf.Name, err)
 	return err
