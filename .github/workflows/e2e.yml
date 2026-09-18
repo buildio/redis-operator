@@ -2,7 +2,6 @@ name: E2E Tests
 
 on:
   pull_request:
-    branches: [main]
   workflow_dispatch:
 
 jobs:
@@ -14,7 +13,7 @@ jobs:
       - name: Set up minikube
         uses: medyagh/setup-minikube@v0.0.21
         with:
-          kubernetes-version: v1.30.0
+          kubernetes-version: v1.32.0
 
       - name: Build operator image
         run: |
@@ -353,7 +352,7 @@ jobs:
       - name: Set up minikube
         uses: medyagh/setup-minikube@v0.0.21
         with:
-          kubernetes-version: v1.30.0
+          kubernetes-version: v1.32.0
 
       - name: Build operator image
         run: |
@@ -612,7 +611,7 @@ jobs:
       - name: Set up minikube
         uses: medyagh/setup-minikube@v0.0.21
         with:
-          kubernetes-version: v1.30.0
+          kubernetes-version: v1.32.0
 
       - name: Build operator image
         run: |
