@@ -11,6 +11,7 @@ import (
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/utils/ptr"
 
 	redisfailoverv1 "github.com/saremox/redis-operator/api/redisfailover/v1"
 	"github.com/saremox/redis-operator/log"
@@ -58,10 +59,9 @@ func TestCheckRedisNumberFalse(t *testing.T) {
 
 	rf := generateRF()
 
-	wrongNumber := int32(4)
 	ss := &appsv1.StatefulSet{
 		Spec: appsv1.StatefulSetSpec{
-			Replicas: &wrongNumber,
+			Replicas: ptr.To(int32(4)),
 		},
 	}
 	ms := &mK8SService.Services{}
@@ -79,10 +79,9 @@ func TestCheckRedisNumberTrue(t *testing.T) {
 
 	rf := generateRF()
 
-	goodNumber := int32(3)
 	ss := &appsv1.StatefulSet{
 		Spec: appsv1.StatefulSetSpec{
-			Replicas: &goodNumber,
+			Replicas: ptr.To(int32(3)),
 		},
 	}
 	ms := &mK8SService.Services{}
@@ -115,10 +114,9 @@ func TestCheckSentinelNumberFalse(t *testing.T) {
 
 	rf := generateRF()
 
-	wrongNumber := int32(4)
 	ss := &appsv1.Deployment{
 		Spec: appsv1.DeploymentSpec{
-			Replicas: &wrongNumber,
+			Replicas: ptr.To(int32(4)),
 		},
 	}
 	ms := &mK8SService.Services{}
@@ -136,10 +134,9 @@ func TestCheckSentinelNumberTrue(t *testing.T) {
 
 	rf := generateRF()
 
-	goodNumber := int32(3)
 	ss := &appsv1.Deployment{
 		Spec: appsv1.DeploymentSpec{
-			Replicas: &goodNumber,
+			Replicas: ptr.To(int32(3)),
 		},
 	}
 	ms := &mK8SService.Services{}
@@ -518,23 +515,30 @@ func TestCheckSentinelSlavesNumberQuorumInMemoryGetNumberSentinelSlavesInMemoryE
 // a replica whose PVC is stuck in a dead zone) must still be accepted,
 // where the exact-match check would block forever.
 func TestCheckSentinelSlavesNumberQuorumInMemory(t *testing.T) {
-	rf := generateRF()
-	rf.Spec.Redis.Replicas = 5 // 4 expected slaves, quorum = 4/2+1 = 3
-
 	tests := []struct {
 		name     string
+		replicas int32
 		nSlaves  int32
 		expError bool
 	}{
-		{"all expected slaves present", 4, false},
-		{"quorum met, one permanently missing slave", 3, false},
-		{"exactly one below quorum", 2, true},
-		{"far below quorum", 0, true},
+		{"all expected slaves present", 5, 4, false},
+		{"quorum met, one permanently missing slave", 5, 3, false},
+		{"exactly one below quorum", 5, 2, true},
+		{"far below quorum", 5, 0, true},
+		// Replicas: 1 means 0 expected slaves (master-only). The majority
+		// formula expected/2+1 degenerates to 1 at expected=0, which would
+		// wrongly demand a slave that was never expected to exist and
+		// permanently block master pod replacement. 0 expected must mean 0
+		// quorum.
+		{"single replica, no slaves expected", 1, 0, false},
 	}
 
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
 			assert := assert.New(t)
+
+			rf := generateRF()
+			rf.Spec.Redis.Replicas = test.replicas
 
 			ms := &mK8SService.Services{}
 			mr := &mRedisService.Client{}

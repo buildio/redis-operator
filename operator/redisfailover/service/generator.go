@@ -14,6 +14,7 @@ import (
 	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/util/intstr"
+	"k8s.io/utils/ptr"
 
 	redisfailoverv1 "github.com/saremox/redis-operator/api/redisfailover/v1"
 	"github.com/saremox/redis-operator/operator/redisfailover/util"
@@ -448,8 +449,8 @@ func generateRedisStatefulSet(rf *redisfailoverv1.RedisFailover, labels map[stri
 					ImagePullSecrets:              rf.Spec.Redis.ImagePullSecrets,
 					PriorityClassName:             rf.Spec.Redis.PriorityClassName,
 					ServiceAccountName:            rf.Spec.Redis.ServiceAccountName,
+					EnableServiceLinks:            ptr.To(false),
 					TerminationGracePeriodSeconds: &terminationGracePeriodSeconds,
-					EnableServiceLinks:            ptrBool(false),
 					Containers: []corev1.Container{
 						{
 							Name:            "redis",
@@ -648,7 +649,7 @@ func generateSentinelDeployment(rf *redisfailoverv1.RedisFailover, labels map[st
 					ImagePullSecrets:          rf.Spec.Sentinel.ImagePullSecrets,
 					PriorityClassName:         rf.Spec.Sentinel.PriorityClassName,
 					ServiceAccountName:        serviceAccountName,
-					EnableServiceLinks:        ptrBool(false),
+					EnableServiceLinks:        ptr.To(false),
 					InitContainers: []corev1.Container{
 						{
 							Name:            "sentinel-config-copy",
@@ -931,14 +932,13 @@ func getAffinity(affinity *corev1.Affinity, labels map[string]string) *corev1.Af
 // any field the user set on secctx taking precedence. A partial user context
 // only overrides the fields it specifies instead of dropping all the defaults.
 func getSecurityContext(secctx *corev1.PodSecurityContext) *corev1.PodSecurityContext {
-	defaultUserAndGroup := int64(1000)
-	runAsNonRoot := true
+	defaultUserAndGroup := ptr.To(int64(1000))
 
 	result := &corev1.PodSecurityContext{
-		RunAsUser:    &defaultUserAndGroup,
-		RunAsGroup:   &defaultUserAndGroup,
-		RunAsNonRoot: &runAsNonRoot,
-		FSGroup:      &defaultUserAndGroup,
+		RunAsUser:    defaultUserAndGroup,
+		RunAsGroup:   defaultUserAndGroup,
+		RunAsNonRoot: ptr.To(true),
+		FSGroup:      defaultUserAndGroup,
 		SeccompProfile: &corev1.SeccompProfile{
 			Type: corev1.SeccompProfileTypeRuntimeDefault,
 		},
@@ -976,20 +976,16 @@ func getContainerSecurityContext(secctx *corev1.SecurityContext) *corev1.Securit
 			"ALL",
 		},
 	}
-	privileged := false
-	defaultUserAndGroup := int64(1000)
-	runAsNonRoot := true
-	allowPrivilegeEscalation := false
-	readOnlyRootFilesystem := true
+	defaultUserAndGroup := ptr.To(int64(1000))
 
 	result := &corev1.SecurityContext{
 		Capabilities:             capabilities,
-		Privileged:               &privileged,
-		RunAsUser:                &defaultUserAndGroup,
-		RunAsGroup:               &defaultUserAndGroup,
-		RunAsNonRoot:             &runAsNonRoot,
-		ReadOnlyRootFilesystem:   &readOnlyRootFilesystem,
-		AllowPrivilegeEscalation: &allowPrivilegeEscalation,
+		Privileged:               ptr.To(false),
+		RunAsUser:                defaultUserAndGroup,
+		RunAsGroup:               defaultUserAndGroup,
+		RunAsNonRoot:             ptr.To(true),
+		ReadOnlyRootFilesystem:   ptr.To(true),
+		AllowPrivilegeEscalation: ptr.To(false),
 	}
 	if secctx == nil {
 		return result
@@ -1342,12 +1338,6 @@ func pullPolicy(specPolicy corev1.PullPolicy) corev1.PullPolicy {
 		return corev1.PullAlways
 	}
 	return specPolicy
-}
-
-// ptrBool returns a pointer to a bool value.
-// Used for optional PodSpec fields like EnableServiceLinks.
-func ptrBool(b bool) *bool {
-	return &b
 }
 
 func getTerminationGracePeriodSeconds(rf *redisfailoverv1.RedisFailover) int64 {
