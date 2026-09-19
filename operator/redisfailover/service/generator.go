@@ -580,6 +580,17 @@ func generateRedisStatefulSet(rf *redisfailoverv1.RedisFailover, labels map[stri
 		ss.Spec.Template.Spec.Containers = append(ss.Spec.Template.Spec.Containers, exporter)
 	}
 
+	// Upstream adds a shell init container that deletes stale temp-*.rdb files.
+	// This fork's instance manager already cleans the data directory before it
+	// starts redis, so the extra container is only added when the manager is
+	// off.
+	if !instanceManagerEnabled(rf) {
+		ss.Spec.Template.Spec.InitContainers = append(
+			[]corev1.Container{createRDBTempfileCleanupContainer(rf)},
+			ss.Spec.Template.Spec.InitContainers...,
+		)
+	}
+
 	// Add instance manager init container if enabled (CNPG model)
 	// This must come before user-provided init containers so the binary is
 	// available for any custom init logic that might need it.
@@ -969,6 +980,49 @@ func getSecurityContext(secctx *corev1.PodSecurityContext) *corev1.PodSecurityCo
 // context, with any field the user set on secctx taking precedence. A partial
 // user context only overrides the fields it specifies instead of dropping all
 // the defaults.
+// createRDBTempfileCleanupContainer removes stale RDB tempfiles before Redis
+// starts.
+//
+// Redis writes temp-<pid>.rdb while a BGSAVE is in flight and renames it over
+// the real dump on success. If the process dies mid-save -- OOM kill, node
+// eviction, SIGKILL after a failed shutdown -- the tempfile is left behind.
+// Nothing removes it: Redis only cleans up the child it forked itself, so the
+// files accumulate across restarts until they fill the volume, at which point
+// every subsequent BGSAVE fails too.
+//
+// The temp-<pid>.rdb name is fixed in rdb.c and does not depend on dbfilename,
+// so matching that pattern cannot touch the live dump whatever it is called.
+// This runs as an init container, so Redis is not running and no BGSAVE can be
+// in progress while it deletes.
+func createRDBTempfileCleanupContainer(rf *redisfailoverv1.RedisFailover) corev1.Container {
+	return corev1.Container{
+		Name:            "rdb-tempfile-cleanup",
+		Image:           rf.Spec.Redis.Image,
+		ImagePullPolicy: pullPolicy(rf.Spec.Redis.ImagePullPolicy),
+		SecurityContext: getContainerSecurityContext(rf.Spec.Redis.ContainerSecurityContext),
+		Command: []string{
+			"sh", "-c",
+			"find /data -maxdepth 1 -type f -name 'temp-*.rdb' -delete",
+		},
+		VolumeMounts: []corev1.VolumeMount{
+			{
+				Name:      getRedisDataVolumeName(rf),
+				MountPath: "/data",
+			},
+		},
+		Resources: corev1.ResourceRequirements{
+			Limits: corev1.ResourceList{
+				corev1.ResourceCPU:    resource.MustParse("10m"),
+				corev1.ResourceMemory: resource.MustParse("32Mi"),
+			},
+			Requests: corev1.ResourceList{
+				corev1.ResourceCPU:    resource.MustParse("10m"),
+				corev1.ResourceMemory: resource.MustParse("32Mi"),
+			},
+		},
+	}
+}
+
 func getContainerSecurityContext(secctx *corev1.SecurityContext) *corev1.SecurityContext {
 	capabilities := &corev1.Capabilities{
 		Add: []corev1.Capability{},

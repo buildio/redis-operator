@@ -3,10 +3,11 @@ package redisfailover
 import (
 	"context"
 	"errors"
-	"github.com/saremox/redis-operator/service/k8s"
-	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"strconv"
 	"time"
+
+	"github.com/saremox/redis-operator/service/k8s"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 
 	redisfailoverv1 "github.com/saremox/redis-operator/api/redisfailover/v1"
 	"github.com/saremox/redis-operator/metrics"
@@ -90,14 +91,25 @@ func (r *RedisFailoverHandler) UpdateRedisesPods(rf *redisfailoverv1.RedisFailov
 			// so one permanently unavailable replica (e.g. a PVC stuck in a dead
 			// zone) cannot block master replacement forever when a safe failover
 			// is available via the reachable majority.
-			sentinels, err := r.rfChecker.GetSentinelsIPs(rf)
-			if err != nil {
-				return err
-			}
-			for _, sip := range sentinels {
-				if err := r.rfChecker.CheckSentinelSlavesNumberQuorumInMemory(sip, rf); err != nil {
-					r.logger.WithField("redisfailover", rf.ObjectMeta.Name).WithField("namespace", rf.ObjectMeta.Namespace).Infof("Waiting for sentinels to see a quorum of slaves before replacing the master: %s", err.Error())
-					return nil
+			//
+			// This gate only applies when Sentinel is actually managing
+			// failover. In operator-managed mode (sentinel.enabled: false)
+			// there is no Sentinel Deployment to query - GetSentinelsIPs would
+			// just 404 against it - and the operator's own election logic in
+			// checkAndHealOperatorManagedMode (the "no master" branch) already
+			// takes over on the very next reconcile once this delete leaves the
+			// RedisFailover without a master, using the same replication-offset
+			// based selection this gate exists to protect.
+			if !rf.OperatorManagedFailover() {
+				sentinels, err := r.rfChecker.GetSentinelsIPs(rf)
+				if err != nil {
+					return err
+				}
+				for _, sip := range sentinels {
+					if err := r.rfChecker.CheckSentinelSlavesNumberQuorumInMemory(sip, rf); err != nil {
+						r.logger.WithField("redisfailover", rf.ObjectMeta.Name).WithField("namespace", rf.ObjectMeta.Namespace).Infof("Waiting for sentinels to see a quorum of slaves before replacing the master: %s", err.Error())
+						return nil
+					}
 				}
 			}
 
@@ -193,7 +205,7 @@ func (r *RedisFailoverHandler) CheckAndHeal(rf *redisfailoverv1.RedisFailover) e
 					State:   redisfailoverv1.NotHealthyState,
 					Message: errorMsg,
 				}
-				r.logger.WithField("redisfailover", rf.ObjectMeta.Name).WithField("namespace", rf.ObjectMeta.Namespace).Errorf(errorMsg)
+				r.logger.WithField("redisfailover", rf.ObjectMeta.Name).WithField("namespace", rf.ObjectMeta.Namespace).Error(errorMsg)
 				return err
 			}
 			return nil
@@ -227,7 +239,7 @@ func (r *RedisFailoverHandler) CheckAndHeal(rf *redisfailoverv1.RedisFailover) e
 					State:   redisfailoverv1.NotHealthyState,
 					Message: errorMsg,
 				}
-				r.logger.WithField("redisfailover", rf.ObjectMeta.Name).WithField("namespace", rf.ObjectMeta.Namespace).Errorf(errorMsg)
+				r.logger.WithField("redisfailover", rf.ObjectMeta.Name).WithField("namespace", rf.ObjectMeta.Namespace).Error(errorMsg)
 				return err2
 			}
 		} else {
@@ -251,7 +263,7 @@ func (r *RedisFailoverHandler) CheckAndHeal(rf *redisfailoverv1.RedisFailover) e
 						State:   redisfailoverv1.NotHealthyState,
 						Message: errorMsg,
 					}
-					r.logger.WithField("redisfailover", rf.ObjectMeta.Name).WithField("namespace", rf.ObjectMeta.Namespace).Errorf(errorMsg)
+					r.logger.WithField("redisfailover", rf.ObjectMeta.Name).WithField("namespace", rf.ObjectMeta.Namespace).Error(errorMsg)
 					return err3
 				}
 
@@ -375,14 +387,18 @@ func (r *RedisFailoverHandler) CheckAndHeal(rf *redisfailoverv1.RedisFailover) e
 // checkAndHealOperatorManagedMode handles failover when Sentinel is disabled.
 // The operator directly manages master election and failover.
 func (r *RedisFailoverHandler) checkAndHealOperatorManagedMode(rf *redisfailoverv1.RedisFailover) error {
-	if !r.rfChecker.IsRedisRunning(rf) {
-		errorMsg := "not all replicas running"
+	// Heal as long as a quorum (majority) of pods is running rather than requiring
+	// the full set, matching the Sentinel-managed path (CheckAndHeal above): a
+	// single Pending pod (unschedulable affinity, AZ loss) must not permanently
+	// block the operator's own master election in this - the default - mode.
+	if !r.rfChecker.IsRedisRunningQuorum(rf) {
+		errorMsg := "redis quorum not running"
 		rf.Status = redisfailoverv1.RedisFailoverStatus{
 			State:   redisfailoverv1.NotHealthyState,
 			Message: errorMsg,
 		}
 		setRedisCheckerMetrics(r.mClient, "redis", rf.Namespace, rf.Name, metrics.REDIS_REPLICA_MISMATCH, metrics.NOT_APPLICABLE, errors.New(errorMsg))
-		r.logger.WithField("redisfailover", rf.ObjectMeta.Name).WithField("namespace", rf.ObjectMeta.Namespace).Debugf("Number of redis mismatch, waiting for redis statefulset reconcile")
+		r.logger.WithField("redisfailover", rf.ObjectMeta.Name).WithField("namespace", rf.ObjectMeta.Namespace).Debugf("Redis quorum not running, waiting for redis statefulset reconcile")
 		return nil
 	}
 
