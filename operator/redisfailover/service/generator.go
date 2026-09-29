@@ -89,10 +89,11 @@ func generateSentinelService(rf *redisfailoverv1.RedisFailover, labels map[strin
 	// The sentinel exporter sidecar listens on sentinelExporterPort, but without
 	// a matching service port there is no way to scrape it through the service.
 	if rf.Spec.Sentinel.Exporter.Enabled {
+		port := sentinelExporterListenPort(rf)
 		svc.Spec.Ports = append(svc.Spec.Ports, corev1.ServicePort{
 			Name:       "metrics",
-			Port:       sentinelExporterPort,
-			TargetPort: intstr.FromInt(sentinelExporterPort),
+			Port:       port,
+			TargetPort: intstr.FromInt(int(port)),
 			Protocol:   corev1.ProtocolTCP,
 		})
 	}
@@ -126,7 +127,7 @@ func generateRedisService(rf *redisfailoverv1.RedisFailover, labels map[string]s
 			ClusterIP: corev1.ClusterIPNone,
 			Ports: []corev1.ServicePort{
 				{
-					Port:     exporterPort,
+					Port:     redisExporterListenPort(rf),
 					Protocol: corev1.ProtocolTCP,
 					Name:     exporterPortName,
 				},
@@ -354,6 +355,13 @@ fi
 
 cmd="${cmd} info replication"
 
+# The operator changes the password of a running Redis in place, and the pod
+# restarts onto it later. Until then a refused password says nothing about
+# replication.
+if echo "${cmd}" | xargs -0 sh -c 2>&1 | grep -qE "NOAUTH|WRONGPASS"; then
+		exit 0
+fi
+
 check_master(){
 		exit 0
 }
@@ -453,7 +461,7 @@ func generateRedisStatefulSet(rf *redisfailoverv1.RedisFailover, labels map[stri
 					TerminationGracePeriodSeconds: &terminationGracePeriodSeconds,
 					Containers: []corev1.Container{
 						{
-							Name:            "redis",
+							Name:            redisContainerName,
 							Image:           rf.Spec.Redis.Image,
 							ImagePullPolicy: pullPolicy(rf.Spec.Redis.ImagePullPolicy),
 							SecurityContext: getContainerSecurityContext(rf.Spec.Redis.ContainerSecurityContext),
@@ -609,8 +617,12 @@ func generateRedisStatefulSet(rf *redisfailoverv1.RedisFailover, labels map[stri
 		ss.Spec.Template.Spec.Containers = append(ss.Spec.Template.Spec.Containers, extraContainers...)
 	}
 
+	// User-supplied env is placed before the operator-injected vars so that, on
+	// duplicate names (Kubernetes last-wins), the operator's REDIS_ADDR/PORT/USER/
+	// PASSWORD keep precedence and can't be silently overridden.
 	redisEnv := getRedisEnv(rf)
-	ss.Spec.Template.Spec.Containers[0].Env = append(ss.Spec.Template.Spec.Containers[0].Env, redisEnv...)
+	mainEnv := append(ss.Spec.Template.Spec.Containers[0].Env, rf.Spec.Redis.Env...)
+	ss.Spec.Template.Spec.Containers[0].Env = append(mainEnv, redisEnv...)
 
 	return ss
 }
@@ -641,6 +653,7 @@ func generateSentinelDeployment(rf *redisfailoverv1.RedisFailover, labels map[st
 		},
 		Spec: appsv1.DeploymentSpec{
 			Replicas: &rf.Spec.Sentinel.Replicas,
+			Strategy: rf.Spec.Sentinel.Strategy,
 			Selector: &metav1.LabelSelector{
 				MatchLabels: selectorLabels,
 			},
@@ -700,6 +713,7 @@ func generateSentinelDeployment(rf *redisfailoverv1.RedisFailover, labels map[st
 							Image:           rf.Spec.Sentinel.Image,
 							ImagePullPolicy: pullPolicy(rf.Spec.Sentinel.ImagePullPolicy),
 							SecurityContext: getContainerSecurityContext(rf.Spec.Sentinel.ContainerSecurityContext),
+							Env:             rf.Spec.Sentinel.Env,
 							Ports: []corev1.ContainerPort{
 								{
 									Name:          "sentinel",
@@ -841,6 +855,24 @@ var exporterDefaultResourceRequirements = corev1.ResourceRequirements{
 	},
 }
 
+// redisExporterListenPort returns the port the redis exporter listens on,
+// falling back to the built-in default when the spec leaves it unset.
+func redisExporterListenPort(rf *redisfailoverv1.RedisFailover) int32 {
+	if p := rf.Spec.Redis.Exporter.Port; p != 0 {
+		return p
+	}
+	return exporterPort
+}
+
+// sentinelExporterListenPort returns the port the sentinel exporter listens on,
+// falling back to the built-in default when the spec leaves it unset.
+func sentinelExporterListenPort(rf *redisfailoverv1.RedisFailover) int32 {
+	if p := rf.Spec.Sentinel.Exporter.Port; p != 0 {
+		return p
+	}
+	return sentinelExporterPort
+}
+
 func createRedisExporterContainer(rf *redisfailoverv1.RedisFailover) corev1.Container {
 	resources := exporterDefaultResourceRequirements
 	if rf.Spec.Redis.Exporter.Resources != nil {
@@ -864,7 +896,7 @@ func createRedisExporterContainer(rf *redisfailoverv1.RedisFailover) corev1.Cont
 		Ports: []corev1.ContainerPort{
 			{
 				Name:          "metrics",
-				ContainerPort: exporterPort,
+				ContainerPort: redisExporterListenPort(rf),
 				Protocol:      corev1.ProtocolTCP,
 			},
 		},
@@ -873,6 +905,13 @@ func createRedisExporterContainer(rf *redisfailoverv1.RedisFailover) corev1.Cont
 
 	redisEnv := getRedisExporterEnv(rf)
 	container.Env = append(container.Env, redisEnv...)
+	// Only for a custom port, so default pod templates stay unchanged.
+	if rf.Spec.Redis.Exporter.Port != 0 {
+		container.Env = append(container.Env, corev1.EnvVar{
+			Name:  "REDIS_EXPORTER_WEB_LISTEN_ADDRESS",
+			Value: fmt.Sprintf("0.0.0.0:%d", rf.Spec.Redis.Exporter.Port),
+		})
+	}
 
 	return container
 }
@@ -882,6 +921,7 @@ func createSentinelExporterContainer(rf *redisfailoverv1.RedisFailover) corev1.C
 	if rf.Spec.Sentinel.Exporter.Resources != nil {
 		resources = *rf.Spec.Sentinel.Exporter.Resources
 	}
+	listenPort := sentinelExporterListenPort(rf)
 	container := corev1.Container{
 		Name:            sentinelExporterContainerName,
 		Image:           rf.Spec.Sentinel.Exporter.Image,
@@ -897,7 +937,7 @@ func createSentinelExporterContainer(rf *redisfailoverv1.RedisFailover) corev1.C
 			},
 		}, corev1.EnvVar{
 			Name:  "REDIS_EXPORTER_WEB_LISTEN_ADDRESS",
-			Value: fmt.Sprintf("0.0.0.0:%[1]v", sentinelExporterPort),
+			Value: fmt.Sprintf("0.0.0.0:%[1]v", listenPort),
 		}, corev1.EnvVar{
 			Name:  "REDIS_ADDR",
 			Value: "redis://127.0.0.1:26379",
@@ -906,7 +946,7 @@ func createSentinelExporterContainer(rf *redisfailoverv1.RedisFailover) corev1.C
 		Ports: []corev1.ContainerPort{
 			{
 				Name:          "metrics",
-				ContainerPort: sentinelExporterPort,
+				ContainerPort: listenPort,
 				Protocol:      corev1.ProtocolTCP,
 			},
 		},

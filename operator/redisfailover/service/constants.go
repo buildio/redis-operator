@@ -25,6 +25,7 @@ const (
 	redisShutdownName          = "r-s"
 	redisReadinessName         = "r-readiness"
 	redisRoleName              = "redis"
+	redisContainerName         = "redis"
 	sentinelServiceAccountName = "s-sa"
 	appLabel                   = "redis-failover"
 	hostnameTopologyKey        = "kubernetes.io/hostname"
@@ -46,3 +47,11 @@ const (
 // template hash, which the existing revision-based staleness check in
 // UpdateRedisesPods already uses to roll pods one at a time.
 const redisAuthSecretChecksumAnnotation = "redisfailovers.databases.spotahome.com/secret-checksum"
+
+// resizeRequestedAnnotation holds when the operator last requested an
+// in-place resize of the pod, and is cleared once the resize is applied.
+const resizeRequestedAnnotation = "redisfailovers.databases.spotahome.com/resize-requested-at"
+
+// masterSafeToEvictAnnotation is the cluster-autoscaler annotation used to keep
+// the node running the redis master from being drained during scale-down.
+const masterSafeToEvictAnnotation = "cluster-autoscaler.kubernetes.io/safe-to-evict"

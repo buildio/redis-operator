@@ -13,17 +13,18 @@ import (
 // CMDFlags are the flags used by the cmd
 // TODO: improve flags.
 type CMDFlags struct {
-	KubeConfig               string
-	SupportedNamespacesRegex string
-	Development              bool
-	ListenAddr               string
-	MetricsPath              string
-	K8sQueriesPerSecond      int
-	K8sQueriesBurstable      int
-	Concurrency              int
-	SyncInterval             int
-	LogLevel                 string
-	InstanceManagerImage     string
+	KubeConfig                  string
+	SupportedNamespacesRegex    string
+	Development                 bool
+	ListenAddr                  string
+	MetricsPath                 string
+	K8sQueriesPerSecond         int
+	K8sQueriesBurstable         int
+	Concurrency                 int
+	SyncInterval                int
+	LogLevel                    string
+	InstanceManagerImage        string
+	DisconnectClientsOnDemotion bool
 }
 
 // Init initializes and parse the flags
@@ -37,12 +38,12 @@ func (c *CMDFlags) Init() {
 	flag.StringVar(&c.MetricsPath, "metrics-path", "/metrics", "Path to serve the metrics.")
 	flag.IntVar(&c.K8sQueriesPerSecond, "k8s-cli-qps-limit", 100, "Number of allowed queries per second by kubernetes client without client side throttling")
 	flag.IntVar(&c.K8sQueriesBurstable, "k8s-cli-burstable-limit", 100, "Number of allowed burst requests by kubernetes client without client side throttling")
-	// default is 3 for conccurency because kooper also defines 3 as default
-	// reference: https://github.com/spotahome/kooper/blob/master/controller/controller.go#L89
+	// 3 is also the controller's fallback for a concurrency of 0 or less.
 	flag.IntVar(&c.Concurrency, "concurrency", 3, "Number of conccurent workers meant to process events")
 	flag.IntVar(&c.SyncInterval, "sync-interval", 30, "Number of seconds between checks")
 	flag.StringVar(&c.LogLevel, "log-level", "info", "set log level")
 	flag.StringVar(&c.InstanceManagerImage, "instance-manager-image", "", "Image containing the redis-instance binary for init containers (defaults to empty, which disables RDB cleanup)")
+	flag.BoolVar(&c.DisconnectClientsOnDemotion, "disconnect-clients-on-demotion", true, "Close a redis pod's normal and pub/sub client connections when it stops being the master, so clients reconnect to the new master instead of staying on a replica")
 	// Parse flags
 	flag.Parse()
 
@@ -60,5 +61,6 @@ func (c *CMDFlags) ToRedisOperatorConfig() redisfailover.Config {
 		SyncInterval:             c.SyncInterval,
 		SupportedNamespacesRegex: c.SupportedNamespacesRegex,
 		InstanceManagerImage:     c.InstanceManagerImage,
+		KeepClientsOnDemotion:    !c.DisconnectClientsOnDemotion,
 	}
 }
