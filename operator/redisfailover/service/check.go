@@ -71,15 +71,17 @@ type RedisFailoverChecker struct {
 	redisClient   redis.Client
 	logger        log.Logger
 	metricsClient metrics.Recorder
+	opts          options
 }
 
 // NewRedisFailoverChecker creates an object of the RedisFailoverChecker struct
-func NewRedisFailoverChecker(k8sService k8s.Services, redisClient redis.Client, logger log.Logger, metricsClient metrics.Recorder) *RedisFailoverChecker {
+func NewRedisFailoverChecker(k8sService k8s.Services, redisClient redis.Client, logger log.Logger, metricsClient metrics.Recorder, opts ...Option) *RedisFailoverChecker {
 	return &RedisFailoverChecker{
 		k8sService:    k8sService,
 		redisClient:   redisClient,
 		logger:        logger,
 		metricsClient: metricsClient,
+		opts:          applyOptions(opts),
 	}
 }
 
@@ -107,22 +109,45 @@ func (r *RedisFailoverChecker) CheckSentinelNumber(rf *redisfailoverv1.RedisFail
 	return nil
 }
 
-func (r *RedisFailoverChecker) setMasterLabelIfNecessary(namespace string, pod corev1.Pod) error {
+// IsMasterPod reports whether the pod is labelled as the redis master.
+func IsMasterPod(pod *corev1.Pod) bool {
+	return pod.Labels[redisRoleLabelKey] == redisRoleLabelMaster
+}
+
+// applyMasterEvictionAnnotation keeps the cluster-autoscaler safe-to-evict
+// annotation in sync with a pod's role, but only when the RedisFailover opts in
+// via spec.redis.preventMasterEviction. The master is pinned (false) and slaves
+// are marked evictable (true). It reads the desired state off the already-fetched
+// pod object and skips the patch when the annotation is already correct, so it is
+// safe to call on every reconcile without extra API writes.
+func applyMasterEvictionAnnotation(k8sService k8s.Services, rf *redisfailoverv1.RedisFailover, pod corev1.Pod, isMaster bool) error {
+	if !rf.Spec.Redis.PreventMasterEviction {
+		return nil
+	}
+	desired := "true"
+	if isMaster {
+		desired = "false"
+	}
+	if pod.Annotations[masterSafeToEvictAnnotation] == desired {
+		return nil
+	}
+	return k8sService.UpdatePodAnnotations(rf.Namespace, pod.Name, map[string]string{masterSafeToEvictAnnotation: desired})
+}
+
+func (r *RedisFailoverChecker) setMasterLabelIfNecessary(rf *redisfailoverv1.RedisFailover, pod corev1.Pod) error {
+	if err := applyMasterEvictionAnnotation(r.k8sService, rf, pod, true); err != nil {
+		return err
+	}
 	for labelKey, labelValue := range pod.Labels {
 		if labelKey == redisRoleLabelKey && labelValue == redisRoleLabelMaster {
 			return nil
 		}
 	}
-	return r.k8sService.UpdatePodLabels(namespace, pod.Name, generateRedisMasterRoleLabel())
+	return r.k8sService.UpdatePodLabels(rf.Namespace, pod.Name, generateRedisMasterRoleLabel())
 }
 
-func (r *RedisFailoverChecker) setSlaveLabelIfNecessary(namespace string, pod corev1.Pod) error {
-	for labelKey, labelValue := range pod.Labels {
-		if labelKey == redisRoleLabelKey && labelValue == redisRoleLabelSlave {
-			return nil
-		}
-	}
-	return r.k8sService.UpdatePodLabels(namespace, pod.Name, generateRedisSlaveRoleLabel())
+func (r *RedisFailoverChecker) setSlaveLabelIfNecessary(rf *redisfailoverv1.RedisFailover, pod corev1.Pod, port, password string) error {
+	return setSlaveLabel(r.k8sService, r.opts, rf, pod, port, password)
 }
 
 // CheckAllSlavesFromMaster controlls that all slaves have the same master (the real one)
@@ -146,17 +171,22 @@ func (r *RedisFailoverChecker) CheckAllSlavesFromMaster(master string, rf *redis
 	var wrongMasterErr error
 	for _, rp := range rps.Items {
 		if rp.Status.PodIP == master {
-			err = r.setMasterLabelIfNecessary(rf.Namespace, rp)
+			err = r.setMasterLabelIfNecessary(rf, rp)
 			if err != nil {
 				return err
 			}
 		} else {
-			err = r.setSlaveLabelIfNecessary(rf.Namespace, rp)
+			err = r.setSlaveLabelIfNecessary(rf, rp, rport, password)
 			if err != nil {
 				return err
 			}
 		}
 
+		if rp.DeletionTimestamp != nil {
+			// A terminating pod is going away, and dialing its IP can block
+			// for the whole connection timeout.
+			continue
+		}
 		slave, err := r.redisClient.GetSlaveOf(rp.Status.PodIP, rport, password)
 		if err != nil {
 			// The pod is unreachable - typically the old master on a downed node.
@@ -353,10 +383,13 @@ func (r *RedisFailoverChecker) GetMasterIP(rf *redisfailoverv1.RedisFailover) (s
 	return masters[0], nil
 }
 
-// GetNumberMasters returns the number of redis nodes that are working as a master
+// GetNumberMasters returns the number of redis nodes that are working as a master.
+// A ready pod that does not answer may still be the master, so if no pod
+// answers as master it returns an error rather than zero, and callers don't
+// promote over it. A pod Kubernetes has marked not ready is skipped.
 func (r *RedisFailoverChecker) GetNumberMasters(rf *redisfailoverv1.RedisFailover) (int, error) {
 	nMasters := 0
-	rips, err := r.GetRedisesIPs(rf)
+	rps, err := r.k8sService.GetStatefulSetPods(rf.Namespace, GetRedisName(rf))
 	if err != nil {
 		r.logger.Error(err.Error())
 		return nMasters, err
@@ -368,16 +401,27 @@ func (r *RedisFailoverChecker) GetNumberMasters(rf *redisfailoverv1.RedisFailove
 		return nMasters, err
 	}
 
+	var unanswered error
 	rport := getRedisPort(rf.Spec.Redis.Port)
-	for _, rip := range rips {
-		master, err := r.redisClient.IsMaster(rip, rport, password)
+	for i := range rps.Items {
+		rp := &rps.Items[i]
+		if rp.Status.Phase != corev1.PodRunning || rp.DeletionTimestamp != nil {
+			continue
+		}
+		master, err := r.redisClient.IsMaster(rp.Status.PodIP, rport, password)
 		if err != nil {
-			r.logger.Errorf("Get redis info failed, maybe this node is not ready, pod ip: %s", rip)
+			r.logger.Errorf("Get redis info failed, maybe this node is not ready, pod ip: %s", rp.Status.PodIP)
+			if unanswered == nil && util.PodIsReady(rp) {
+				unanswered = fmt.Errorf("ready redis pod %s did not answer: %w", rp.Name, err)
+			}
 			continue
 		}
 		if master {
 			nMasters++
 		}
+	}
+	if nMasters == 0 && unanswered != nil {
+		return nMasters, unanswered
 	}
 	return nMasters, nil
 }
@@ -516,6 +560,12 @@ func (r *RedisFailoverChecker) GetRedisRevisionHash(podName string, rFailover *r
 
 	if pod.Labels == nil {
 		return "", errors.New("labels not found")
+	}
+
+	// A pod being resized in place is on no revision until the resize is
+	// applied, even when its label matches again, e.g. after a revert.
+	if pod.Annotations[resizeRequestedAnnotation] != "" {
+		return "", nil
 	}
 
 	val := pod.Labels[appsv1.ControllerRevisionHashLabelKey]

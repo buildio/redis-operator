@@ -26,6 +26,13 @@ rules:
     - list
     - update      
   - apiGroups:
+      - discovery.k8s.io
+    resources:
+      - endpointslices
+    verbs:
+      - get
+      - list
+  - apiGroups:
       - ""
     resources:
       - pods
@@ -37,6 +44,7 @@ rules:
       - serviceaccounts
       - persistentvolumeclaims
       - persistentvolumeclaims/finalizers
+      - pods/resize
     verbs:
       - "*"
   - apiGroups:
@@ -44,6 +52,7 @@ rules:
     resources:
       - deployments
       - statefulsets
+      - controllerrevisions
     verbs:
       - "*"
   - apiGroups:

@@ -40,7 +40,7 @@ import (
 const (
 	ommNamespace      = "rf-integration-tests-operator-managed"
 	ommName           = "testing-omm"
-	ommRedisSize      = int32(3)
+	ommRedisSize      = int32(2)
 	ommAuthSecretPath = "redis-auth-omm"
 	ommTestPass       = "test-pass-omm"
 )
@@ -255,6 +255,13 @@ func (c *ommClients) onlyMaster(labelSelector string) (string, error) {
 // at all, and the only one that exercises a rollout (a StatefulSet template
 // change) rather than just initial creation.
 func TestRedisFailoverOperatorManagedModeRollout(t *testing.T) {
+	// Runs alongside TestRedisFailover (creation_test.go): separate
+	// namespaces, separate in-process operator instances (each with its own
+	// leader-election lease scoped to its own namespace), separate Secrets -
+	// nothing here is shared state, so there's no reason to pay for the two
+	// tests' pod-startup waits back to back instead of concurrently.
+	t.Parallel()
+
 	require := require.New(t)
 
 	stopC := make(chan struct{})
@@ -286,7 +293,9 @@ func TestRedisFailoverOperatorManagedModeRollout(t *testing.T) {
 	require.NoError(waitForNamespaceActive(k8sClient, ommNamespace, 15*time.Second))
 
 	k8sservice := k8s.New(k8sClient, customClient, log.Dummy, metrics.Dummy)
-	redisfailoverOperator, err := redisfailover.New(redisfailover.Config{}, k8sservice, k8sClient, ommNamespace, redisClient, metrics.Dummy, log.Dummy)
+	// The resync is far longer than the rollout's timeout, so only pod events
+	// can drive the rollout's steps.
+	redisfailoverOperator, err := redisfailover.New(redisfailover.Config{SyncInterval: 600, SupportedNamespacesRegex: "^" + ommNamespace + "$"}, k8sservice, k8sClient, ommNamespace, redisClient, metrics.Dummy, log.Dummy)
 	require.NoError(err)
 
 	go func() {

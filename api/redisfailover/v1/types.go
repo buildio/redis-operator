@@ -1,8 +1,10 @@
 package v1
 
 import (
+	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/util/intstr"
 )
 
 // +genclient
@@ -49,6 +51,7 @@ type RedisSettings struct {
 	Replicas                      int32                             `json:"replicas,omitempty"`
 	Port                          int32                             `json:"port,omitempty"`
 	Resources                     corev1.ResourceRequirements       `json:"resources,omitempty"`
+	Env                           []corev1.EnvVar                   `json:"env,omitempty"`
 	CustomConfig                  []string                          `json:"customConfig,omitempty"`
 	CustomCommandRenames          []RedisCommandRename              `json:"customCommandRenames,omitempty"`
 	Command                       []string                          `json:"command,omitempty"`
@@ -78,6 +81,34 @@ type RedisSettings struct {
 	CustomReadinessProbe          *corev1.Probe                     `json:"customReadinessProbe,omitempty"`
 	CustomStartupProbe            *corev1.Probe                     `json:"customStartupProbe,omitempty"`
 	DisablePodDisruptionBudget    bool                              `json:"disablePodDisruptionBudget,omitempty"`
+	// PreventMasterEviction, when true, annotates the current master pod with
+	// cluster-autoscaler.kubernetes.io/safe-to-evict=false so the cluster
+	// autoscaler will not drain the node running the master. Slaves are marked
+	// evictable. Defaults to false.
+	PreventMasterEviction bool `json:"preventMasterEviction,omitempty"`
+	// PodDisruptionBudgetMinAvailable overrides the PodDisruptionBudget
+	// minAvailable for the redis pods. Defaults to 2 (or 1 when replicas <= 2).
+	PodDisruptionBudgetMinAvailable *intstr.IntOrString `json:"podDisruptionBudgetMinAvailable,omitempty"`
+	// MaxMemory lets the operator set maxmemory and maxmemory-policy from the
+	// redis container's memory limit. Values set in customConfig take precedence.
+	MaxMemory *MaxMemorySettings `json:"maxMemory,omitempty"`
+	// InPlaceResize controls whether redis pods whose update only changes
+	// container resources are resized in place instead of being recreated.
+	// Defaults to Enabled.
+	// +kubebuilder:validation:Enum=Enabled;Disabled
+	InPlaceResize string `json:"inPlaceResize,omitempty"`
+}
+
+// MaxMemorySettings configures the operator-managed maxmemory.
+type MaxMemorySettings struct {
+	// Percent of the memory limit used as maxmemory. At least 32Mi of the
+	// limit is always left free. Defaults to 75.
+	// +kubebuilder:validation:Minimum=10
+	// +kubebuilder:validation:Maximum=95
+	Percent int32 `json:"percent,omitempty"`
+	// Policy is the maxmemory-policy. Defaults to noeviction.
+	// +kubebuilder:validation:Enum=noeviction;allkeys-lru;allkeys-lfu;allkeys-random;volatile-lru;volatile-lfu;volatile-random;volatile-ttl
+	Policy string `json:"policy,omitempty"`
 }
 
 // SentinelSettings defines the specification of the sentinel cluster
@@ -93,6 +124,7 @@ type SentinelSettings struct {
 	ImagePullPolicy            corev1.PullPolicy                 `json:"imagePullPolicy,omitempty"`
 	Replicas                   int32                             `json:"replicas,omitempty"`
 	Resources                  corev1.ResourceRequirements       `json:"resources,omitempty"`
+	Env                        []corev1.EnvVar                   `json:"env,omitempty"`
 	CustomConfig               []string                          `json:"customConfig,omitempty"`
 	Command                    []string                          `json:"command,omitempty"`
 	StartupConfigMap           string                            `json:"startupConfigMap,omitempty"`
@@ -119,6 +151,14 @@ type SentinelSettings struct {
 	CustomReadinessProbe       *corev1.Probe                     `json:"customReadinessProbe,omitempty"`
 	CustomStartupProbe         *corev1.Probe                     `json:"customStartupProbe,omitempty"`
 	DisablePodDisruptionBudget bool                              `json:"disablePodDisruptionBudget,omitempty"`
+	// Strategy overrides the sentinel Deployment update strategy (e.g. to set
+	// rollingUpdate maxSurge/maxUnavailable). Defaults to the Kubernetes default
+	// RollingUpdate strategy when unset.
+	Strategy appsv1.DeploymentStrategy `json:"strategy,omitempty"`
+	// PodDisruptionBudgetMinAvailable overrides the PodDisruptionBudget
+	// minAvailable for the sentinel pods. Defaults to 2 (or 1 when sentinel
+	// replicas <= 2).
+	PodDisruptionBudgetMinAvailable *intstr.IntOrString `json:"podDisruptionBudgetMinAvailable,omitempty"`
 }
 
 // AuthSettings contains settings about auth
@@ -142,6 +182,12 @@ type Exporter struct {
 	Args                     []string                     `json:"args,omitempty"`
 	Env                      []corev1.EnvVar              `json:"env,omitempty"`
 	Resources                *corev1.ResourceRequirements `json:"resources,omitempty"`
+	// Port the exporter sidecar listens on and the metrics service exposes.
+	// Defaults to 9121 for the redis exporter and 9355 for the sentinel exporter
+	// when left as 0.
+	// +kubebuilder:validation:Minimum=0
+	// +kubebuilder:validation:Maximum=65535
+	Port int32 `json:"port,omitempty"`
 }
 
 // SentinelConfigCopy defines the specification for the sentinel exporter
