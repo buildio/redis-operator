@@ -17,6 +17,12 @@
 # Pod logs die with the pod (a StatefulSet delete recreates rather than
 # restarts, so --previous is empty), so the log is streamed during termination.
 #
+# Run it against pods that already carry the spec you want to measure. Editing
+# the StatefulSet does not change a running pod, so a delete straight after a
+# spec change measures the *old* pod and reports on the spec you just replaced.
+# After a normal operator rollout this is automatic: the pods are already on the
+# new spec by the time it settles.
+#
 # usage: prove-shutdown-saves.sh <rf-name> [namespace]
 set -u
 export KUBECONFIG=${KUBECONFIG:-$HOME/.kube/kubeconfig-us-east-1b}
