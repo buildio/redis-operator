@@ -3,15 +3,18 @@ package redisfailover
 import (
 	"context"
 	"errors"
+	"fmt"
 	"strconv"
 	"time"
 
 	"github.com/saremox/redis-operator/service/k8s"
+	appsv1 "k8s.io/api/apps/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 
 	redisfailoverv1 "github.com/saremox/redis-operator/api/redisfailover/v1"
 	"github.com/saremox/redis-operator/metrics"
 	rfservice "github.com/saremox/redis-operator/operator/redisfailover/service"
+	"github.com/saremox/redis-operator/operator/redisfailover/util"
 	"github.com/saremox/redis-operator/service/redis"
 )
 
@@ -28,7 +31,6 @@ func (r *RedisFailoverHandler) UpdateRedisesPods(rf *redisfailoverv1.RedisFailov
 		r.logger.WithField("namespace", rf.Namespace).WithField("name", rf.Name).WithField("masterIP", masterIP).Debug("got master IP")
 	}
 	// No performed updates when nodes are syncing, still not connected, etc.
-	readyReplicas := int32(0)
 	for _, rip := range redises {
 		if rip != masterIP {
 			ready, err := r.rfChecker.CheckRedisSlavesReady(rip, rf)
@@ -39,43 +41,6 @@ func (r *RedisFailoverHandler) UpdateRedisesPods(rf *redisfailoverv1.RedisFailov
 			if !ready {
 				return nil
 			}
-			readyReplicas++
-		}
-	}
-
-	// The loop above only sees pods that are already Running: GetRedisesIPs
-	// filters on Status.Phase, so a replica that is still terminating or being
-	// recreated is absent from the list entirely. "No replica reported unready"
-	// is therefore also true when there is no replica at all, and the gate
-	// passes on an empty set. The code then falls through to replacing the
-	// master while the replacement replica has not synced, leaving the failover
-	// with nothing to promote until the next reconcile elects one.
-	//
-	// In sentinel mode that is masked by the second gate further down
-	// (CheckSentinelSlavesNumberQuorumInMemory), which reads sentinel's own
-	// in-memory view of the replicas and does block. Operator-managed failover
-	// skips that gate, so it needs the count here instead. Scoped to
-	// OperatorManagedFailover so sentinel behaviour is unchanged.
-	//
-	// A quorum rather than the full expected count, mirroring the sentinel gate,
-	// so that one permanently unavailable replica (e.g. a PVC stuck in a dead
-	// zone) cannot block pod replacement forever while a safe failover is still
-	// available through the reachable majority.
-	if rf.OperatorManagedFailover() {
-		expectedReplicas := rf.Spec.Redis.Replicas - 1
-		if rf.Bootstrapping() {
-			// Every redis pod replicates from the external bootstrap node, so
-			// none of them is the master and all count towards the quorum.
-			expectedReplicas = rf.Spec.Redis.Replicas
-		}
-		var quorum int32
-		if expectedReplicas > 0 {
-			quorum = expectedReplicas/2 + 1
-		}
-		if readyReplicas < quorum {
-			r.logger.WithField("namespace", rf.Namespace).WithField("name", rf.Name).
-				Infof("waiting for a quorum of ready replicas before replacing pods: have %d, need at least %d of %d expected", readyReplicas, quorum, expectedReplicas)
-			return nil
 		}
 	}
 
@@ -119,6 +84,16 @@ func (r *RedisFailoverHandler) UpdateRedisesPods(rf *redisfailoverv1.RedisFailov
 			return err
 		}
 		if masterRevision != ssUR {
+			// Upstream's settled check (Saremox/redis-operator): the readiness
+			// loop above only iterates pods that are already Running, so a
+			// replica that is terminating or being recreated is absent from it
+			// and "nothing reported unready" is trivially true. This counts the
+			// pods against the expected replica count instead, which is what
+			// actually keeps replica-first / master-last ordering intact.
+			if settled, err := r.redisPodsSettled(rf, ssUR); err != nil || !settled {
+				return err
+			}
+
 			// Deleting the master makes sentinel run a failover. Only do that once
 			// every sentinel has a quorum (majority) of the freshly (re)started
 			// slaves in memory - the redis-side readiness checked above is not
@@ -803,4 +778,34 @@ func updateStatus(k8sservice k8s.Services, rf *redisfailoverv1.RedisFailover, ol
 		rf.Status.LastChanged = oldLastChanged
 	}
 	k8sservice.UpdateRedisFailoverStatus(context.Background(), rf.Namespace, rf, metav1.PatchOptions{})
+}
+
+// redisPodsSettled reports whether the redis StatefulSet has finished the
+// previous step of a rollout: every expected pod exists, none is terminating,
+// and every pod already carrying the target revision is ready.
+//
+// Ported verbatim from upstream (Saremox/redis-operator) so this fork does not
+// carry a second, divergent implementation of the same guard.
+func (r *RedisFailoverHandler) redisPodsSettled(rf *redisfailoverv1.RedisFailover, updateRevision string) (bool, error) {
+	pods, err := r.k8sservice.GetStatefulSetPods(rf.Namespace, rfservice.GetRedisName(rf))
+	if err != nil {
+		return false, err
+	}
+	wait := func(reason string) (bool, error) {
+		r.logger.WithField("namespace", rf.Namespace).WithField("name", rf.Name).Infof("redis rollout waits: %s", reason)
+		return false, nil
+	}
+	if len(pods.Items) < int(rf.Spec.Redis.Replicas) {
+		return wait(fmt.Sprintf("%d of %d pods exist", len(pods.Items), rf.Spec.Redis.Replicas))
+	}
+	for i := range pods.Items {
+		pod := &pods.Items[i]
+		if pod.DeletionTimestamp != nil {
+			return wait("pod " + pod.Name + " is terminating")
+		}
+		if pod.Labels[appsv1.ControllerRevisionHashLabelKey] == updateRevision && !util.PodIsReady(pod) {
+			return wait("pod " + pod.Name + " is not ready")
+		}
+	}
+	return true, nil
 }
