@@ -4190,10 +4190,10 @@ func TestGetTerminationGracePeriodSecondsUsesUserSuppliedValue(t *testing.T) {
 // the redis container only in Sentinel mode.
 //
 // In operator-managed mode the hook could only run a synchronous SAVE, which
-// redis already does on SIGTERM, and which blocks the redis main thread - so
-// against an instance already stuck in a BGSAVE it never returned. Worse, the
-// terminationGracePeriodSeconds countdown starts before preStop, so the time it
-// spent came out of the instance manager's own graceful-shutdown window.
+// redis already does on SIGTERM, so it wrote the RDB twice on every pod
+// replacement. It also took time from the instance manager's own
+// graceful-shutdown window, because the terminationGracePeriodSeconds countdown
+// starts before preStop runs.
 func TestRedisPreStopHookOnlyForSentinel(t *testing.T) {
 	for _, test := range []struct {
 		name     string

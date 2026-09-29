@@ -318,11 +318,9 @@ eval $save_command`, rfName, port)
 		//
 		// It used to run a synchronous SAVE. That was redundant - redis saves on
 		// SIGTERM by itself because save points are configured, and the instance
-		// manager runs as PID 1 and forwards SIGTERM - and actively harmful:
-		// the terminationGracePeriodSeconds countdown starts *before* preStop, so
-		// every second spent here was taken from the instance manager's own 25s
-		// graceful window. SAVE is synchronous, so against an instance already
-		// stuck in a BGSAVE it never returned at all.
+		// manager runs as PID 1 and forwards SIGTERM - and it took time from the
+		// instance manager's own graceful window, because the
+		// terminationGracePeriodSeconds countdown starts *before* preStop.
 		shutdownContent = "# no-op: operator-managed mode does not use a preStop hook\n"
 	}
 
@@ -1516,8 +1514,7 @@ func envExists(env []corev1.EnvVar, name string) bool {
 // It is not merely redundant. The terminationGracePeriodSeconds countdown starts
 // before preStop runs, so whatever the hook spends is taken from the budget the
 // instance manager needs for its own graceful shutdown (SIGTERM, 25s, then
-// SIGKILL). A hook that blocks - and the old one ran a synchronous SAVE, which
-// never returns against an instance already stuck in a BGSAVE - leaves nothing.
+// SIGKILL), whose own constants claim to match that grace period.
 func redisLifecycle(rf *redisfailoverv1.RedisFailover) *corev1.Lifecycle {
 	if !rf.SentinelEnabled() {
 		return nil
