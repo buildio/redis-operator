@@ -3,18 +3,22 @@ package redisfailover
 import (
 	"context"
 	"errors"
+	"sync/atomic"
 	"testing"
+	"time"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/mock"
 	"github.com/stretchr/testify/require"
 
 	corev1 "k8s.io/api/core/v1"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/watch"
+	clientfeatures "k8s.io/client-go/features"
+	clientfeaturestesting "k8s.io/client-go/features/testing"
 	fakekubernetes "k8s.io/client-go/kubernetes/fake"
-
-	kooperlog "github.com/spotahome/kooper/v2/log"
+	"k8s.io/client-go/tools/cache"
 
 	redisfailoverv1 "github.com/saremox/redis-operator/api/redisfailover/v1"
 	"github.com/saremox/redis-operator/log"
@@ -22,10 +26,6 @@ import (
 	mK8SService "github.com/saremox/redis-operator/mocks/service/k8s"
 	mRedisService "github.com/saremox/redis-operator/mocks/service/redis"
 )
-
-// This file is deliberately in package redisfailover (white-box) rather than
-// redisfailover_test, because kooperlogger and its WithKV method are
-// unexported and can't be reached from outside the package.
 
 // -----------------------------------------------------------------------
 // NewRedisFailoverRetriever - List
@@ -45,7 +45,7 @@ func TestNewRedisFailoverRetrieverListFiltersByNamespace(t *testing.T) {
 	mk.On("ListRedisFailovers", mock.Anything, "", mock.Anything).Once().Return(rfList, nil)
 
 	retriever := NewRedisFailoverRetriever(cfg, mk)
-	obj, err := retriever.List(context.Background(), metav1.ListOptions{})
+	obj, err := retriever.ListWithContext(context.Background(), metav1.ListOptions{})
 	require.NoError(t, err)
 
 	got, ok := obj.(*redisfailoverv1.RedisFailoverList)
@@ -67,7 +67,7 @@ func TestNewRedisFailoverRetrieverListPropagatesError(t *testing.T) {
 	mk.On("ListRedisFailovers", mock.Anything, "", mock.Anything).Once().Return(nil, wantErr)
 
 	retriever := NewRedisFailoverRetriever(cfg, mk)
-	obj, err := retriever.List(context.Background(), metav1.ListOptions{})
+	obj, err := retriever.ListWithContext(context.Background(), metav1.ListOptions{})
 
 	assert.Equal(t, wantErr, err)
 	assert.Nil(t, obj)
@@ -86,7 +86,7 @@ func TestNewRedisFailoverRetrieverWatchFiltersByNamespace(t *testing.T) {
 	mk.On("WatchRedisFailovers", mock.Anything, "", mock.Anything).Once().Return(fakeWatcher, nil)
 
 	retriever := NewRedisFailoverRetriever(cfg, mk)
-	w, err := retriever.Watch(context.Background(), metav1.ListOptions{})
+	w, err := retriever.WatchWithContext(context.Background(), metav1.ListOptions{})
 	require.NoError(t, err)
 	require.NotNil(t, w)
 
@@ -121,7 +121,7 @@ func TestNewRedisFailoverRetrieverWatchPropagatesError(t *testing.T) {
 	mk.On("WatchRedisFailovers", mock.Anything, "", mock.Anything).Once().Return(nil, wantErr)
 
 	retriever := NewRedisFailoverRetriever(cfg, mk)
-	w, err := retriever.Watch(context.Background(), metav1.ListOptions{})
+	w, err := retriever.WatchWithContext(context.Background(), metav1.ListOptions{})
 
 	assert.Equal(t, wantErr, err)
 	assert.Nil(t, w)
@@ -143,42 +143,55 @@ func TestNewRedisFailoverRetrieverWatchNilWatcherNoError(t *testing.T) {
 	var w watch.Interface
 	var err error
 	assert.NotPanics(t, func() {
-		w, err = retriever.Watch(context.Background(), metav1.ListOptions{})
+		w, err = retriever.WatchWithContext(context.Background(), metav1.ListOptions{})
 	})
 	assert.NoError(t, err)
 	assert.Nil(t, w)
 	mk.AssertExpectations(t)
 }
 
-// -----------------------------------------------------------------------
-// kooperlogger.WithKV
-// -----------------------------------------------------------------------
-
-// kvCapturingLogger is a minimal log.Logger test double that records the
-// values passed to WithFields so we can assert kooperlogger.WithKV forwards
-// its kooperlog.KV argument correctly.
-type kvCapturingLogger struct {
-	log.DummyLogger
-	lastKV map[string]interface{}
+// rfInformer builds an informer on NewRedisFailoverRetriever the way the
+// controller does.
+func rfInformer(t *testing.T, mk *mK8SService.Services) cache.SharedIndexInformer {
+	t.Helper()
+	lw := NewRedisFailoverRetriever(Config{SupportedNamespacesRegex: "^allowed$"}, mk)
+	informer := cache.NewSharedIndexInformer(lw, nil, 0, cache.Indexers{})
+	ctx, cancel := context.WithCancel(context.Background())
+	t.Cleanup(cancel)
+	go informer.RunWithContext(ctx)
+	return informer
 }
 
-func (l *kvCapturingLogger) WithFields(values map[string]interface{}) log.Logger {
-	l.lastKV = values
-	return l
+func TestRedisFailoverInformerSyncsFromAWatchListStream(t *testing.T) {
+	clientfeaturestesting.SetFeatureDuringTest(t, clientfeatures.WatchListClient, true)
+	mk := &mK8SService.Services{}
+	stream := watch.NewFake()
+	mk.On("WatchRedisFailovers", mock.Anything, "", mock.Anything).Return(stream, nil)
+
+	informer := rfInformer(t, mk)
+	stream.Add(&redisfailoverv1.RedisFailover{ObjectMeta: metav1.ObjectMeta{Name: "rf", Namespace: "allowed", ResourceVersion: "5"}})
+	stream.Action(watch.Bookmark, &redisfailoverv1.RedisFailover{ObjectMeta: metav1.ObjectMeta{
+		ResourceVersion: "6",
+		Annotations:     map[string]string{metav1.InitialEventsAnnotationKey: "true"},
+	}})
+
+	assert.Eventually(t, informer.HasSynced, 3*time.Second, 10*time.Millisecond, "the end-of-initial-events bookmark must reach the informer")
 }
 
-func TestKooperLoggerWithKV(t *testing.T) {
-	fake := &kvCapturingLogger{}
-	kl := kooperlogger{Logger: fake}
+func TestRedisFailoverInformerRelistsOnAnExpiredWatch(t *testing.T) {
+	clientfeaturestesting.SetFeatureDuringTest(t, clientfeatures.WatchListClient, false)
+	mk := &mK8SService.Services{}
+	var lists atomic.Int32
+	mk.On("ListRedisFailovers", mock.Anything, "", mock.Anything).Run(func(mock.Arguments) { lists.Add(1) }).
+		Return(&redisfailoverv1.RedisFailoverList{ListMeta: metav1.ListMeta{ResourceVersion: "1"}}, nil)
+	stream := watch.NewFake()
+	mk.On("WatchRedisFailovers", mock.Anything, "", mock.Anything).Return(stream, nil)
 
-	kv := kooperlog.KV{"foo": "bar", "n": 1}
-	result := kl.WithKV(kv)
+	informer := rfInformer(t, mk)
+	assert.Eventually(t, informer.HasSynced, 3*time.Second, 10*time.Millisecond)
+	stream.Error(&apierrors.NewResourceExpired("too old resource version").ErrStatus)
 
-	wrapped, ok := result.(kooperlogger)
-	require.True(t, ok)
-
-	assert.Equal(t, map[string]interface{}{"foo": "bar", "n": 1}, fake.lastKV)
-	assert.Same(t, fake, wrapped.Logger)
+	assert.Eventually(t, func() bool { return lists.Load() > 1 }, 5*time.Second, 10*time.Millisecond, "an expired watch must make the informer relist")
 }
 
 // -----------------------------------------------------------------------
@@ -230,4 +243,11 @@ func TestNewPropagatesLeaderElectionError(t *testing.T) {
 	assert.Nil(t, ctrl)
 	mk.AssertExpectations(t)
 	mr.AssertExpectations(t)
+}
+
+func TestNewPropagatesControllerError(t *testing.T) {
+	ctrl, err := New(Config{SupportedNamespacesRegex: ".*"}, &mK8SService.Services{}, fakekubernetes.NewClientset(), "test-namespace", &mRedisService.Client{}, failingQueueMetrics{metrics.Dummy}, log.Dummy)
+
+	assert.Error(t, err)
+	assert.Nil(t, ctrl)
 }

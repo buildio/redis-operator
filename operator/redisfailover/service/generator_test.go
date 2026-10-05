@@ -14,6 +14,7 @@ import (
 	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/util/intstr"
+	"k8s.io/utils/ptr"
 
 	redisfailoverv1 "github.com/saremox/redis-operator/api/redisfailover/v1"
 	"github.com/saremox/redis-operator/log"
@@ -1131,6 +1132,110 @@ func TestSentinelService(t *testing.T) {
 		})
 	}
 }
+
+func TestRedisShutdownConfigMapRetries(t *testing.T) {
+	assert := assert.New(t)
+
+	rf := generateRF()
+	// Sentinel is disabled by default in this fork, and the operator-managed
+	// shutdown script has no sentinel to query. The retries this test is about
+	// only exist in the sentinel branch, so ask for it explicitly.
+	rf.Spec.Sentinel.Enabled = ptr.To(true)
+
+	var script string
+	ms := &mK8SService.Services{}
+	ms.On("CreateOrUpdateConfigMap", rf.Namespace, mock.Anything).Return(nil).Run(func(args mock.Arguments) {
+		c := args.Get(1).(*corev1.ConfigMap)
+		if s, ok := c.Data["shutdown.sh"]; ok {
+			script = s
+		}
+	})
+
+	client := rfservice.NewRedisFailoverKubeClient(ms, log.Dummy, metrics.Dummy)
+	err := client.EnsureRedisShutdownConfigMap(rf, nil, []metav1.OwnerReference{})
+	assert.NoError(err)
+
+	// Both sentinel calls are retried: a single failed query used to be enough
+	// to skip the failover and shut the master down anyway.
+	assert.Contains(script, `while [ -z "$master" ] && [ "$retries" -lt 3 ]`)
+	assert.Contains(script, `while [ "$failover" != "OK" ] && [ "$retries" -lt 3 ]`)
+
+	// The preStop hook runs under /bin/sh, which is dash on the debian-based
+	// redis images. "let" does not exist there, so the counter would never
+	// increment and the retry loop would spin forever.
+	assert.NotContains(script, "let ")
+	assert.Contains(script, "retries=$((retries + 1))")
+}
+
+func TestSentinelServiceExporterPort(t *testing.T) {
+	sentinelPort := corev1.ServicePort{
+		Name:       "sentinel",
+		Port:       26379,
+		TargetPort: intstr.FromInt(26379),
+		Protocol:   corev1.ProtocolTCP,
+	}
+	metricsPort := corev1.ServicePort{
+		Name:       "metrics",
+		Port:       9355,
+		TargetPort: intstr.FromInt(9355),
+		Protocol:   corev1.ProtocolTCP,
+	}
+	customMetricsPort := corev1.ServicePort{
+		Name:       "metrics",
+		Port:       19355,
+		TargetPort: intstr.FromInt(19355),
+		Protocol:   corev1.ProtocolTCP,
+	}
+
+	tests := []struct {
+		name            string
+		exporterEnabled bool
+		exporterPort    int32
+		expectedPorts   []corev1.ServicePort
+	}{
+		{
+			name:            "exporter disabled exposes only the sentinel port",
+			exporterEnabled: false,
+			expectedPorts:   []corev1.ServicePort{sentinelPort},
+		},
+		{
+			name:            "exporter enabled also exposes the metrics port",
+			exporterEnabled: true,
+			expectedPorts:   []corev1.ServicePort{sentinelPort, metricsPort},
+		},
+		{
+			name:            "exporter port override is honoured",
+			exporterEnabled: true,
+			exporterPort:    19355,
+			expectedPorts:   []corev1.ServicePort{sentinelPort, customMetricsPort},
+		},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			assert := assert.New(t)
+
+			rf := generateRF()
+			rf.Spec.Sentinel.Exporter.Enabled = test.exporterEnabled
+			rf.Spec.Sentinel.Exporter.Port = test.exporterPort
+
+			generatedService := corev1.Service{}
+
+			ms := &mK8SService.Services{}
+			ms.On("CreateOrUpdateService", rf.Namespace, mock.Anything).Once().Run(func(args mock.Arguments) {
+				s := args.Get(1).(*corev1.Service)
+				generatedService = *s
+			}).Return(nil)
+
+			client := rfservice.NewRedisFailoverKubeClient(ms, log.Dummy, metrics.Dummy)
+			err := client.EnsureSentinelService(rf, nil, []metav1.OwnerReference{{Name: "testing"}})
+
+			assert.NoError(err)
+			assert.Equal(test.expectedPorts, generatedService.Spec.Ports)
+		})
+	}
+}
+
 func TestRedisService(t *testing.T) {
 	tests := []struct {
 		name            string
@@ -3059,94 +3164,6 @@ func TestRedisStatefulSetAuthSecretChecksumChangesWithPassword(t *testing.T) {
 	assert.Equal(annotationsV1[checksumKey], annotationsV1Again[checksumKey], "same password must produce the same checksum")
 	assert.NotEqual(annotationsV1[checksumKey], annotationsV2[checksumKey], "a rotated password must produce a different checksum, so the pod template (and its revision hash) changes")
 }
-func TestRedisShutdownConfigMapRetries(t *testing.T) {
-	assert := assert.New(t)
-
-	rf := generateRF()
-	// This fork defaults sentinel to disabled, which produces the save-only
-	// shutdown script. Enable it: this test covers the sentinel retry logic.
-	sentinelOnRetries := true
-	rf.Spec.Sentinel.Enabled = &sentinelOnRetries
-
-	var script string
-	ms := &mK8SService.Services{}
-	ms.On("CreateOrUpdateConfigMap", rf.Namespace, mock.Anything).Return(nil).Run(func(args mock.Arguments) {
-		c := args.Get(1).(*corev1.ConfigMap)
-		if s, ok := c.Data["shutdown.sh"]; ok {
-			script = s
-		}
-	})
-
-	client := rfservice.NewRedisFailoverKubeClient(ms, log.Dummy, metrics.Dummy)
-	err := client.EnsureRedisShutdownConfigMap(rf, nil, []metav1.OwnerReference{})
-	assert.NoError(err)
-
-	// Both sentinel calls are retried: a single failed query used to be enough
-	// to skip the failover and shut the master down anyway.
-	assert.Contains(script, `while [ -z "$master" ] && [ "$retries" -lt 3 ]`)
-	assert.Contains(script, `while [ "$failover" != "OK" ] && [ "$retries" -lt 3 ]`)
-
-	// The preStop hook runs under /bin/sh, which is dash on the debian-based
-	// redis images. "let" does not exist there, so the counter would never
-	// increment and the retry loop would spin forever.
-	assert.NotContains(script, "let ")
-	assert.Contains(script, "retries=$((retries + 1))")
-}
-
-func TestSentinelServiceExporterPort(t *testing.T) {
-	sentinelPort := corev1.ServicePort{
-		Name:       "sentinel",
-		Port:       26379,
-		TargetPort: intstr.FromInt(26379),
-		Protocol:   corev1.ProtocolTCP,
-	}
-	metricsPort := corev1.ServicePort{
-		Name:       "metrics",
-		Port:       9355,
-		TargetPort: intstr.FromInt(9355),
-		Protocol:   corev1.ProtocolTCP,
-	}
-
-	tests := []struct {
-		name            string
-		exporterEnabled bool
-		expectedPorts   []corev1.ServicePort
-	}{
-		{
-			name:            "exporter disabled exposes only the sentinel port",
-			exporterEnabled: false,
-			expectedPorts:   []corev1.ServicePort{sentinelPort},
-		},
-		{
-			name:            "exporter enabled also exposes the metrics port",
-			exporterEnabled: true,
-			expectedPorts:   []corev1.ServicePort{sentinelPort, metricsPort},
-		},
-	}
-
-	for _, test := range tests {
-		t.Run(test.name, func(t *testing.T) {
-			assert := assert.New(t)
-
-			rf := generateRF()
-			rf.Spec.Sentinel.Exporter.Enabled = test.exporterEnabled
-
-			generatedService := corev1.Service{}
-
-			ms := &mK8SService.Services{}
-			ms.On("CreateOrUpdateService", rf.Namespace, mock.Anything).Once().Run(func(args mock.Arguments) {
-				s := args.Get(1).(*corev1.Service)
-				generatedService = *s
-			}).Return(nil)
-
-			client := rfservice.NewRedisFailoverKubeClient(ms, log.Dummy, metrics.Dummy)
-			err := client.EnsureSentinelService(rf, nil, []metav1.OwnerReference{{Name: "testing"}})
-
-			assert.NoError(err)
-			assert.Equal(test.expectedPorts, generatedService.Spec.Ports)
-		})
-	}
-}
 func TestRedisPDBUsesRedisReplicaCount(t *testing.T) {
 	tests := []struct {
 		name             string
@@ -3937,6 +3954,49 @@ func TestRedisExporterCustomResources(t *testing.T) {
 	assert.NoError(err)
 	if assert.NotNil(gotSS) && assert.Len(gotSS.Spec.Template.Spec.Containers, 2) {
 		assert.Equal(*customResources, gotSS.Spec.Template.Spec.Containers[1].Resources)
+	}
+}
+
+func TestRedisExporterListensOnCustomPort(t *testing.T) {
+	tests := []struct {
+		name       string
+		port       int32
+		wantPort   int32
+		wantListen string
+	}{
+		{name: "default port leaves the listen address alone", wantPort: 9121},
+		{name: "custom port sets the listen address", port: 19121, wantPort: 19121, wantListen: "0.0.0.0:19121"},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			assert := assert.New(t)
+			rf := generateRF()
+			rf.Spec.Redis.Exporter.Enabled = true
+			rf.Spec.Redis.Exporter.Port = test.port
+
+			var gotSS *appsv1.StatefulSet
+			ms := &mK8SService.Services{}
+			ms.On("CreateOrUpdatePodDisruptionBudget", namespace, mock.Anything).Once().Return(nil, nil)
+			ms.On("CreateOrUpdateStatefulSet", namespace, mock.Anything).Once().Run(func(args mock.Arguments) {
+				gotSS = args.Get(1).(*appsv1.StatefulSet)
+			}).Return(nil)
+
+			client := rfservice.NewRedisFailoverKubeClient(ms, log.Dummy, metrics.Dummy)
+			assert.NoError(client.EnsureRedisStatefulset(rf, nil, []metav1.OwnerReference{}))
+
+			if assert.NotNil(gotSS) && assert.Len(gotSS.Spec.Template.Spec.Containers, 2) {
+				exporter := gotSS.Spec.Template.Spec.Containers[1]
+				assert.Equal(test.wantPort, exporter.Ports[0].ContainerPort)
+				var listen string
+				for _, env := range exporter.Env {
+					if env.Name == "REDIS_EXPORTER_WEB_LISTEN_ADDRESS" {
+						listen = env.Value
+					}
+				}
+				assert.Equal(test.wantListen, listen)
+			}
+		})
 	}
 }
 

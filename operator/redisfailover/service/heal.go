@@ -33,6 +33,10 @@ type RedisFailoverHeal interface {
 	DeletePod(podName string, rFailover *redisfailoverv1.RedisFailover) error
 	// Operator-managed failover methods
 	PromoteBestReplica(newMasterIP string, rFailover *redisfailoverv1.RedisFailover) error
+	EnsureRedisMaxMemory(rFailover *redisfailoverv1.RedisFailover, master string, redises []string) (MaxMemoryResult, error)
+	ResizePodInPlace(rFailover *redisfailoverv1.RedisFailover, podName, updateRevision string) (ResizeResult, error)
+	ApplyPassword(rFailover *redisfailoverv1.RedisFailover, password, previous string) (bool, error)
+	ApplySentinelPassword(rFailover *redisfailoverv1.RedisFailover, password string) (bool, error)
 }
 
 // RedisFailoverHealer is our implementation of RedisFailoverCheck interface
@@ -40,34 +44,34 @@ type RedisFailoverHealer struct {
 	k8sService  k8s.Services
 	redisClient redis.Client
 	logger      log.Logger
+	opts        options
 }
 
 // NewRedisFailoverHealer creates an object of the RedisFailoverChecker struct
-func NewRedisFailoverHealer(k8sService k8s.Services, redisClient redis.Client, logger log.Logger) *RedisFailoverHealer {
+func NewRedisFailoverHealer(k8sService k8s.Services, redisClient redis.Client, logger log.Logger, opts ...Option) *RedisFailoverHealer {
 	logger = logger.With("service", "redis.healer")
 	return &RedisFailoverHealer{
 		k8sService:  k8sService,
 		redisClient: redisClient,
 		logger:      logger,
+		opts:        applyOptions(opts),
 	}
 }
 
-func (r *RedisFailoverHealer) setMasterLabelIfNecessary(namespace string, pod v1.Pod) error {
+func (r *RedisFailoverHealer) setMasterLabelIfNecessary(rf *redisfailoverv1.RedisFailover, pod v1.Pod) error {
+	if err := applyMasterEvictionAnnotation(r.k8sService, rf, pod, true); err != nil {
+		return err
+	}
 	for labelKey, labelValue := range pod.Labels {
 		if labelKey == redisRoleLabelKey && labelValue == redisRoleLabelMaster {
 			return nil
 		}
 	}
-	return r.k8sService.UpdatePodLabels(namespace, pod.Name, generateRedisMasterRoleLabel())
+	return r.k8sService.UpdatePodLabels(rf.Namespace, pod.Name, generateRedisMasterRoleLabel())
 }
 
-func (r *RedisFailoverHealer) setSlaveLabelIfNecessary(namespace string, pod v1.Pod) error {
-	for labelKey, labelValue := range pod.Labels {
-		if labelKey == redisRoleLabelKey && labelValue == redisRoleLabelSlave {
-			return nil
-		}
-	}
-	return r.k8sService.UpdatePodLabels(namespace, pod.Name, generateRedisSlaveRoleLabel())
+func (r *RedisFailoverHealer) setSlaveLabelIfNecessary(rf *redisfailoverv1.RedisFailover, pod v1.Pod, port, password string) error {
+	return setSlaveLabel(r.k8sService, r.opts, rf, pod, port, password)
 }
 
 func (r *RedisFailoverHealer) MakeMaster(ip string, rf *redisfailoverv1.RedisFailover) error {
@@ -88,7 +92,7 @@ func (r *RedisFailoverHealer) MakeMaster(ip string, rf *redisfailoverv1.RedisFai
 	}
 	for _, rp := range rps.Items {
 		if rp.Status.PodIP == ip {
-			return r.setMasterLabelIfNecessary(rf.Namespace, rp)
+			return r.setMasterLabelIfNecessary(rf, rp)
 		}
 	}
 	return nil
@@ -126,7 +130,7 @@ func (r *RedisFailoverHealer) SetOldestAsMaster(rf *redisfailoverv1.RedisFailove
 				continue
 			}
 
-			err = r.setMasterLabelIfNecessary(rf.Namespace, pod)
+			err = r.setMasterLabelIfNecessary(rf, pod)
 			if err != nil {
 				return err
 			}
@@ -134,11 +138,11 @@ func (r *RedisFailoverHealer) SetOldestAsMaster(rf *redisfailoverv1.RedisFailove
 			newMasterIP = pod.Status.PodIP
 		} else {
 			r.logger.Infof("Making pod %s slave of %s", pod.Name, newMasterIP)
-			if err := r.redisClient.MakeSlaveOfWithPort(pod.Status.PodIP, newMasterIP, port, password); err != nil {
+			if err := r.redisClient.MakeSlaveOfWithPort(pod.Status.PodIP, port, newMasterIP, port, password); err != nil {
 				r.logger.WithField("redisfailover", rf.Name).WithField("namespace", rf.Namespace).Errorf("Make slave failed, slave pod ip: %s, master ip: %s, error: %v", pod.Status.PodIP, newMasterIP, err)
 			}
 
-			err = r.setSlaveLabelIfNecessary(rf.Namespace, pod)
+			err = r.setSlaveLabelIfNecessary(rf, pod, port, password)
 			if err != nil {
 				return err
 			}
@@ -203,7 +207,7 @@ func (r *RedisFailoverHealer) SetMasterOnAll(masterIP string, rf *redisfailoverv
 				continue
 			}
 			r.logger.WithField("redisfailover", rf.Name).WithField("namespace", rf.Namespace).Infof("Making pod %s slave of %s", pod.Name, masterIP)
-			if err := r.redisClient.MakeSlaveOfWithPort(pod.Status.PodIP, masterIP, port, password); err != nil {
+			if err := r.redisClient.MakeSlaveOfWithPort(pod.Status.PodIP, port, masterIP, port, password); err != nil {
 				// The pod is unreachable - typically the old master on a downed
 				// node. Skip it and keep repointing the reachable slaves instead
 				// of aborting; it will re-sync via sentinel once its node is back.
@@ -211,7 +215,7 @@ func (r *RedisFailoverHealer) SetMasterOnAll(masterIP string, rf *redisfailoverv
 				continue
 			}
 
-			err = r.setSlaveLabelIfNecessary(rf.Namespace, pod)
+			err = r.setSlaveLabelIfNecessary(rf, pod, port, password)
 			if err != nil {
 				return err
 			}
@@ -233,9 +237,13 @@ func (r *RedisFailoverHealer) SetExternalMasterOnAll(masterIP, masterPort string
 		return err
 	}
 
+	// The target pods' own port, which is not necessarily masterPort - the
+	// external bootstrap master can be configured on a different port than
+	// this RedisFailover's own Redis pods.
+	port := getRedisPort(rf.Spec.Redis.Port)
 	for _, pod := range ssp.Items {
 		r.logger.WithField("redisfailover", rf.Name).WithField("namespace", rf.Namespace).Infof("Making pod %s slave of %s:%s", pod.Name, masterIP, masterPort)
-		if err := r.redisClient.MakeSlaveOfWithPort(pod.Status.PodIP, masterIP, masterPort, password); err != nil {
+		if err := r.redisClient.MakeSlaveOfWithPort(pod.Status.PodIP, port, masterIP, masterPort, password); err != nil {
 			return err
 		}
 
@@ -337,7 +345,7 @@ func (r *RedisFailoverHealer) PromoteBestReplica(newMasterIP string, rf *redisfa
 	// Step 2: Update pod labels for the new master
 	for _, rp := range rps.Items {
 		if rp.Status.PodIP == newMasterIP {
-			if err := r.setMasterLabelIfNecessary(rf.Namespace, rp); err != nil {
+			if err := r.setMasterLabelIfNecessary(rf, rp); err != nil {
 				r.logger.WithField("redisfailover", rf.Name).WithField("namespace", rf.Namespace).
 					Errorf("Failed to set master label on pod %s: %v", rp.Name, err)
 				return err
@@ -362,14 +370,14 @@ func (r *RedisFailoverHealer) PromoteBestReplica(newMasterIP string, rf *redisfa
 		r.logger.WithField("redisfailover", rf.Name).WithField("namespace", rf.Namespace).
 			Infof("Making pod %s slave of %s", rp.Name, newMasterIP)
 
-		if err := r.redisClient.MakeSlaveOfWithPort(rp.Status.PodIP, newMasterIP, port, password); err != nil {
+		if err := r.redisClient.MakeSlaveOfWithPort(rp.Status.PodIP, port, newMasterIP, port, password); err != nil {
 			r.logger.WithField("redisfailover", rf.Name).WithField("namespace", rf.Namespace).
 				Errorf("Failed to make %s slave of %s: %v", rp.Status.PodIP, newMasterIP, err)
 			reconcileErrs = append(reconcileErrs, err)
 			continue
 		}
 
-		if err := r.setSlaveLabelIfNecessary(rf.Namespace, rp); err != nil {
+		if err := r.setSlaveLabelIfNecessary(rf, rp, port, password); err != nil {
 			r.logger.WithField("redisfailover", rf.Name).WithField("namespace", rf.Namespace).
 				Errorf("Failed to set slave label on pod %s: %v", rp.Name, err)
 			reconcileErrs = append(reconcileErrs, err)

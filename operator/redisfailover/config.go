@@ -10,4 +10,6 @@ type Config struct {
 	// InstanceManagerImage is the image used for Redis instance management init containers.
 	// This should be the same image as the operator, which contains the redis-instance binary.
 	InstanceManagerImage string
+	// KeepClientsOnDemotion is negative so the zero Config disconnects.
+	KeepClientsOnDemotion bool
 }

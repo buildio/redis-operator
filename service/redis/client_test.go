@@ -6,16 +6,19 @@ package redis
 // though it is the entire wire-protocol layer the operator uses to talk to
 // Redis and Sentinel.
 //
-// Two behaviours here were verified empirically against real Redis 7.0.15
-// rather than assumed, per the investigation that prompted this test suite:
-//   - SENTINEL CKQUORUM's NOQUORUM outcome (see TestSentinelCheckQuorum_NoQuorum).
+// Several behaviours here were verified empirically against real Redis
+// 7.0.15 rather than assumed, per the investigation that prompted this test
+// suite - each surfaced a real bug in client.go, fixed in the same change
+// as its test:
 //   - CONFIG SET aclfile's immutability (see TestSetCustomRedisConfig_ACLFile).
-// The aclfile finding surfaced a real bug in client.go, fixed in the same
-// change as this test (see the comment on TestSetCustomRedisConfig_ACLFile).
+//   - SENTINEL CKQUORUM's NOQUORUM outcome (see TestSentinelCheckQuorum_NoQuorum).
+//   - MakeSlaveOfWithPort connecting to the master's port instead of the
+//     target's own port (see TestMakeSlaveOfWithPort_MismatchedTargetPort).
 
 import (
 	"context"
 	"errors"
+	"io"
 	"net"
 	"os"
 	"strconv"
@@ -46,6 +49,29 @@ func newTestClientStruct() *client {
 // IsMaster / GetSlaveOf / SlaveIsReady / GetReplicationInfo
 // (shared read-only master+replica+sentinel environment)
 // ---------------------------------------------------------------------
+
+// A frozen node accepts connections and never replies.
+func TestIsMasterUnresponsiveTimesOut(t *testing.T) {
+	l, err := net.Listen("tcp", "127.0.0.1:0")
+	require.NoError(t, err)
+	defer func() { _ = l.Close() }()
+	go func() {
+		for {
+			conn, err := l.Accept()
+			if err != nil {
+				return
+			}
+			defer func() { _ = conn.Close() }()
+		}
+	}()
+	host, port, err := net.SplitHostPort(l.Addr().String())
+	require.NoError(t, err)
+
+	start := time.Now()
+	_, err = newTestClient().IsMaster(host, port, "")
+	assert.Error(t, err)
+	assert.Less(t, time.Since(start), 6*time.Second)
+}
 
 func TestIsMaster(t *testing.T) {
 	env := getSharedEnv(t)
@@ -219,6 +245,14 @@ func TestSlaveIsReady_ConnectionError(t *testing.T) {
 	assert.Error(t, err)
 }
 
+func TestSetPassword_ConnectionError(t *testing.T) {
+	port, err := findFreePort()
+	require.NoError(t, err)
+	c := newTestClient()
+
+	assert.Error(t, c.SetPassword(testLoopbackIP, strconv.Itoa(port), "", "p1"))
+}
+
 func TestGetReplicationInfo_ConnectionError(t *testing.T) {
 	port, err := findFreePort()
 	require.NoError(t, err)
@@ -243,18 +277,15 @@ func TestMakeMaster_ConnectionError(t *testing.T) {
 	assert.Error(t, err)
 }
 
-// TestMakeSlaveOfWithPort_ConnectionError points at a port nothing is
-// listening on to exercise MakeSlaveOfWithPort's own connection-error
-// branch. It intentionally does not attempt to also reach a real master -
-// see TestMakeSlaveOfWithPort_MismatchedTargetPort for why the address
-// MakeSlaveOfWithPort actually connects to is (ip, masterPort), not
-// (ip, targetPort).
+// TestMakeSlaveOfWithPort_ConnectionError points the target's own port at a
+// port nothing is listening on to exercise MakeSlaveOfWithPort's own
+// connection-error branch.
 func TestMakeSlaveOfWithPort_ConnectionError(t *testing.T) {
 	port, err := findFreePort()
 	require.NoError(t, err)
 	c := newTestClient()
 
-	err = c.MakeSlaveOfWithPort(testLoopbackIP, "10.0.0.1", strconv.Itoa(port), "")
+	err = c.MakeSlaveOfWithPort(testLoopbackIP, strconv.Itoa(port), "10.0.0.1", "6379", "")
 	assert.Error(t, err)
 }
 
@@ -309,7 +340,7 @@ func TestMakeSlaveOfWithPort_SamePortDifferentIP(t *testing.T) {
 	require.NoError(t, err)
 	require.True(t, isMaster)
 
-	err = c.MakeSlaveOfWithPort(a.IP, b.IP, strconv.Itoa(b.Port), "")
+	err = c.MakeSlaveOfWithPort(a.IP, strconv.Itoa(a.Port), b.IP, strconv.Itoa(b.Port), "")
 	require.NoError(t, err)
 
 	waitForCondition(t, 5*time.Second, func() bool {
@@ -327,55 +358,169 @@ func TestMakeSlaveOfWithPort_SamePortDifferentIP(t *testing.T) {
 	assert.True(t, linkUp)
 }
 
-// TestMakeSlaveOfWithPort_MismatchedTargetPort documents a real bug found
-// while building this test suite (not fixed here, per instructions - see
-// the task summary for the full report):
+// dialRaw uses a raw connection: a pooled client would silently redial.
+func dialRaw(t *testing.T, addr, cmd, wantReply string) net.Conn {
+	t.Helper()
+	conn, err := net.Dial("tcp", addr)
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = conn.Close() })
+	require.NoError(t, conn.SetDeadline(time.Now().Add(2*time.Second)))
+	_, err = conn.Write([]byte(cmd))
+	require.NoError(t, err)
+	reply := make([]byte, len(wantReply))
+	_, err = io.ReadFull(conn, reply)
+	require.NoError(t, err)
+	require.Equal(t, wantReply, string(reply))
+	return conn
+}
+
+// requireClosedByServer requires io.EOF; a read timeout means still open.
+func requireClosedByServer(t *testing.T, conn net.Conn) {
+	t.Helper()
+	require.NoError(t, conn.SetDeadline(time.Now().Add(5*time.Second)))
+	_, err := conn.Read(make([]byte, 1))
+	if netErr, ok := err.(net.Error); ok && netErr.Timeout() {
+		t.Fatalf("read timed out: the server never closed the connection: %v", err)
+	}
+	require.ErrorIs(t, err, io.EOF)
+}
+
+// SLAVEOF is re-issued against healthy replicas, so it must not disconnect.
+// Same port, different IPs: see TestMakeSlaveOfWithPort_MismatchedTargetPort.
+func TestMakeSlaveOfWithPort_LeavesClientConnectionsAlone(t *testing.T) {
+	requireRedisServer(t)
+	otherIP, ok := nonLoopbackIPv4()
+	if !ok {
+		t.Skip("no non-loopback IPv4 address available on this machine")
+	}
+	port, err := findFreePort()
+	require.NoError(t, err)
+
+	a := startRedisProcessOnAddr(t, testLoopbackIP, port)
+	b := startRedisProcessOnAddr(t, otherIP, port)
+	c := newTestClient()
+
+	appConn := dialRaw(t, a.Addr(), "PING\r\n", "+PONG\r\n")
+
+	require.NoError(t, c.MakeSlaveOfWithPort(a.IP, strconv.Itoa(a.Port), b.IP, strconv.Itoa(b.Port), ""))
+
+	require.NoError(t, appConn.SetDeadline(time.Now().Add(2*time.Second)))
+	_, err = appConn.Write([]byte("PING\r\n"))
+	require.NoError(t, err)
+	pong := make([]byte, 7)
+	_, err = io.ReadFull(appConn, pong)
+	require.NoError(t, err, "SLAVEOF must not close existing client connections")
+	assert.Equal(t, "+PONG\r\n", string(pong))
+}
+
+func replicaLinkID(t *testing.T, master *redisProc) string {
+	t.Helper()
+	rc := rediscli.NewClient(&rediscli.Options{Addr: master.Addr()})
+	defer func() { _ = rc.Close() }()
+	list, err := rc.Do(bgCtx(), "CLIENT", "LIST", "TYPE", "replica").Text()
+	require.NoError(t, err)
+	fields := strings.Fields(list)
+	require.NotEmpty(t, fields, "no replica connected to master")
+	require.True(t, strings.HasPrefix(fields[0], "id="), "unexpected CLIENT LIST output: %q", list)
+	return fields[0]
+}
+
+func TestDisconnectClients_ClosesNormalAndPubSubClientsOnly(t *testing.T) {
+	requireRedisServer(t)
+	master := startRedisProcess(t, "--repl-diskless-sync-delay", "0")
+	replica := startReplicaOf(t, master)
+	c := newTestClient()
+
+	require.True(t, waitForCondition(t, 10*time.Second, func() bool {
+		info, err := c.GetReplicationInfo(replica.IP, strconv.Itoa(replica.Port), "")
+		return err == nil && info.MasterLinkStatus == "up"
+	}), "replica never finished syncing")
+	linkBefore := replicaLinkID(t, master)
+
+	normalConn := dialRaw(t, master.Addr(), "PING\r\n", "+PONG\r\n")
+	pubsubConn := dialRaw(t, master.Addr(), "SUBSCRIBE ch\r\n",
+		"*3\r\n$9\r\nsubscribe\r\n$2\r\nch\r\n:1\r\n")
+
+	require.NoError(t, c.DisconnectClients(master.IP, strconv.Itoa(master.Port), ""))
+
+	requireClosedByServer(t, normalConn)
+	requireClosedByServer(t, pubsubConn)
+	assert.Equal(t, linkBefore, replicaLinkID(t, master),
+		"the replication link must survive: a new client ID means it was killed and redialled")
+}
+
+func TestDisconnectClients_ReturnsErrorWhenDenied(t *testing.T) {
+	requireRedisServer(t)
+	a := startRedisProcess(t, "--user", "default", "on", "nopass", "~*", "&*", "+@all", "-client|kill")
+	c := newTestClient()
+
+	err := c.DisconnectClients(a.IP, strconv.Itoa(a.Port), "")
+	require.Error(t, err)
+	assert.ErrorContains(t, err, "TYPE normal")
+	assert.ErrorContains(t, err, "TYPE pubsub")
+	assert.ErrorContains(t, err, "NOPERM")
+}
+
+// Unreachable: don't pay the dial timeout twice.
+func TestDisconnectClients_ConnectionError(t *testing.T) {
+	port, err := findFreePort()
+	require.NoError(t, err)
+	c := newTestClient()
+
+	err = c.DisconnectClients(testLoopbackIP, strconv.Itoa(port), "")
+	require.Error(t, err)
+	assert.ErrorContains(t, err, "TYPE normal")
+	assert.NotContains(t, err.Error(), "TYPE pubsub", "the second kill should be skipped once the node is known to be unreachable")
+}
+
+func TestCloseClient_LogsCloseError(t *testing.T) {
+	rClient := rediscli.NewClient(&rediscli.Options{Addr: net.JoinHostPort(testLoopbackIP, "0")})
+	closeClient(rClient)
+	require.Error(t, rClient.Close(), "a second Close should fail")
+	assert.NotPanics(t, func() { closeClient(rClient) })
+}
+
+// TestMakeSlaveOfWithPort_MismatchedTargetPort covers a real bug found while
+// building this test suite: MakeSlaveOfWithPort used to have no separate
+// parameter for the target's own port, and connected to the *target* at
+// `net.JoinHostPort(ip, masterPort)` - i.e. it used the *master's* port to
+// reach the target. That was only correct when the target and the master
+// happened to share a port number (true in this operator's normal
+// deployment model - see TestMakeSlaveOfWithPort_SamePortDifferentIP for
+// that case). When the target's actual port differed from the master's
+// port (reachable via Bootstrapping's externally supplied master port),
+// this silently connected to the wrong instance rather than failing loudly.
 //
-// MakeSlaveOfWithPort(ip, masterIP, masterPort, password) connects to the
-// *target* redis instance (the one it's about to issue SLAVEOF against) at
-// `net.JoinHostPort(ip, masterPort)` - i.e. it uses the *master's* port to
-// reach the target, with no separate parameter for the target's own port.
-// That's only correct when the target and the master happen to listen on
-// the same port number (true in this operator's normal deployment model,
-// where every managed Redis instance uses one shared configured port across
-// different pod IPs - see the SamePortDifferentIP test above for that
-// case). When the target's actual port differs from the master's port, this
-// silently does the wrong thing rather than failing loudly:
-//
-// Here `a` (the intended target) and `b` (the intended master) share the
-// same IP (both loopback) but listen on *different* ports. Calling
-// MakeSlaveOfWithPort(a.IP, b.IP, b.Port, "") computes the connection
-// address as (a.IP, b.Port) - since a.IP == b.IP, that address actually
-// belongs to `b`'s own server, not `a`'s. The client ends up connected to
-// `b` and issues `SLAVEOF b.IP b.Port` *to b itself*. Real Redis accepts
-// `SLAVEOF <self>` without error (confirmed manually against 7.0.15) and
-// becomes a slave of itself with master_link_status permanently "down" -
-// so the call returns a misleading nil error, `b` is left in a broken
-// self-replicating state, and `a` (the actual intended target) is never
-// contacted at all and remains an untouched master.
+// MakeSlaveOfWithPort now takes an explicit port for the target, separate
+// from masterPort. Here `a` (the target) and `b` (the master) share the
+// same IP (both loopback) but listen on *different* ports - exactly the
+// case that used to misroute the connection to `b` itself. This asserts
+// the fix: `a` is correctly reconfigured as a replica of `b`, and `b` is
+// left untouched as a master.
 func TestMakeSlaveOfWithPort_MismatchedTargetPort(t *testing.T) {
 	requireRedisServer(t)
 	a := startRedisProcess(t)
 	b := startRedisProcess(t)
 	c := newTestClient()
-	require.NotEqual(t, a.Port, b.Port, "test setup requires distinct ports to reproduce the bug")
+	require.NotEqual(t, a.Port, b.Port, "test setup requires distinct ports to exercise the target/master port distinction")
 
-	err := c.MakeSlaveOfWithPort(a.IP, b.IP, strconv.Itoa(b.Port), "")
-	require.NoError(t, err, "the call itself does not surface an error - that's the point of this bug")
-
-	// `a`, the intended target, was never actually reached.
-	masterOf, err := c.GetSlaveOf(a.IP, strconv.Itoa(a.Port), "")
+	err := c.MakeSlaveOfWithPort(a.IP, strconv.Itoa(a.Port), b.IP, strconv.Itoa(b.Port), "")
 	require.NoError(t, err)
-	assert.Empty(t, masterOf, "the intended target should be untouched, still a master")
 
-	// `b` was told to replicate from itself instead.
-	waitForCondition(t, 2*time.Second, func() bool {
-		masterOf, err := c.GetSlaveOf(b.IP, strconv.Itoa(b.Port), "")
+	// `a`, the actual target, should be reconfigured as a replica of `b`.
+	waitForCondition(t, 5*time.Second, func() bool {
+		masterOf, err := c.GetSlaveOf(a.IP, strconv.Itoa(a.Port), "")
 		return err == nil && masterOf == b.IP
 	})
+	masterOf, err := c.GetSlaveOf(a.IP, strconv.Itoa(a.Port), "")
+	require.NoError(t, err)
+	assert.Equal(t, b.IP, masterOf, "the target should be reconfigured as a replica of the intended master")
+
+	// `b`, the master, should be untouched - still its own master, not
+	// pointed at itself or at `a`.
 	masterOf, err = c.GetSlaveOf(b.IP, strconv.Itoa(b.Port), "")
 	require.NoError(t, err)
-	assert.Equal(t, b.IP, masterOf, "the master ends up pointed at itself instead of the target being reconfigured")
+	assert.Empty(t, masterOf, "the master should be untouched, still a master")
 }
 
 // TestMakeSlaveOf covers the MakeSlaveOf convenience wrapper, which hardcodes
@@ -880,30 +1025,23 @@ func TestSentinelCheckQuorum_OK(t *testing.T) {
 	assert.NoError(t, err)
 }
 
-// TestSentinelCheckQuorum_NoQuorum documents a real bug found while building
-// this test suite (not fixed here, per instructions - see the task summary
-// for the full report):
+// TestSentinelCheckQuorum_NoQuorum covers a real bug found while building
+// this test suite: real Sentinel's CKQUORUM reply for the NOQUORUM case
+// comes back as a RESP *error* reply (confirmed here against real Redis
+// 7.0.15: `redis-cli --no-raw` shows `(error) NOQUORUM ...`), not as a
+// successful string reply whose text happens to start with the literal
+// characters "(error)". Since go-redis's SentinelClient.CkQuorum uses a
+// StringCmd, that RESP error becomes cmd.Err()/the err returned by
+// cmd.Result() - so client.go's SentinelCheckQuorum used to take its `if
+// err != nil { ... return err }` branch immediately, and its own intended
+// NOQUORUM handling (checking `s := strings.Split(res, " ")` for a literal
+// "(error)"/"NOQUORUM" pair) could never execute, since res is only
+// non-empty when err is nil.
 //
-// Real Sentinel's CKQUORUM reply for the NOQUORUM case comes back as a RESP
-// *error* reply (confirmed here against real Redis 7.0.15: `redis-cli
-// --no-raw` shows `(error) NOQUORUM ...`), not as a successful string reply
-// whose text happens to start with the literal characters "(error)". Since
-// go-redis's SentinelClient.CkQuorum uses a StringCmd, that RESP error
-// becomes cmd.Err()/the err returned by cmd.Result() - so
-// client.go's SentinelCheckQuorum takes its `if err != nil { ... return err
-// }` branch immediately.
-//
-// The subsequent code - `s := strings.Split(res, " ")` followed by `if
-// status == "(error)" && quorum == "NOQUORUM"` - can therefore never
-// execute on a real NOQUORUM response: `res` is only non-empty when err is
-// nil, i.e. only for the OK case, so status will always be "OK" whenever
-// that branch is reached. In other words, the code's own intended NOQUORUM
-// handling (returning `errors.New("quorum Not available")`) is dead code;
-// what actually gets returned to callers today is the raw driver error
-// (whose message happens to also mention NOQUORUM, so callers checking
-// err != nil for failure still work correctly - this is a
-// dead-code/messaging bug, not a functional regression for existing
-// callers as far as we can tell).
+// SentinelCheckQuorum now classifies NOQUORUM directly from err.Error()
+// (which real Sentinel prefixes with "NOQUORUM ...") before the
+// success-path string parsing, restoring the intended "quorum Not
+// available" message and NOQUORUM metrics tag.
 // ---------------------------------------------------------------------
 // getRedisError
 //
@@ -943,6 +1081,14 @@ func TestSentinelCheckQuorum_NoQuorum(t *testing.T) {
 
 	err = c.SentinelCheckQuorum(env.sentinel.IP)
 	require.Error(t, err, "CKQUORUM should fail when quorum exceeds the number of known sentinels")
+	assert.Equal(t, "quorum Not available", err.Error(), "the intended NOQUORUM message should be reachable, not just the raw driver error")
+}
+
+func TestSetSentinelAuthPass(t *testing.T) {
+	env := getSharedEnv(t)
+	c := newTestClient()
+	require.NoError(t, c.SetSentinelAuthPass(env.sentinel.IP, "s3cr3t"))
+	require.NoError(t, c.SetSentinelAuthPass(env.sentinel.IP, ""))
 }
 
 // TestSentinelFunctions_SentinelUnreachable exercises the connection-error
@@ -995,6 +1141,9 @@ func TestSentinelFunctions_SentinelUnreachable(t *testing.T) {
 
 	err = c.MonitorRedisWithPort(env.sentinel.IP, testLoopbackIP, redisPort, "1", "")
 	assert.Error(t, err, "MonitorRedisWithPort should fail once nothing is listening on the sentinel port")
+
+	err = c.SetSentinelAuthPass(env.sentinel.IP, "s3cr3t")
+	assert.Error(t, err, "SetSentinelAuthPass should fail once nothing is listening on the sentinel port")
 }
 
 // ---------------------------------------------------------------------
@@ -1065,5 +1214,60 @@ func TestIsUnreachableError(t *testing.T) {
 		t.Run(test.name, func(t *testing.T) {
 			assert.Equal(t, test.expected, IsUnreachableError(test.err))
 		})
+	}
+}
+
+func TestIsAuthError(t *testing.T) {
+	tests := []struct {
+		name     string
+		err      error
+		expected bool
+	}{
+		{name: "nil", err: nil, expected: false},
+		{name: "wrong password", err: errors.New("WRONGPASS invalid username-password pair or user is disabled."), expected: true},
+		{name: "no password given", err: errors.New("NOAUTH Authentication required."), expected: true},
+		{name: "password given to a redis without one", err: errors.New("ERR AUTH <password> called without any password configured for the default user. Are you sure your configuration is correct?"), expected: true},
+		{name: "unreachable", err: errors.New("dial tcp 10.0.0.1:6379: i/o timeout"), expected: false},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			assert.Equal(t, test.expected, IsAuthError(test.err))
+		})
+	}
+}
+
+func TestIsNoPasswordError(t *testing.T) {
+	assert.False(t, IsNoPasswordError(nil))
+	assert.False(t, IsNoPasswordError(errors.New("WRONGPASS invalid username-password pair or user is disabled.")))
+	assert.True(t, IsNoPasswordError(errors.New("ERR AUTH <password> called without any password configured for the default user. Are you sure your configuration is correct?")))
+}
+
+// Adding, changing and removing a password in place keeps replication up.
+func TestSetPassword(t *testing.T) {
+	requireRedisServer(t)
+	master := startRedisProcess(t)
+	replica := startReplicaOf(t, master)
+	c := newTestClient()
+	mport, rport := strconv.Itoa(master.Port), strconv.Itoa(replica.Port)
+
+	linkUp := func(password string) bool {
+		return waitForCondition(t, 15*time.Second, func() bool {
+			info, err := c.GetReplicationInfo(replica.IP, rport, password)
+			return err == nil && info.MasterLinkStatus == "up"
+		})
+	}
+	require.True(t, linkUp(""))
+
+	for _, step := range []struct{ from, to string }{{"", "p1"}, {"p1", "p2"}, {"p2", ""}} {
+		require.NoError(t, c.SetPassword(replica.IP, rport, step.from, step.to))
+		require.NoError(t, c.SetPassword(master.IP, mport, step.from, step.to))
+
+		_, err := c.IsMaster(master.IP, mport, step.from)
+		assert.True(t, IsAuthError(err), "old password %q: %v", step.from, err)
+		isMaster, err := c.IsMaster(master.IP, mport, step.to)
+		require.NoError(t, err)
+		assert.True(t, isMaster)
+		assert.True(t, linkUp(step.to), "replication after %q -> %q", step.from, step.to)
 	}
 }
