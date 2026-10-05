@@ -313,14 +313,16 @@ fi
 save_command="${cmd} save"
 eval $save_command`, rfName, port)
 	} else {
-		// Operator-managed mode: just save data, no Sentinel failover
-		// The operator will handle master election during the next reconcile
-		shutdownContent = fmt.Sprintf(`cmd="redis-cli -p %[1]v"
-if [ ! -z "${REDIS_PASSWORD}" ]; then
-	export REDISCLI_AUTH=${REDIS_PASSWORD}
-fi
-save_command="${cmd} save"
-eval $save_command`, port)
+		// Operator-managed mode has no preStop hook, so this script is never
+		// executed; it stays a valid no-op only so the ConfigMap and its mount
+		// keep the same shape in both modes.
+		//
+		// It used to run a synchronous SAVE. That was redundant - redis saves on
+		// SIGTERM by itself because save points are configured, and the instance
+		// manager runs as PID 1 and forwards SIGTERM - and it took time from the
+		// instance manager's own graceful window, because the
+		// terminationGracePeriodSeconds countdown starts *before* preStop.
+		shutdownContent = "# no-op: operator-managed mode does not use a preStop hook\n"
 	}
 
 	return &corev1.ConfigMap{
@@ -475,13 +477,7 @@ func generateRedisStatefulSet(rf *redisfailoverv1.RedisFailover, labels map[stri
 							VolumeMounts: volumeMounts,
 							Command:      redisCommand,
 							Resources:    rf.Spec.Redis.Resources,
-							Lifecycle: &corev1.Lifecycle{
-								PreStop: &corev1.LifecycleHandler{
-									Exec: &corev1.ExecAction{
-										Command: []string{"/bin/sh", "/redis-shutdown/shutdown.sh"},
-									},
-								},
-							},
+							Lifecycle:    redisLifecycle(rf),
 						},
 					},
 					Volumes: volumes,
@@ -1545,4 +1541,29 @@ func envExists(env []corev1.EnvVar, name string) bool {
 		}
 	}
 	return false
+}
+
+// redisLifecycle returns the preStop hook for the redis container, or nil.
+//
+// Only Sentinel deployments get one. There the hook does something nothing else
+// can: it asks Sentinel to fail over before the master goes away. In
+// operator-managed mode there is no Sentinel to ask, the operator moves the
+// master role before the pod is replaced, and redis saves on SIGTERM by itself,
+// so a hook there is redundant.
+//
+// It is not merely redundant. The terminationGracePeriodSeconds countdown starts
+// before preStop runs, so whatever the hook spends is taken from the budget the
+// instance manager needs for its own graceful shutdown (SIGTERM, 25s, then
+// SIGKILL), whose own constants claim to match that grace period.
+func redisLifecycle(rf *redisfailoverv1.RedisFailover) *corev1.Lifecycle {
+	if !rf.SentinelEnabled() {
+		return nil
+	}
+	return &corev1.Lifecycle{
+		PreStop: &corev1.LifecycleHandler{
+			Exec: &corev1.ExecAction{
+				Command: []string{"/bin/sh", "/redis-shutdown/shutdown.sh"},
+			},
+		},
+	}
 }

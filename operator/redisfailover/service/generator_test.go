@@ -4244,3 +4244,57 @@ func TestGetTerminationGracePeriodSecondsUsesUserSuppliedValue(t *testing.T) {
 		assert.EqualValues(120, *got)
 	}
 }
+
+// TestRedisPreStopHookOnlyForSentinel covers the preStop hook being attached to
+// the redis container only in Sentinel mode.
+//
+// In operator-managed mode the hook could only run a synchronous SAVE, which
+// redis already does on SIGTERM, so it wrote the RDB twice on every pod
+// replacement. It also took time from the instance manager's own
+// graceful-shutdown window, because the terminationGracePeriodSeconds countdown
+// starts before preStop runs.
+func TestRedisPreStopHookOnlyForSentinel(t *testing.T) {
+	for _, test := range []struct {
+		name     string
+		sentinel bool
+		wantHook bool
+	}{
+		{name: "sentinel enabled keeps the failover hook", sentinel: true, wantHook: true},
+		{name: "operator-managed has no hook", sentinel: false, wantHook: false},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			assert := assert.New(t)
+
+			rf := generateRF()
+			rf.Spec.Sentinel.Enabled = ptr.To(test.sentinel)
+
+			var ss *appsv1.StatefulSet
+			ms := &mK8SService.Services{}
+			ms.On("CreateOrUpdatePodDisruptionBudget", rf.Namespace, mock.Anything).Once().Return(nil, nil)
+			ms.On("CreateOrUpdateStatefulSet", rf.Namespace, mock.Anything).Once().Return(nil).Run(func(args mock.Arguments) {
+				ss = args.Get(1).(*appsv1.StatefulSet)
+			})
+
+			client := rfservice.NewRedisFailoverKubeClient(ms, log.Dummy, metrics.Dummy)
+			err := client.EnsureRedisStatefulset(rf, nil, []metav1.OwnerReference{})
+			assert.NoError(err)
+			assert.NotNil(ss)
+
+			var redis *corev1.Container
+			for i := range ss.Spec.Template.Spec.Containers {
+				if ss.Spec.Template.Spec.Containers[i].Name == "redis" {
+					redis = &ss.Spec.Template.Spec.Containers[i]
+				}
+			}
+			assert.NotNil(redis, "redis container must exist")
+
+			if test.wantHook {
+				assert.NotNil(redis.Lifecycle, "sentinel mode must keep the preStop failover hook")
+				assert.NotNil(redis.Lifecycle.PreStop)
+				assert.Equal([]string{"/bin/sh", "/redis-shutdown/shutdown.sh"}, redis.Lifecycle.PreStop.Exec.Command)
+			} else {
+				assert.Nil(redis.Lifecycle, "operator-managed mode must not attach a preStop hook")
+			}
+		})
+	}
+}
