@@ -15,6 +15,7 @@ import (
 	"k8s.io/apimachinery/pkg/runtime"
 	fakekubernetes "k8s.io/client-go/kubernetes/fake"
 	k8stesting "k8s.io/client-go/testing"
+	"k8s.io/client-go/tools/leaderelection/resourcelock"
 	"k8s.io/utils/ptr"
 
 	"github.com/saremox/redis-operator/log"
@@ -22,10 +23,10 @@ import (
 
 func TestNewLeaseRunnerValidates(t *testing.T) {
 	_, err := newLeaseRunner(lockKey, "", fakekubernetes.NewClientset(), log.Dummy)
-	assert.EqualError(t, err, "running in leader election mode requires the namespace running")
+	require.EqualError(t, err, "running in leader election mode requires the namespace running")
 
 	_, err = newLeaseRunner("", "ns", fakekubernetes.NewClientset(), log.Dummy)
-	assert.EqualError(t, err, "running in leader election mode requires a key for identification the different instances")
+	require.EqualError(t, err, "running in leader election mode requires a key for identification the different instances")
 
 	defer func(h func() (string, error)) { hostname = h }(hostname)
 	hostname = func() (string, error) { return "", errors.New("no hostname") }
@@ -69,7 +70,7 @@ func TestLeaseRunnerReleasesTheLeaseWhenFReturns(t *testing.T) {
 		return errors.New("done")
 	})
 
-	assert.EqualError(t, err, "done")
+	require.EqualError(t, err, "done")
 	assert.Equal(t, r.lock.Identity(), holder)
 	assert.Empty(t, leaseHolder(t, kube))
 }
@@ -87,7 +88,7 @@ func TestLeaseRunnerStopsFThenReleasesTheLeaseOnShutdown(t *testing.T) {
 		return nil
 	})
 
-	assert.NoError(t, err)
+	require.NoError(t, err)
 	assert.Equal(t, r.lock.Identity(), holderWhenStopped, "the lease is held until f has returned")
 	assert.Empty(t, leaseHolder(t, kube))
 	events, err := kube.CoreV1().Events("").List(context.Background(), metav1.ListOptions{})
@@ -117,7 +118,7 @@ func TestLeaseRunnerReturnsAtOnceWhenLeadershipIsLost(t *testing.T) {
 		return nil
 	})
 
-	assert.ErrorIs(t, err, errLeadershipLost)
+	require.ErrorIs(t, err, errLeadershipLost)
 	select {
 	case <-fStopping:
 	case <-time.After(5 * time.Second):
@@ -168,7 +169,7 @@ func TestLeaseRunnerStopsWaitingWhenAnotherReplicaLeads(t *testing.T) {
 		return nil
 	})
 
-	assert.NoError(t, err)
+	require.NoError(t, err)
 	assert.Less(t, time.Since(start), 2*time.Second)
 	assert.Equal(t, other.lock.Identity(), leaseHolder(t, kube))
 }
@@ -187,7 +188,7 @@ func TestLeaseRunnerReleasesALeaseAcquiredWhileStopping(t *testing.T) {
 		return nil
 	})
 
-	assert.NoError(t, err)
+	require.NoError(t, err)
 	assert.Empty(t, leaseHolder(t, kube))
 }
 
@@ -213,7 +214,7 @@ func TestLeaseRunnerDoesNotReleaseALostLease(t *testing.T) {
 		return nil
 	})
 
-	assert.ErrorIs(t, err, errLeadershipLost)
+	require.ErrorIs(t, err, errLeadershipLost)
 	assert.Zero(t, releases.Load())
 }
 
@@ -233,7 +234,7 @@ func TestLeaseRunnerKeepsGoingWhenReleaseFails(t *testing.T) {
 		return nil
 	})
 
-	assert.NoError(t, err)
+	require.NoError(t, err)
 	assert.Equal(t, r.lock.Identity(), leaseHolder(t, kube), "the lease is left to expire")
 }
 
@@ -255,12 +256,43 @@ func TestLeaseRunnerLeavesALeaseTakenOverByAnotherReplica(t *testing.T) {
 		takenOver.Store(true)
 		lease, err := kube.CoordinationV1().Leases("ns").Get(context.Background(), lockKey, metav1.GetOptions{})
 		require.NoError(t, err)
-		lease.Spec.HolderIdentity = ptr.To("other")
+		lease.Spec.HolderIdentity = new("other")
 		_, err = kube.CoordinationV1().Leases("ns").Update(context.Background(), lease, metav1.UpdateOptions{})
 		require.NoError(t, err)
 		return nil
 	})
 
-	assert.NoError(t, err)
+	require.NoError(t, err)
 	assert.Equal(t, "other", leaseHolder(t, kube))
+}
+
+type ctxKey struct{}
+
+// ctxRecordLock records what release passes to Get.
+type ctxRecordLock struct {
+	resourcelock.Interface
+	value       any
+	err         error
+	hasDeadline bool
+}
+
+func (l *ctxRecordLock) Get(ctx context.Context) (*resourcelock.LeaderElectionRecord, []byte, error) {
+	l.value = ctx.Value(ctxKey{})
+	l.err = ctx.Err()
+	_, l.hasDeadline = ctx.Deadline()
+	return l.Interface.Get(ctx)
+}
+
+func TestLeaseRunnerReleaseKeepsTheContextValuesAfterShutdown(t *testing.T) {
+	r := fastLeaseRunner(t, fakekubernetes.NewClientset())
+	lock := &ctxRecordLock{Interface: r.lock}
+	r.lock = lock
+	ctx, cancel := context.WithCancel(context.WithValue(context.Background(), ctxKey{}, "v"))
+	cancel()
+
+	r.release(ctx)
+
+	assert.Equal(t, "v", lock.value)
+	require.NoError(t, lock.err, "a release on shutdown must not fail because ctx is done")
+	assert.True(t, lock.hasDeadline)
 }

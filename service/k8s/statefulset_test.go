@@ -3,6 +3,7 @@ package k8s_test
 import (
 	"context"
 	"errors"
+	"strconv"
 	"testing"
 
 	"k8s.io/apimachinery/pkg/api/resource"
@@ -10,6 +11,7 @@ import (
 	v1 "k8s.io/api/core/v1"
 
 	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 	appsv1 "k8s.io/api/apps/v1"
 	kubeerrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -17,7 +19,6 @@ import (
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	kubernetes "k8s.io/client-go/kubernetes/fake"
 	kubetesting "k8s.io/client-go/testing"
-	"k8s.io/utils/ptr"
 
 	"github.com/saremox/redis-operator/log"
 	"github.com/saremox/redis-operator/metrics"
@@ -26,6 +27,7 @@ import (
 
 var (
 	statefulSetsGroup = schema.GroupVersionResource{Group: "apps", Version: "v1", Resource: "statefulsets"}
+	pvcsGroup         = schema.GroupVersionResource{Version: "v1", Resource: "persistentvolumeclaims"}
 )
 
 func newStatefulSetUpdateAction(ns string, statefulSet *appsv1.StatefulSet) kubetesting.UpdateActionImpl {
@@ -40,147 +42,126 @@ func newStatefulSetCreateAction(ns string, statefulSet *appsv1.StatefulSet) kube
 	return kubetesting.NewCreateAction(statefulSetsGroup, ns, statefulSet)
 }
 
-// TestStatefulSetServiceGetStatefulSetPods exercises the real selector-building
-// logic in GetStatefulSetPods: it must list only the pods that belong to the
-// named StatefulSet, scoped by both the StatefulSet's own MatchLabels selector
-// and namespace. This is the exact property a recent fix relies on to prevent
-// replicas from attaching to the wrong RedisFailover's master after pod-IP
-// reuse across namespaces, so it uses a real fake clientset (not hand-rolled
-// reactors) to get genuine label-selector and namespace filtering semantics.
+// ownedPod returns a pod that the StatefulSet controller owns.
+func ownedPod(statefulSet *appsv1.StatefulSet, name string, labels map[string]string) *v1.Pod {
+	return &v1.Pod{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      name,
+			Namespace: statefulSet.Namespace,
+			Labels:    labels,
+			OwnerReferences: []metav1.OwnerReference{
+				*metav1.NewControllerRef(statefulSet, appsv1.SchemeGroupVersion.WithKind("StatefulSet")),
+			},
+		},
+	}
+}
+
+func podNames(podList *v1.PodList) []string {
+	names := make([]string, 0, len(podList.Items))
+	for _, pod := range podList.Items {
+		names = append(names, pod.Name)
+	}
+	return names
+}
+
+// TestStatefulSetServiceGetStatefulSetPods uses a fake clientset to get real
+// label selector and namespace semantics. The pods must come from the
+// StatefulSet: the labels are not enough.
 func TestStatefulSetServiceGetStatefulSetPods(t *testing.T) {
 	testns := "testns"
 	otherns := "otherns"
 	stsName := "teststatefulset"
+	selectorLabels := map[string]string{"app": "redis", "component": "master"}
 
 	testStatefulSet := &appsv1.StatefulSet{
-		ObjectMeta: metav1.ObjectMeta{
-			Name:      stsName,
-			Namespace: testns,
-		},
+		ObjectMeta: metav1.ObjectMeta{Name: stsName, Namespace: testns, UID: "sts-uid"},
 		Spec: appsv1.StatefulSetSpec{
-			Selector: &metav1.LabelSelector{
-				MatchLabels: map[string]string{
-					"app":       "redis",
-					"component": "master",
-				},
-			},
+			Selector: &metav1.LabelSelector{MatchLabels: selectorLabels},
 		},
+	}
+	otherStatefulSet := &appsv1.StatefulSet{
+		ObjectMeta: metav1.ObjectMeta{Name: "other", Namespace: testns, UID: "other-uid"},
 	}
 
-	matchingPod1 := &v1.Pod{
-		ObjectMeta: metav1.ObjectMeta{
-			Name:      "matching-pod-1",
-			Namespace: testns,
-			Labels: map[string]string{
-				"app":       "redis",
-				"component": "master",
-			},
-		},
+	// A scale-down keeps the pods with a high ordinal until the controller deletes them.
+	podMaster := ownedPod(testStatefulSet, stsName+"-0", selectorLabels)
+	podHighOrdinal := ownedPod(testStatefulSet, stsName+"-12", map[string]string{"app": "redis", "component": "master", "extra": "label"})
+
+	// Same labels, no owner.
+	labelsOnly := &v1.Pod{ObjectMeta: metav1.ObjectMeta{Name: stsName + "-1", Namespace: testns, Labels: selectorLabels}}
+	// Same labels, owned by another StatefulSet.
+	otherOwner := ownedPod(otherStatefulSet, stsName+"-2", selectorLabels)
+	// Same owner, name outside the form <name>-<ordinal>.
+	for _, name := range []string{"custom", stsName + "-", stsName + "-x", stsName + "-1x", stsName + "-3-4", "x" + stsName + "-3", stsName + "-01", stsName + "-00", stsName + "--1", stsName + "-4294967296", stsName + "-99999999999"} {
+		t.Run("drops the owned pod with the name "+name, func(t *testing.T) {
+			mcli := kubernetes.NewClientset(testStatefulSet, podMaster, ownedPod(testStatefulSet, name, selectorLabels))
+			service := k8s.NewStatefulSetService(mcli, log.Dummy, metrics.Dummy)
+
+			podList, err := service.GetStatefulSetPods(testns, stsName)
+			require.NoError(t, err)
+			assert.Equal(t, []string{podMaster.Name}, podNames(podList))
+		})
 	}
-	matchingPod2 := &v1.Pod{
-		ObjectMeta: metav1.ObjectMeta{
-			Name:      "matching-pod-2",
-			Namespace: testns,
-			Labels: map[string]string{
-				"app":       "redis",
-				"component": "master",
-				"extra":     "label-should-not-matter",
-			},
-		},
-	}
-	// Same namespace, but does not carry all of the StatefulSet's selector labels.
-	nonMatchingLabelsPod := &v1.Pod{
-		ObjectMeta: metav1.ObjectMeta{
-			Name:      "non-matching-labels-pod",
-			Namespace: testns,
-			Labels: map[string]string{
-				"app":       "redis",
-				"component": "slave",
-			},
-		},
-	}
-	// Different namespace, but carries the exact same labels as the matching pods.
-	// This proves the selector is correctly namespace-scoped: same labels alone
-	// must not be enough to match across namespaces (the #698-class fix property).
-	crossNamespacePod := &v1.Pod{
-		ObjectMeta: metav1.ObjectMeta{
-			Name:      "cross-namespace-pod",
-			Namespace: otherns,
-			Labels: map[string]string{
-				"app":       "redis",
-				"component": "master",
-			},
-		},
-	}
+	// Same owner reference, but the pod does not carry the selector labels.
+	otherLabels := ownedPod(testStatefulSet, stsName+"-4", map[string]string{"app": "redis", "component": "slave"})
+	// Right owner and labels in another namespace.
+	otherNamespace := ownedPod(testStatefulSet, stsName+"-5", selectorLabels)
+	otherNamespace.Namespace = otherns
+	// Same name and kind, other UID: an older StatefulSet with the same name.
+	staleOwner := ownedPod(testStatefulSet, stsName+"-6", selectorLabels)
+	staleOwner.OwnerReferences[0].UID = "old-uid"
+	// An owner reference without the controller flag.
+	notController := ownedPod(testStatefulSet, stsName+"-7", selectorLabels)
+	notController.OwnerReferences[0].Controller = new(false)
 
 	mcli := kubernetes.NewClientset(
 		testStatefulSet,
-		matchingPod1,
-		matchingPod2,
-		nonMatchingLabelsPod,
-		crossNamespacePod,
+		otherStatefulSet,
+		podMaster,
+		podHighOrdinal,
+		labelsOnly,
+		otherOwner,
+		otherLabels,
+		otherNamespace,
+		staleOwner,
+		notController,
 	)
-
 	service := k8s.NewStatefulSetService(mcli, log.Dummy, metrics.Dummy)
 
-	t.Run("returns exactly the pods matching selector and namespace", func(t *testing.T) {
-		assertTest := assert.New(t)
-
+	t.Run("returns only the pods that the StatefulSet owns", func(t *testing.T) {
 		podList, err := service.GetStatefulSetPods(testns, stsName)
-		assertTest.NoError(err)
-		assertTest.NotNil(podList)
-
-		gotNames := map[string]bool{}
-		for _, p := range podList.Items {
-			gotNames[p.Name] = true
-		}
-
-		assertTest.Len(podList.Items, 2)
-		assertTest.True(gotNames["matching-pod-1"])
-		assertTest.True(gotNames["matching-pod-2"])
-		assertTest.False(gotNames["non-matching-labels-pod"], "pod with a different label value must be excluded")
-		assertTest.False(gotNames["cross-namespace-pod"], "pod in a different namespace with identical labels must be excluded")
+		require.NoError(t, err)
+		assert.ElementsMatch(t, []string{podMaster.Name, podHighOrdinal.Name}, podNames(podList))
 	})
 
 	t.Run("propagates the error when the StatefulSet itself does not exist", func(t *testing.T) {
-		assertTest := assert.New(t)
-
 		podList, err := service.GetStatefulSetPods(testns, "does-not-exist")
-		assertTest.Error(err)
-		assertTest.Nil(podList)
+		require.Error(t, err)
+		assert.Nil(t, podList)
 	})
 
-	t.Run("an empty MatchLabels selector matches every pod in the namespace", func(t *testing.T) {
-		// This documents the actual behavior of GetStatefulSetPods when
-		// Spec.Selector.MatchLabels is empty: the joined selector string is
-		// empty, which k8s treats as "select everything" (no restriction),
-		// so every pod in the namespace is returned -- not zero pods.
-		assertTest := assert.New(t)
+	t.Run("propagates the error of the pod list", func(t *testing.T) {
+		failing := kubernetes.NewClientset(testStatefulSet)
+		failing.PrependReactor("list", "pods", func(kubetesting.Action) (bool, runtime.Object, error) {
+			return true, nil, errors.New("list failed")
+		})
 
+		podList, err := k8s.NewStatefulSetService(failing, log.Dummy, metrics.Dummy).GetStatefulSetPods(testns, stsName)
+		require.Error(t, err)
+		assert.Nil(t, podList)
+	})
+
+	t.Run("an empty selector lists every pod, and the owner check keeps only the owned pods", func(t *testing.T) {
 		emptySelectorSts := &appsv1.StatefulSet{
-			ObjectMeta: metav1.ObjectMeta{
-				Name:      "empty-selector-sts",
-				Namespace: testns,
-			},
-			Spec: appsv1.StatefulSetSpec{
-				Selector: &metav1.LabelSelector{
-					MatchLabels: map[string]string{},
-				},
-			},
+			ObjectMeta: metav1.ObjectMeta{Name: "empty", Namespace: testns, UID: "empty-uid"},
+			Spec:       appsv1.StatefulSetSpec{Selector: &metav1.LabelSelector{MatchLabels: map[string]string{}}},
 		}
+		owned := ownedPod(emptySelectorSts, "empty-0", nil)
+		mcli := kubernetes.NewClientset(emptySelectorSts, owned, podMaster, labelsOnly)
 
-		mcli2 := kubernetes.NewClientset(
-			emptySelectorSts,
-			matchingPod1,
-			matchingPod2,
-			nonMatchingLabelsPod,
-		)
-		service2 := k8s.NewStatefulSetService(mcli2, log.Dummy, metrics.Dummy)
-
-		podList, err := service2.GetStatefulSetPods(testns, "empty-selector-sts")
-		assertTest.NoError(err)
-		assertTest.NotNil(podList)
-		assertTest.Len(podList.Items, 3, "an empty selector matches every pod in the namespace")
+		podList, err := k8s.NewStatefulSetService(mcli, log.Dummy, metrics.Dummy).GetStatefulSetPods(testns, "empty")
+		require.NoError(t, err)
+		assert.Equal(t, []string{"empty-0"}, podNames(podList))
 	})
 }
 
@@ -235,11 +216,11 @@ func TestStatefulSetServiceGetCreateOrUpdate(t *testing.T) {
 			name: "An existent statefulSet should update the statefulSet.",
 			statefulSet: &appsv1.StatefulSet{
 				ObjectMeta: metav1.ObjectMeta{Name: "teststatefulSet1"},
-				Spec:       appsv1.StatefulSetSpec{Replicas: ptr.To(int32(3))},
+				Spec:       appsv1.StatefulSetSpec{Replicas: new(int32(3))},
 			},
 			getStatefulSetResult: &appsv1.StatefulSet{
 				ObjectMeta: metav1.ObjectMeta{Name: "teststatefulSet1", ResourceVersion: "10"},
-				Spec:       appsv1.StatefulSetSpec{Replicas: ptr.To(int32(1))},
+				Spec:       appsv1.StatefulSetSpec{Replicas: new(int32(1))},
 			},
 			errorOnGet:      nil,
 			errorOnCreation: nil,
@@ -250,7 +231,7 @@ func TestStatefulSetServiceGetCreateOrUpdate(t *testing.T) {
 					// merging two nils, so the applied object's Annotations
 					// is {} rather than nil.
 					ObjectMeta: metav1.ObjectMeta{Name: "teststatefulSet1", ResourceVersion: "10", Annotations: map[string]string{}},
-					Spec:       appsv1.StatefulSetSpec{Replicas: ptr.To(int32(3))},
+					Spec:       appsv1.StatefulSetSpec{Replicas: new(int32(3))},
 				}),
 			},
 			expErr: false,
@@ -263,10 +244,10 @@ func TestStatefulSetServiceGetCreateOrUpdate(t *testing.T) {
 
 			// Mock.
 			mcli := &kubernetes.Clientset{}
-			mcli.AddReactor("get", "statefulsets", func(action kubetesting.Action) (bool, runtime.Object, error) {
+			mcli.AddReactor("get", "statefulsets", func(_ kubetesting.Action) (bool, runtime.Object, error) {
 				return true, test.getStatefulSetResult, test.errorOnGet
 			})
-			mcli.AddReactor("create", "statefulsets", func(action kubetesting.Action) (bool, runtime.Object, error) {
+			mcli.AddReactor("create", "statefulsets", func(_ kubetesting.Action) (bool, runtime.Object, error) {
 				return true, nil, test.errorOnCreation
 			})
 
@@ -276,110 +257,401 @@ func TestStatefulSetServiceGetCreateOrUpdate(t *testing.T) {
 			if test.expErr {
 				assertTest.Error(err)
 			} else {
-				assertTest.NoError(err)
+				require.NoError(t, err)
 				// Check calls to kubernetes.
 				assertTest.Equal(test.expActions, mcli.Actions())
 			}
 		})
 	}
 	// test resize pvc
-	{
-		t.Run("test_Resize_Pvc", func(t *testing.T) {
-			assertTest := assert.New(t)
-			beforeSts := &appsv1.StatefulSet{
-				ObjectMeta: metav1.ObjectMeta{
-					Name:            "teststatefulSet1",
-					ResourceVersion: "10",
-				},
-				Spec: appsv1.StatefulSetSpec{
-					VolumeClaimTemplates: []v1.PersistentVolumeClaim{
-						{
-							Spec: v1.PersistentVolumeClaimSpec{
-								Resources: v1.VolumeResourceRequirements{
-									Requests: v1.ResourceList{
-										v1.ResourceStorage: resource.MustParse("0.5Gi"),
-									},
-								},
+	t.Run("test_Resize_Pvc", func(t *testing.T) {
+		assertTest := assert.New(t)
+		owners := []metav1.OwnerReference{rfOwnerReference}
+		otherPVC := statefulSetPVC("data-rfr-other-0", "0.5Gi")
+		otherPVC.Labels["app.kubernetes.io/name"] = "other"
+		// Same labels, but not a PVC of the volume claim template.
+		foreignPVC := statefulSetPVC("data-rfr-test-extra", "0.5Gi")
+		wrongTemplatePVC := statefulSetPVC("cache-rfr-test-0", "0.5Gi")
+		mcli := kubernetes.NewClientset(
+			pvcStatefulSet("0.5Gi", owners),
+			statefulSetPVC("data-rfr-test-0", "0.5Gi", rfOwnerReference),
+			// resized already
+			statefulSetPVC("data-rfr-test-1", "1Gi", rfOwnerReference),
+			otherPVC,
+			foreignPVC,
+			wrongTemplatePVC,
+		)
+		service := k8s.NewStatefulSetService(mcli, log.Dummy, metrics.Dummy)
+		err := service.CreateOrUpdateStatefulSet(testns, pvcStatefulSet("1Gi", owners))
+		require.NoError(t, err)
+		assertPVCStorage(t, mcli, "data-rfr-test-0", "1Gi")
+		assertPVCStorage(t, mcli, "data-rfr-test-1", "1Gi")
+		assertPVCStorage(t, mcli, "data-rfr-other-0", "0.5Gi")
+		assertPVCStorage(t, mcli, "data-rfr-test-extra", "0.5Gi")
+		assertPVCStorage(t, mcli, "cache-rfr-test-0", "0.5Gi")
+		// should not call update
+		mcli.PrependReactor("update", "persistentvolumeclaims", func(_ kubetesting.Action) (handled bool, ret runtime.Object, err error) {
+			t.Error("shouldn't call update")
+			return true, nil, nil
+		})
+		err = service.CreateOrUpdateStatefulSet(testns, pvcStatefulSet("1Gi", owners))
+		assertTest.NoError(err)
+	})
+}
+
+var rfOwnerReference = metav1.OwnerReference{
+	APIVersion: "databases.spotahome.com/v1",
+	Kind:       "RedisFailover",
+	Name:       "test",
+	UID:        "rf-uid",
+	Controller: new(true),
+}
+
+// pvcStatefulSet returns a StatefulSet with a volume claim template, shaped
+// like what generateRedisStatefulSet builds for a RedisFailover with storage.
+func pvcStatefulSet(storage string, templateOwners []metav1.OwnerReference) *appsv1.StatefulSet {
+	return &appsv1.StatefulSet{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:            "rfr-test",
+			Namespace:       "testns",
+			OwnerReferences: []metav1.OwnerReference{rfOwnerReference},
+		},
+		Spec: appsv1.StatefulSetSpec{
+			Selector: &metav1.LabelSelector{MatchLabels: map[string]string{
+				"app.kubernetes.io/component": "redis",
+				"app.kubernetes.io/name":      "test",
+				"app.kubernetes.io/part-of":   "redis-failover",
+			}},
+			VolumeClaimTemplates: []v1.PersistentVolumeClaim{
+				{
+					ObjectMeta: metav1.ObjectMeta{
+						Name:            "data",
+						OwnerReferences: templateOwners,
+					},
+					Spec: v1.PersistentVolumeClaimSpec{
+						Resources: v1.VolumeResourceRequirements{
+							Requests: v1.ResourceList{
+								v1.ResourceStorage: resource.MustParse(storage),
 							},
 						},
 					},
 				},
+			},
+		},
+	}
+}
+
+// statefulSetPVC returns a PVC of the pvcStatefulSet, with the selector labels
+// that the StatefulSet controller adds to each PVC.
+func statefulSetPVC(name, storage string, owners ...metav1.OwnerReference) *v1.PersistentVolumeClaim {
+	return &v1.PersistentVolumeClaim{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:            name,
+			Namespace:       "testns",
+			ResourceVersion: "1",
+			Labels: map[string]string{
+				"app.kubernetes.io/component": "redis",
+				"app.kubernetes.io/name":      "test",
+				"app.kubernetes.io/part-of":   "redis-failover",
+			},
+			OwnerReferences: owners,
+		},
+		Spec: v1.PersistentVolumeClaimSpec{
+			Resources: v1.VolumeResourceRequirements{
+				Requests: v1.ResourceList{
+					v1.ResourceStorage: resource.MustParse(storage),
+				},
+			},
+		},
+	}
+}
+
+// enforcePVCResourceVersion makes a PVC update fail with a conflict when its
+// resourceVersion is old, as the API server does. The object tracker of the fake
+// clientset does not check the resourceVersion.
+func enforcePVCResourceVersion(mcli *kubernetes.Clientset) {
+	mcli.PrependReactor("update", "persistentvolumeclaims", func(action kubetesting.Action) (bool, runtime.Object, error) {
+		pvc := action.(kubetesting.UpdateAction).GetObject().(*v1.PersistentVolumeClaim)
+		obj, err := mcli.Tracker().Get(pvcsGroup, action.GetNamespace(), pvc.Name)
+		if err != nil {
+			return true, nil, err
+		}
+		stored := obj.(*v1.PersistentVolumeClaim)
+		if pvc.ResourceVersion != stored.ResourceVersion {
+			return true, nil, kubeerrors.NewConflict(pvcsGroup.GroupResource(), pvc.Name, errors.New("the object has been modified"))
+		}
+		updated := pvc.DeepCopy()
+		updated.ResourceVersion = nextResourceVersion(stored.ResourceVersion)
+		if err := mcli.Tracker().Update(pvcsGroup, updated, action.GetNamespace()); err != nil {
+			return true, nil, err
+		}
+		return true, updated.DeepCopy(), nil
+	})
+}
+
+func nextResourceVersion(resourceVersion string) string {
+	version, _ := strconv.Atoi(resourceVersion)
+	return strconv.Itoa(version + 1)
+}
+
+func getPVC(t *testing.T, mcli *kubernetes.Clientset, name string) *v1.PersistentVolumeClaim {
+	t.Helper()
+	pvc, err := mcli.CoreV1().PersistentVolumeClaims("testns").Get(context.TODO(), name, metav1.GetOptions{})
+	if err != nil {
+		t.Fatalf("get pvc %s: %v", name, err)
+	}
+	return pvc
+}
+
+func assertPVCStorage(t *testing.T, mcli *kubernetes.Clientset, name, storage string) {
+	t.Helper()
+	got := getPVC(t, mcli, name).Spec.Resources.Requests.Storage()
+	assert.Zero(t, got.Cmp(resource.MustParse(storage)), "pvc %s has %s, expected %s", name, got, storage)
+}
+
+func TestStatefulSetServiceCreateOrUpdatePVCs(t *testing.T) {
+	otherOwner := metav1.OwnerReference{APIVersion: "v1", Kind: "ConfigMap", Name: "other", UID: "other-uid"}
+
+	tests := []struct {
+		name                 string
+		storedStorage        string
+		storedAnnotations    map[string]string
+		desiredStorage       string
+		desiredOwners        []metav1.OwnerReference
+		desiredReplicas      *int32
+		pvcs                 []*v1.PersistentVolumeClaim
+		errorOnList          error
+		errorOnGet           error
+		errorOnUpdate        error
+		conflictOnUpdate     bool
+		rejectResize         bool
+		expErr               bool
+		expStorage           map[string]string
+		expOwners            map[string][]metav1.OwnerReference
+		expAnnotations       map[string]map[string]string
+		expStatefulSetUpdate bool
+	}{
+		{
+			name: "A PVC that the StatefulSet created from its old template after a resize is resized.",
+			// The template cannot be changed, so it keeps the size from before the resize.
+			storedStorage:     "1Gi",
+			storedAnnotations: map[string]string{"storageCapacity": "2147483648"},
+			desiredStorage:    "2Gi",
+			desiredOwners:     []metav1.OwnerReference{rfOwnerReference},
+			pvcs: []*v1.PersistentVolumeClaim{
+				statefulSetPVC("data-rfr-test-0", "2Gi", rfOwnerReference),
+				statefulSetPVC("data-rfr-test-1", "2Gi", rfOwnerReference),
+				statefulSetPVC("data-rfr-test-2", "1Gi", rfOwnerReference),
+			},
+			expStorage: map[string]string{
+				"data-rfr-test-0": "2Gi",
+				"data-rfr-test-1": "2Gi",
+				"data-rfr-test-2": "2Gi",
+			},
+		},
+		{
+			name:           "A PVC is not made smaller, because Kubernetes does not allow it.",
+			storedStorage:  "2Gi",
+			desiredStorage: "1Gi",
+			desiredOwners:  []metav1.OwnerReference{rfOwnerReference},
+			pvcs: []*v1.PersistentVolumeClaim{
+				statefulSetPVC("data-rfr-test-0", "2Gi", rfOwnerReference),
+			},
+			expStorage: map[string]string{"data-rfr-test-0": "2Gi"},
+		},
+		{
+			name:           "keepAfterDeletion set on an existing RedisFailover removes its owner reference from the PVCs.",
+			storedStorage:  "1Gi",
+			desiredStorage: "1Gi",
+			desiredOwners:  nil,
+			pvcs: []*v1.PersistentVolumeClaim{
+				statefulSetPVC("data-rfr-test-0", "1Gi", rfOwnerReference),
+				statefulSetPVC("data-rfr-test-1", "1Gi", rfOwnerReference, otherOwner),
+			},
+			expOwners: map[string][]metav1.OwnerReference{
+				"data-rfr-test-0": nil,
+				"data-rfr-test-1": {otherOwner},
+			},
+		},
+		{
+			name:           "The PVCs keep the owner reference that the template references.",
+			storedStorage:  "1Gi",
+			desiredStorage: "1Gi",
+			desiredOwners:  []metav1.OwnerReference{rfOwnerReference},
+			pvcs: []*v1.PersistentVolumeClaim{
+				statefulSetPVC("data-rfr-test-0", "1Gi", rfOwnerReference),
+			},
+			expOwners: map[string][]metav1.OwnerReference{
+				"data-rfr-test-0": {rfOwnerReference},
+			},
+		},
+		{
+			name:            "A failed PVC update does not stop the StatefulSet update.",
+			storedStorage:   "1Gi",
+			desiredStorage:  "2Gi",
+			desiredOwners:   []metav1.OwnerReference{rfOwnerReference},
+			desiredReplicas: new(int32(3)),
+			pvcs: []*v1.PersistentVolumeClaim{
+				statefulSetPVC("data-rfr-test-0", "1Gi", rfOwnerReference),
+			},
+			errorOnUpdate:        errors.New("wanted error"),
+			expStorage:           map[string]string{"data-rfr-test-0": "1Gi"},
+			expStatefulSetUpdate: true,
+		},
+		{
+			name:           "keepAfterDeletion and a resize in one reconcile change both, with the resourceVersion of the owner update.",
+			storedStorage:  "1Gi",
+			desiredStorage: "2Gi",
+			desiredOwners:  nil,
+			pvcs: []*v1.PersistentVolumeClaim{
+				statefulSetPVC("data-rfr-test-0", "1Gi", rfOwnerReference),
+			},
+			expStorage: map[string]string{"data-rfr-test-0": "2Gi"},
+			expOwners:  map[string][]metav1.OwnerReference{"data-rfr-test-0": nil},
+		},
+		{
+			name:           "A conflict on the owner reference removal is retried on the current PVC.",
+			storedStorage:  "1Gi",
+			desiredStorage: "1Gi",
+			desiredOwners:  nil,
+			pvcs: []*v1.PersistentVolumeClaim{
+				statefulSetPVC("data-rfr-test-0", "1Gi", rfOwnerReference),
+			},
+			conflictOnUpdate: true,
+			expOwners:        map[string][]metav1.OwnerReference{"data-rfr-test-0": nil},
+			expAnnotations:   map[string]map[string]string{"data-rfr-test-0": {"other-writer": "true"}},
+		},
+		{
+			name:           "A failed PVC get for the owner reference removal returns an error.",
+			storedStorage:  "1Gi",
+			desiredStorage: "1Gi",
+			desiredOwners:  nil,
+			pvcs: []*v1.PersistentVolumeClaim{
+				statefulSetPVC("data-rfr-test-0", "1Gi", rfOwnerReference),
+			},
+			errorOnGet: errors.New("wanted error"),
+			expErr:     true,
+		},
+		{
+			name:           "A rejected resize does not keep the owner reference that keepAfterDeletion removes.",
+			storedStorage:  "1Gi",
+			desiredStorage: "2Gi",
+			desiredOwners:  nil,
+			pvcs: []*v1.PersistentVolumeClaim{
+				statefulSetPVC("data-rfr-test-0", "1Gi", rfOwnerReference),
+			},
+			rejectResize: true,
+			expStorage:   map[string]string{"data-rfr-test-0": "1Gi"},
+			expOwners:    map[string][]metav1.OwnerReference{"data-rfr-test-0": nil},
+		},
+		{
+			name:           "A failed owner reference removal returns an error.",
+			storedStorage:  "1Gi",
+			desiredStorage: "1Gi",
+			desiredOwners:  nil,
+			pvcs: []*v1.PersistentVolumeClaim{
+				statefulSetPVC("data-rfr-test-0", "1Gi", rfOwnerReference),
+			},
+			errorOnUpdate: errors.New("wanted error"),
+			expErr:        true,
+		},
+		{
+			name:           "A failed PVC list returns an error.",
+			storedStorage:  "1Gi",
+			desiredStorage: "2Gi",
+			desiredOwners:  []metav1.OwnerReference{rfOwnerReference},
+			errorOnList:    errors.New("wanted error"),
+			expErr:         true,
+		},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			assert := assert.New(t)
+
+			stored := pvcStatefulSet(test.storedStorage, []metav1.OwnerReference{rfOwnerReference})
+			stored.Annotations = test.storedAnnotations
+			objects := []runtime.Object{stored}
+			for _, pvc := range test.pvcs {
+				objects = append(objects, pvc)
 			}
-			afterSts := &appsv1.StatefulSet{
-				ObjectMeta: metav1.ObjectMeta{
-					Name:            "teststatefulSet1",
-					ResourceVersion: "10",
-				},
-				Spec: appsv1.StatefulSetSpec{
-					VolumeClaimTemplates: []v1.PersistentVolumeClaim{
-						{
-							Spec: v1.PersistentVolumeClaimSpec{
-								Resources: v1.VolumeResourceRequirements{
-									Requests: v1.ResourceList{
-										v1.ResourceStorage: resource.MustParse("1Gi"),
-									},
-								},
-							},
-						},
-					},
-				},
+			mcli := kubernetes.NewClientset(objects...)
+			enforcePVCResourceVersion(mcli)
+			if test.errorOnList != nil {
+				mcli.PrependReactor("list", "persistentvolumeclaims", func(_ kubetesting.Action) (bool, runtime.Object, error) {
+					return true, nil, test.errorOnList
+				})
 			}
-			pvcList := &v1.PersistentVolumeClaimList{
-				Items: []v1.PersistentVolumeClaim{
-					{
-						ObjectMeta: metav1.ObjectMeta{
-							Labels: map[string]string{
-								"app.kubernetes.io/component": "redis",
-								"app.kubernetes.io/name":      "teststatefulSet1",
-								"app.kubernetes.io/part-of":   "redis-failover",
-							},
-						},
-						Spec: v1.PersistentVolumeClaimSpec{
-							VolumeName: "vol-1",
-							Resources: v1.VolumeResourceRequirements{
-								Requests: v1.ResourceList{
-									v1.ResourceStorage: resource.MustParse("0.5Gi"),
-								},
-							},
-						},
-					},
-					// resized already
-					{
-						Spec: v1.PersistentVolumeClaimSpec{
-							VolumeName: "vol-2",
-							Resources: v1.VolumeResourceRequirements{
-								Requests: v1.ResourceList{
-									v1.ResourceStorage: resource.MustParse("1Gi"),
-								},
-							},
-						},
-					},
-				},
+			if test.errorOnUpdate != nil {
+				mcli.PrependReactor("update", "persistentvolumeclaims", func(_ kubetesting.Action) (bool, runtime.Object, error) {
+					return true, nil, test.errorOnUpdate
+				})
 			}
-			// Mock.
-			mcli := &kubernetes.Clientset{}
-			mcli.AddReactor("get", "statefulsets", func(action kubetesting.Action) (bool, runtime.Object, error) {
-				return true, beforeSts, nil
-			})
-			mcli.AddReactor("list", "persistentvolumeclaims", func(action kubetesting.Action) (handled bool, ret runtime.Object, err error) {
-				return true, pvcList, nil
-			})
-			mcli.AddReactor("update", "persistentvolumeclaims", func(action kubetesting.Action) (handled bool, ret runtime.Object, err error) {
-				// update pvc[0]
-				pvcList.Items[0] = *action.(kubetesting.UpdateActionImpl).Object.(*v1.PersistentVolumeClaim)
-				return true, action.(kubetesting.UpdateActionImpl).Object, nil
-			})
+
+			if test.errorOnGet != nil {
+				mcli.PrependReactor("get", "persistentvolumeclaims", func(_ kubetesting.Action) (bool, runtime.Object, error) {
+					return true, nil, test.errorOnGet
+				})
+			}
+			if test.conflictOnUpdate {
+				// Another controller writes the PVC between the get and the
+				// first update of the operator.
+				conflicted := false
+				mcli.PrependReactor("update", "persistentvolumeclaims", func(action kubetesting.Action) (bool, runtime.Object, error) {
+					if conflicted {
+						return false, nil, nil
+					}
+					conflicted = true
+					name := action.(kubetesting.UpdateAction).GetObject().(*v1.PersistentVolumeClaim).Name
+					obj, err := mcli.Tracker().Get(pvcsGroup, action.GetNamespace(), name)
+					if err != nil {
+						return true, nil, err
+					}
+					other := obj.(*v1.PersistentVolumeClaim).DeepCopy()
+					other.Annotations = map[string]string{"other-writer": "true"}
+					other.ResourceVersion = nextResourceVersion(other.ResourceVersion)
+					if err := mcli.Tracker().Update(pvcsGroup, other, action.GetNamespace()); err != nil {
+						return true, nil, err
+					}
+					return true, nil, kubeerrors.NewConflict(pvcsGroup.GroupResource(), name, errors.New("the object has been modified"))
+				})
+			}
+			if test.rejectResize {
+				mcli.PrependReactor("update", "persistentvolumeclaims", func(action kubetesting.Action) (bool, runtime.Object, error) {
+					pvc := action.(kubetesting.UpdateAction).GetObject().(*v1.PersistentVolumeClaim)
+					if pvc.Spec.Resources.Requests.Storage().String() != "1Gi" {
+						return true, nil, errors.New("the storage class does not allow expansion")
+					}
+					return false, nil, nil
+				})
+			}
+
 			service := k8s.NewStatefulSetService(mcli, log.Dummy, metrics.Dummy)
-			err := service.CreateOrUpdateStatefulSet(testns, afterSts)
-			assertTest.NoError(err)
-			assertTest.Equal(pvcList.Items[0].Spec.Resources, pvcList.Items[1].Spec.Resources)
-			// should not call update
-			mcli.AddReactor("update", "persistentvolumeclaims", func(action kubetesting.Action) (handled bool, ret runtime.Object, err error) {
-				panic("shouldn't call update")
-			})
-			service = k8s.NewStatefulSetService(mcli, log.Dummy, metrics.Dummy)
-			err = service.CreateOrUpdateStatefulSet(testns, afterSts)
-			assertTest.NoError(err)
+			desired := pvcStatefulSet(test.desiredStorage, test.desiredOwners)
+			desired.Spec.Replicas = test.desiredReplicas
+			err := service.CreateOrUpdateStatefulSet("testns", desired)
+
+			if test.expErr {
+				assert.Error(err)
+				return
+			}
+			require.NoError(t, err)
+			for name, storage := range test.expStorage {
+				assertPVCStorage(t, mcli, name, storage)
+			}
+			for name, owners := range test.expOwners {
+				assert.ElementsMatch(owners, getPVC(t, mcli, name).OwnerReferences, "owner references of pvc %s", name)
+			}
+			for name, annotations := range test.expAnnotations {
+				assert.Equal(annotations, getPVC(t, mcli, name).Annotations, "annotations of pvc %s", name)
+			}
+			statefulSetUpdated := false
+			for _, action := range mcli.Actions() {
+				if action.Matches("update", "statefulsets") {
+					statefulSetUpdated = true
+				}
+			}
+			assert.Equal(test.expStatefulSetUpdate, statefulSetUpdated, "StatefulSet update")
 		})
 	}
 }
@@ -399,7 +671,7 @@ func realisticStatefulSet(replicas int32) *appsv1.StatefulSet {
 		},
 		Spec: appsv1.StatefulSetSpec{
 			ServiceName: "rfr-test",
-			Replicas:    ptr.To(replicas),
+			Replicas:    new(replicas),
 			UpdateStrategy: appsv1.StatefulSetUpdateStrategy{
 				Type: appsv1.OnDeleteStatefulSetStrategyType,
 			},
@@ -408,7 +680,7 @@ func realisticStatefulSet(replicas int32) *appsv1.StatefulSet {
 			Template: v1.PodTemplateSpec{
 				ObjectMeta: metav1.ObjectMeta{Labels: map[string]string{"app.kubernetes.io/name": "test"}},
 				Spec: v1.PodSpec{
-					TerminationGracePeriodSeconds: ptr.To(int64(30)),
+					TerminationGracePeriodSeconds: new(int64(30)),
 					Containers: []v1.Container{
 						{Name: "redis", Image: "redis:7", ImagePullPolicy: v1.PullAlways},
 					},
@@ -422,7 +694,7 @@ func realisticStatefulSet(replicas int32) *appsv1.StatefulSet {
 // StatefulSet.
 func serverDefaultedSTS(s *appsv1.StatefulSet) *appsv1.StatefulSet {
 	s = s.DeepCopy()
-	s.Spec.RevisionHistoryLimit = ptr.To(int32(10))
+	s.Spec.RevisionHistoryLimit = new(int32(10))
 	s.Spec.Template.Spec.RestartPolicy = v1.RestartPolicyAlways
 	s.Spec.Template.Spec.SchedulerName = "default-scheduler"
 	s.Spec.Template.Spec.DeprecatedServiceAccount = s.Spec.Template.Spec.ServiceAccountName
@@ -499,7 +771,7 @@ func TestStatefulSetServiceObjectUpToDate(t *testing.T) {
 			mcli := kubernetes.NewClientset(stored)
 
 			service := k8s.NewStatefulSetService(mcli, log.Dummy, metrics.Dummy)
-			assert.NoError(service.CreateOrUpdateStatefulSet(testns, test.desired.DeepCopy()))
+			require.NoError(t, service.CreateOrUpdateStatefulSet(testns, test.desired.DeepCopy()))
 
 			updates := 0
 			for _, a := range mcli.Actions() {
@@ -528,10 +800,10 @@ func TestStatefulSetServiceDeleteStatefulSet(t *testing.T) {
 		service := k8s.NewStatefulSetService(mcli, log.Dummy, metrics.Dummy)
 
 		err := service.DeleteStatefulSet(testns, "teststatefulset")
-		assertTest.NoError(err)
+		require.NoError(t, err)
 
 		_, err = mcli.AppsV1().StatefulSets(testns).Get(context.TODO(), "teststatefulset", metav1.GetOptions{})
-		assertTest.Error(err)
+		require.Error(t, err)
 		assertTest.True(kubeerrors.IsNotFound(err))
 	})
 
@@ -542,7 +814,7 @@ func TestStatefulSetServiceDeleteStatefulSet(t *testing.T) {
 		service := k8s.NewStatefulSetService(mcli, log.Dummy, metrics.Dummy)
 
 		err := service.DeleteStatefulSet(testns, "does-not-exist")
-		assertTest.Error(err)
+		require.Error(t, err)
 		assertTest.True(kubeerrors.IsNotFound(err))
 	})
 }
@@ -559,6 +831,33 @@ func TestStatefulSetServiceListStatefulSets(t *testing.T) {
 	service := k8s.NewStatefulSetService(mcli, log.Dummy, metrics.Dummy)
 
 	list, err := service.ListStatefulSets(testns)
-	assertTest.NoError(err)
+	require.NoError(t, err)
 	assertTest.Len(list.Items, 2)
+}
+
+// TestStatefulSetServiceRejectedResizeKeepsTheNextPVCs checks that a rejected
+// resize of one PVC does not stop the owner removal and the resize of the
+// PVCs after it.
+func TestStatefulSetServiceRejectedResizeKeepsTheNextPVCs(t *testing.T) {
+	stored := pvcStatefulSet("1Gi", []metav1.OwnerReference{rfOwnerReference})
+	mcli := kubernetes.NewClientset(stored,
+		statefulSetPVC("data-rfr-test-0", "1Gi", rfOwnerReference),
+		statefulSetPVC("data-rfr-test-1", "1Gi", rfOwnerReference),
+	)
+	enforcePVCResourceVersion(mcli)
+	mcli.PrependReactor("update", "persistentvolumeclaims", func(action kubetesting.Action) (bool, runtime.Object, error) {
+		pvc := action.(kubetesting.UpdateAction).GetObject().(*v1.PersistentVolumeClaim)
+		if pvc.Name == "data-rfr-test-0" && pvc.Spec.Resources.Requests.Storage().String() != "1Gi" {
+			return true, nil, errors.New("the storage class does not allow expansion")
+		}
+		return false, nil, nil
+	})
+
+	err := k8s.NewStatefulSetService(mcli, log.Dummy, metrics.Dummy).CreateOrUpdateStatefulSet("testns", pvcStatefulSet("2Gi", nil))
+
+	require.NoError(t, err)
+	assertPVCStorage(t, mcli, "data-rfr-test-0", "1Gi")
+	assertPVCStorage(t, mcli, "data-rfr-test-1", "2Gi")
+	assert.Empty(t, getPVC(t, mcli, "data-rfr-test-0").OwnerReferences)
+	assert.Empty(t, getPVC(t, mcli, "data-rfr-test-1").OwnerReferences)
 }

@@ -3,13 +3,17 @@ package redisfailover_test
 import (
 	"context"
 	"errors"
+	"fmt"
+	"strings"
 	"testing"
 	"time"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/mock"
+	"github.com/stretchr/testify/require"
+	corev1 "k8s.io/api/core/v1"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
-	"k8s.io/utils/ptr"
 
 	redisfailoverv1 "github.com/saremox/redis-operator/api/redisfailover/v1"
 	"github.com/saremox/redis-operator/log"
@@ -18,6 +22,7 @@ import (
 	mRFService "github.com/saremox/redis-operator/mocks/operator/redisfailover/service"
 	mK8SService "github.com/saremox/redis-operator/mocks/service/k8s"
 	rfOperator "github.com/saremox/redis-operator/operator/redisfailover"
+	"github.com/saremox/redis-operator/service/k8s"
 )
 
 // redisFailoverFinalizerMirror mirrors the unexported constant of the same
@@ -25,7 +30,7 @@ import (
 const redisFailoverFinalizerMirror = "redisfailovers.databases.spotahome.com/finalizer"
 
 // fakeRecorder wraps metrics.Dummy (whose concrete type is unexported, so it
-// can't be embedded directly) and records DeleteCluster calls, which is the
+// cannot be embedded directly) and records DeleteCluster calls, which is the
 // one signal these tests need to observe.
 type fakeRecorder struct {
 	metrics.Recorder
@@ -34,6 +39,14 @@ type fakeRecorder struct {
 
 func (f *fakeRecorder) DeleteCluster(namespace, name string) {
 	f.deleteClusterCalls = append(f.deleteClusterCalls, namespace+"/"+name)
+}
+
+// noAutoscalerState makes ms answer that the autoscaler state ConfigMap is
+// missing. Handle looks for it one time without autoscaling.
+func noAutoscalerState(ms *mK8SService.Services) *mK8SService.Services {
+	ms.On("GetConfigMap", mock.Anything, mock.MatchedBy(func(name string) bool { return strings.HasPrefix(name, "rfa-") })).Maybe().
+		Return(nil, apierrors.NewNotFound(corev1.Resource("configmaps"), "rfa"))
+	return ms
 }
 
 // skipReconcileAnnotationKey mirrors the unexported constant of the same name
@@ -77,8 +90,6 @@ func TestHandleSkipReconcileAnnotation(t *testing.T) {
 
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
-			assert := assert.New(t)
-
 			// Bootstrapping, no exporter: the minimal path through Ensure and
 			// CheckAndHeal, matching the "Only ensure Redis when bootstrapping"
 			// case already exercised in ensurer_test.go.
@@ -90,13 +101,14 @@ func TestHandleSkipReconcileAnnotation(t *testing.T) {
 			}
 
 			config := generateConfig()
-			mk := &mK8SService.Services{}
+			mk := noAutoscalerState(noAppliedSecret(&mK8SService.Services{}))
 			// CheckAndHeal always defers updateStatus, on every return path;
-			// only reached when reconciliation isn't skipped, hence Maybe().
+			// only reached when reconciliation is not skipped, hence Maybe().
 			mk.On("UpdateRedisFailoverStatus", mock.Anything, mock.Anything, mock.Anything, mock.Anything).Maybe().Return()
 			mrfc := &mRFService.RedisFailoverCheck{}
 			mrfh := &mRFService.RedisFailoverHeal{}
-			mrfh.On("ApplyPassword", mock.Anything, mock.Anything, mock.Anything).Maybe().Return(true, nil)
+			mrfh.On("AbortOrphanedFailover", mock.Anything, mock.Anything).Maybe().Return(false, nil)
+			mrfh.On("ApplyPassword", mock.Anything, mock.Anything, mock.Anything).Maybe().Return(true, false, nil)
 			mrfh.On("ApplySentinelPassword", mock.Anything, mock.Anything).Maybe().Return(true, nil)
 			mrfs := &mRFService.RedisFailoverClient{}
 
@@ -120,12 +132,14 @@ func TestHandleSkipReconcileAnnotation(t *testing.T) {
 				// Minimal CheckAndHeal() expectation: bootstrap mode bails out
 				// early once IsRedisRunning reports false.
 				mrfc.On("IsRedisRunning", rf).Once().Return(false)
+				// No redis pod is a stale Pending pod to delete.
+				mk.On("GetStatefulSetPods", rf.Namespace, mock.Anything).Once().Return(&corev1.PodList{}, nil)
 			}
 
 			handler := rfOperator.NewRedisFailoverHandler(config, mrfs, mrfc, mrfh, mk, metrics.Dummy, log.Dummy)
 			err := handler.Handle(context.Background(), rf)
 
-			assert.NoError(err)
+			require.NoError(t, err)
 
 			if test.expectSkip {
 				// None of Ensure/CheckAndHeal's underlying calls should have
@@ -149,10 +163,11 @@ func TestHandleNotARedisFailover(t *testing.T) {
 	assert := assert.New(t)
 
 	config := generateConfig()
-	mk := &mK8SService.Services{}
+	mk := noAutoscalerState(noAppliedSecret(&mK8SService.Services{}))
 	mrfc := &mRFService.RedisFailoverCheck{}
 	mrfh := &mRFService.RedisFailoverHeal{}
-	mrfh.On("ApplyPassword", mock.Anything, mock.Anything, mock.Anything).Maybe().Return(true, nil)
+	mrfh.On("AbortOrphanedFailover", mock.Anything, mock.Anything).Maybe().Return(false, nil)
+	mrfh.On("ApplyPassword", mock.Anything, mock.Anything, mock.Anything).Maybe().Return(true, false, nil)
 	mrfh.On("ApplySentinelPassword", mock.Anything, mock.Anything).Maybe().Return(true, nil)
 	mrfs := &mRFService.RedisFailoverClient{}
 
@@ -161,6 +176,22 @@ func TestHandleNotARedisFailover(t *testing.T) {
 
 	assert.Error(err)
 }
+
+type reconcileKey struct{}
+
+// reconcileCtx returns a cancelled context with a value, as Handle gets it
+// from a reconcile that runs on shutdown.
+func reconcileCtx() context.Context {
+	ctx, cancel := context.WithCancel(context.WithValue(context.Background(), reconcileKey{}, "reconcile"))
+	cancel()
+	return ctx
+}
+
+// fromReconcile matches a context that keeps the value of reconcileCtx, but
+// not its cancel: the writes of a running reconcile finish on shutdown.
+var fromReconcile = mock.MatchedBy(func(ctx context.Context) bool {
+	return ctx.Value(reconcileKey{}) == "reconcile" && ctx.Err() == nil
+})
 
 // TestHandleValidateError verifies that Handle rejects a RedisFailover that
 // fails Validate() (here, a name longer than the 48-char limit) before ever
@@ -172,23 +203,36 @@ func TestHandleValidateError(t *testing.T) {
 	rf.Name = "this-name-is-far-too-long-to-pass-the-forty-eight-character-limit"
 
 	config := generateConfig()
-	mk := &mK8SService.Services{}
+	mk := noAutoscalerState(noAppliedSecret(&mK8SService.Services{}))
 	mrfc := &mRFService.RedisFailoverCheck{}
 	mrfh := &mRFService.RedisFailoverHeal{}
-	mrfh.On("ApplyPassword", mock.Anything, mock.Anything, mock.Anything).Maybe().Return(true, nil)
+	mrfh.On("AbortOrphanedFailover", mock.Anything, mock.Anything).Maybe().Return(false, nil)
+	mrfh.On("ApplyPassword", mock.Anything, mock.Anything, mock.Anything).Maybe().Return(true, false, nil)
 	mrfh.On("ApplySentinelPassword", mock.Anything, mock.Anything).Maybe().Return(true, nil)
 	mrfs := &mRFService.RedisFailoverClient{}
 
-	// Finalizer registration runs before Validate(), so it's still expected
+	// Finalizer registration runs before Validate(), so it is still expected
 	// even though this RF fails validation.
-	mk.On("PatchRedisFailoverFinalizers", mock.Anything, rf.Namespace, rf.Name, mock.Anything, mock.Anything).Once().Return(nil)
+	mk.On("PatchRedisFailoverFinalizers", fromReconcile, rf.Namespace, rf.Name, mock.Anything, mock.Anything).Twice().Return(nil)
+	// The status shows the error, because the last status is not correct.
+	var written redisfailoverv1.RedisFailoverStatus
+	mk.On("UpdateRedisFailoverStatus", fromReconcile, rf.Namespace, rf, mock.Anything).Once().Run(func(args mock.Arguments) {
+		written = args.Get(2).(*redisfailoverv1.RedisFailover).Status
+	})
+	rf.Status = redisfailoverv1.RedisFailoverStatus{State: redisfailoverv1.HealthyState, LastChanged: "2026-01-01T00:00:00Z"}
 
 	handler := rfOperator.NewRedisFailoverHandler(config, mrfs, mrfc, mrfh, mk, metrics.Dummy, log.Dummy)
-	err := handler.Handle(context.Background(), rf)
+	err := handler.Handle(reconcileCtx(), rf)
 
-	assert.Error(err)
+	require.Error(t, err)
+	assert.Equal(redisfailoverv1.NotHealthyState, written.State)
+	assert.Equal(err.Error(), written.Message)
+	assert.NotEqual("2026-01-01T00:00:00Z", written.LastChanged)
 	mrfs.AssertNotCalled(t, "EnsureNotPresentRedisService", mock.Anything)
 	mrfc.AssertNotCalled(t, "IsRedisRunning", mock.Anything)
+
+	// An unchanged error is not written again.
+	require.Error(t, handler.Handle(reconcileCtx(), rf))
 	mk.AssertExpectations(t)
 }
 
@@ -201,10 +245,11 @@ func TestHandleEnsureError(t *testing.T) {
 	ensureErr := errors.New("ensure boom")
 
 	config := generateConfig()
-	mk := &mK8SService.Services{}
+	mk := noAutoscalerState(noAppliedSecret(&mK8SService.Services{}))
 	mrfc := &mRFService.RedisFailoverCheck{}
 	mrfh := &mRFService.RedisFailoverHeal{}
-	mrfh.On("ApplyPassword", mock.Anything, mock.Anything, mock.Anything).Maybe().Return(true, nil)
+	mrfh.On("AbortOrphanedFailover", mock.Anything, mock.Anything).Maybe().Return(false, nil)
+	mrfh.On("ApplyPassword", mock.Anything, mock.Anything, mock.Anything).Maybe().Return(true, false, nil)
 	mrfh.On("ApplySentinelPassword", mock.Anything, mock.Anything).Maybe().Return(true, nil)
 	mrfs := &mRFService.RedisFailoverClient{}
 
@@ -222,26 +267,58 @@ func TestHandleEnsureError(t *testing.T) {
 	mk.AssertExpectations(t)
 }
 
+// TestHandleEnsureNameConflict verifies that the status of a RedisFailover
+// shows an error when another RedisFailover controls an object that Ensure
+// must write, and that Handle does not call CheckAndHeal.
+func TestHandleEnsureNameConflict(t *testing.T) {
+	assert := assert.New(t)
+
+	rf := generateRF(false, true)
+	conflict := fmt.Errorf("ensure: %w", &k8s.ControlledByOtherError{Kind: "ConfigMap", Name: "rfr-s-foo", OwnerKind: "RedisFailover", OwnerName: "foo"})
+
+	mk := noAutoscalerState(noAppliedSecret(&mK8SService.Services{}))
+	mrfc := &mRFService.RedisFailoverCheck{}
+	mrfh := &mRFService.RedisFailoverHeal{}
+	mrfh.On("AbortOrphanedFailover", mock.Anything, mock.Anything).Maybe().Return(false, nil)
+	mrfs := &mRFService.RedisFailoverClient{}
+	mrfs.On("EnsureNotPresentRedisService", rf).Once().Return(conflict)
+	mk.On("PatchRedisFailoverFinalizers", fromReconcile, rf.Namespace, rf.Name, mock.Anything, mock.Anything).Once().Return(nil)
+	var written redisfailoverv1.RedisFailoverStatus
+	mk.On("UpdateRedisFailoverStatus", fromReconcile, rf.Namespace, rf, mock.Anything).Once().Run(func(args mock.Arguments) {
+		written = args.Get(2).(*redisfailoverv1.RedisFailover).Status
+	})
+
+	handler := rfOperator.NewRedisFailoverHandler(generateConfig(), mrfs, mrfc, mrfh, mk, metrics.Dummy, log.Dummy)
+	err := handler.Handle(reconcileCtx(), rf)
+
+	assert.Equal(conflict, err)
+	assert.Equal(redisfailoverv1.NotHealthyState, written.State)
+	assert.Equal(conflict.Error(), written.Message)
+	mrfc.AssertNotCalled(t, "IsRedisRunning", mock.Anything)
+	mk.AssertExpectations(t)
+}
+
 // TestHandleCheckAndHealError verifies that Handle propagates an error from
 // CheckAndHeal once Ensure has completed successfully.
 func TestHandleCheckAndHealError(t *testing.T) {
 	assert := assert.New(t)
 
 	// Operator-managed mode (sentinel disabled), not bootstrapping: the
-	// minimal Ensure() call graph (see TestEnsure "don't use exporter" case,
+	// minimal Ensure() call graph (see TestEnsure `don't use exporter` case,
 	// with sentinels also disabled).
 	rf := generateRF(false, false)
-	rf.Spec.Sentinel.Enabled = ptr.To(false)
+	rf.Spec.Sentinel.Enabled = new(false)
 
 	checkErr := errors.New("get number masters boom")
 
 	config := generateConfig()
-	mk := &mK8SService.Services{}
+	mk := noAutoscalerState(noAppliedSecret(&mK8SService.Services{}))
 	// CheckAndHeal always defers updateStatus, on every return path.
 	mk.On("UpdateRedisFailoverStatus", mock.Anything, mock.Anything, mock.Anything, mock.Anything).Return()
 	mrfc := &mRFService.RedisFailoverCheck{}
 	mrfh := &mRFService.RedisFailoverHeal{}
-	mrfh.On("ApplyPassword", mock.Anything, mock.Anything, mock.Anything).Maybe().Return(true, nil)
+	mrfh.On("AbortOrphanedFailover", mock.Anything, mock.Anything).Maybe().Return(false, nil)
+	mrfh.On("ApplyPassword", mock.Anything, mock.Anything, mock.Anything).Maybe().Return(true, false, nil)
 	mrfh.On("ApplySentinelPassword", mock.Anything, mock.Anything).Maybe().Return(true, nil)
 	mrfs := &mRFService.RedisFailoverClient{}
 
@@ -255,9 +332,10 @@ func TestHandleCheckAndHealError(t *testing.T) {
 	mrfs.On("EnsureRedisStatefulset", rf, mock.Anything, mock.Anything).Once().Return(nil)
 	mk.On("PatchRedisFailoverFinalizers", mock.Anything, rf.Namespace, rf.Name, mock.Anything, mock.Anything).Once().Return(nil)
 
-	// CheckAndHeal routes to checkAndHealOperatorManagedMode and fails at
-	// GetNumberMasters.
-	mrfc.On("IsRedisRunningQuorum", rf).Once().Return(true)
+	// CheckAndHeal routes to checkAndHealOperatorManagedMode, finds no
+	// FAILOVER to abort, and fails at GetNumberMasters.
+	mk.On("GetStatefulSetPods", rf.Namespace, mock.Anything).Return(&corev1.PodList{}, nil)
+	mrfc.On("IsRedisRunning", rf).Once().Return(true)
 	mrfc.On("GetNumberMasters", rf).Once().Return(0, checkErr)
 
 	handler := rfOperator.NewRedisFailoverHandler(config, mrfs, mrfc, mrfh, mk, metrics.Dummy, log.Dummy)
@@ -333,12 +411,13 @@ func TestHandleGetLabelsWhitelistFiltering(t *testing.T) {
 			rf.Spec.LabelWhitelist = test.whitelist
 
 			config := generateConfig()
-			mk := &mK8SService.Services{}
+			mk := noAutoscalerState(noAppliedSecret(&mK8SService.Services{}))
 			// CheckAndHeal always defers updateStatus, on every return path.
 			mk.On("UpdateRedisFailoverStatus", mock.Anything, mock.Anything, mock.Anything, mock.Anything).Return()
 			mrfc := &mRFService.RedisFailoverCheck{}
 			mrfh := &mRFService.RedisFailoverHeal{}
-			mrfh.On("ApplyPassword", mock.Anything, mock.Anything, mock.Anything).Maybe().Return(true, nil)
+			mrfh.On("AbortOrphanedFailover", mock.Anything, mock.Anything).Maybe().Return(false, nil)
+			mrfh.On("ApplyPassword", mock.Anything, mock.Anything, mock.Anything).Maybe().Return(true, false, nil)
 			mrfh.On("ApplySentinelPassword", mock.Anything, mock.Anything).Maybe().Return(true, nil)
 			mrfs := &mRFService.RedisFailoverClient{}
 
@@ -359,10 +438,12 @@ func TestHandleGetLabelsWhitelistFiltering(t *testing.T) {
 			mk.On("PatchRedisFailoverFinalizers", mock.Anything, rf.Namespace, rf.Name, mock.Anything, mock.Anything).Once().Return(nil)
 
 			mrfc.On("IsRedisRunning", rf).Once().Return(false)
+			// No redis pod is a stale Pending pod to delete.
+			mk.On("GetStatefulSetPods", rf.Namespace, mock.Anything).Once().Return(&corev1.PodList{}, nil)
 
 			handler := rfOperator.NewRedisFailoverHandler(config, mrfs, mrfc, mrfh, mk, metrics.Dummy, log.Dummy)
 			err := handler.Handle(context.Background(), rf)
-			assert.NoError(err)
+			require.NoError(t, err)
 
 			if assert.NotNil(gotLabels) {
 				assert.Equal(operatorNameMirror, gotLabels[rfLabelManagedByKeyMirror])
@@ -384,26 +465,25 @@ func TestHandleGetLabelsWhitelistFiltering(t *testing.T) {
 }
 
 // TestHandleAddsFinalizerOnFreshRF verifies that Handle registers
-// redisFailoverFinalizer on a RedisFailover that doesn't yet have it, adding
+// redisFailoverFinalizer on a RedisFailover that does not yet have it, adding
 // it to whatever finalizers were already present rather than replacing them.
 func TestHandleAddsFinalizerOnFreshRF(t *testing.T) {
-	assert := assert.New(t)
-
 	rf := generateRF(false, true)
 	rf.Finalizers = []string{"some.other/finalizer"}
 
 	config := generateConfig()
-	mk := &mK8SService.Services{}
+	mk := noAutoscalerState(noAppliedSecret(&mK8SService.Services{}))
 	mrfc := &mRFService.RedisFailoverCheck{}
 	mrfh := &mRFService.RedisFailoverHeal{}
-	mrfh.On("ApplyPassword", mock.Anything, mock.Anything, mock.Anything).Maybe().Return(true, nil)
+	mrfh.On("AbortOrphanedFailover", mock.Anything, mock.Anything).Maybe().Return(false, nil)
+	mrfh.On("ApplyPassword", mock.Anything, mock.Anything, mock.Anything).Maybe().Return(true, false, nil)
 	mrfh.On("ApplySentinelPassword", mock.Anything, mock.Anything).Maybe().Return(true, nil)
 	mrfs := &mRFService.RedisFailoverClient{}
 
-	mk.On("PatchRedisFailoverFinalizers", mock.Anything, rf.Namespace, rf.Name,
+	mk.On("PatchRedisFailoverFinalizers", fromReconcile, rf.Namespace, rf.Name,
 		[]string{"some.other/finalizer", redisFailoverFinalizerMirror}, mock.Anything).Once().Return(nil)
 	// CheckAndHeal always defers updateStatus, on every return path.
-	mk.On("UpdateRedisFailoverStatus", mock.Anything, mock.Anything, mock.Anything, mock.Anything).Return()
+	mk.On("UpdateRedisFailoverStatus", fromReconcile, mock.Anything, mock.Anything, mock.Anything).Return()
 
 	mrfs.On("EnsureNotPresentRedisService", rf).Once().Return(nil)
 	mrfs.On("EnsureNotPresentSentinelResources", rf).Once().Return(nil)
@@ -414,11 +494,13 @@ func TestHandleAddsFinalizerOnFreshRF(t *testing.T) {
 	mrfs.On("EnsureRedisReadinessConfigMap", rf, mock.Anything, mock.Anything).Once().Return(nil)
 	mrfs.On("EnsureRedisStatefulset", rf, mock.Anything, mock.Anything).Once().Return(nil)
 	mrfc.On("IsRedisRunning", rf).Once().Return(false)
+	// No redis pod is a stale Pending pod to delete.
+	mk.On("GetStatefulSetPods", rf.Namespace, mock.Anything).Once().Return(&corev1.PodList{}, nil)
 
 	handler := rfOperator.NewRedisFailoverHandler(config, mrfs, mrfc, mrfh, mk, metrics.Dummy, log.Dummy)
-	err := handler.Handle(context.Background(), rf)
+	err := handler.Handle(reconcileCtx(), rf)
 
-	assert.NoError(err)
+	require.NoError(t, err)
 	mk.AssertExpectations(t)
 	mrfs.AssertExpectations(t)
 	mrfc.AssertExpectations(t)
@@ -438,21 +520,22 @@ func TestHandleDeletionCleansUpMetricsAndRemovesFinalizer(t *testing.T) {
 	rf.Finalizers = []string{"some.other/finalizer", redisFailoverFinalizerMirror}
 
 	config := generateConfig()
-	mk := &mK8SService.Services{}
+	mk := noAutoscalerState(noAppliedSecret(&mK8SService.Services{}))
 	mrfc := &mRFService.RedisFailoverCheck{}
 	mrfh := &mRFService.RedisFailoverHeal{}
-	mrfh.On("ApplyPassword", mock.Anything, mock.Anything, mock.Anything).Maybe().Return(true, nil)
+	mrfh.On("AbortOrphanedFailover", mock.Anything, mock.Anything).Maybe().Return(false, nil)
+	mrfh.On("ApplyPassword", mock.Anything, mock.Anything, mock.Anything).Maybe().Return(true, false, nil)
 	mrfh.On("ApplySentinelPassword", mock.Anything, mock.Anything).Maybe().Return(true, nil)
 	mrfs := &mRFService.RedisFailoverClient{}
 	mClient := &fakeRecorder{Recorder: metrics.Dummy}
 
-	mk.On("PatchRedisFailoverFinalizers", mock.Anything, rf.Namespace, rf.Name,
+	mk.On("PatchRedisFailoverFinalizers", fromReconcile, rf.Namespace, rf.Name,
 		[]string{"some.other/finalizer"}, mock.Anything).Once().Return(nil)
 
 	handler := rfOperator.NewRedisFailoverHandler(config, mrfs, mrfc, mrfh, mk, mClient, log.Dummy)
-	err := handler.Handle(context.Background(), rf)
+	err := handler.Handle(reconcileCtx(), rf)
 
-	assert.NoError(err)
+	require.NoError(t, err)
 	assert.Equal([]string{rf.Namespace + "/" + rf.Name}, mClient.deleteClusterCalls)
 	mk.AssertExpectations(t)
 	mrfs.AssertNotCalled(t, "EnsureNotPresentRedisService", mock.Anything)
@@ -472,10 +555,11 @@ func TestHandleDeletionWithoutFinalizerIsNoop(t *testing.T) {
 	rf.Finalizers = []string{"some.other/finalizer"}
 
 	config := generateConfig()
-	mk := &mK8SService.Services{}
+	mk := noAutoscalerState(noAppliedSecret(&mK8SService.Services{}))
 	mrfc := &mRFService.RedisFailoverCheck{}
 	mrfh := &mRFService.RedisFailoverHeal{}
-	mrfh.On("ApplyPassword", mock.Anything, mock.Anything, mock.Anything).Maybe().Return(true, nil)
+	mrfh.On("AbortOrphanedFailover", mock.Anything, mock.Anything).Maybe().Return(false, nil)
+	mrfh.On("ApplyPassword", mock.Anything, mock.Anything, mock.Anything).Maybe().Return(true, false, nil)
 	mrfh.On("ApplySentinelPassword", mock.Anything, mock.Anything).Maybe().Return(true, nil)
 	mrfs := &mRFService.RedisFailoverClient{}
 	mClient := &fakeRecorder{Recorder: metrics.Dummy}
@@ -483,7 +567,7 @@ func TestHandleDeletionWithoutFinalizerIsNoop(t *testing.T) {
 	handler := rfOperator.NewRedisFailoverHandler(config, mrfs, mrfc, mrfh, mk, mClient, log.Dummy)
 	err := handler.Handle(context.Background(), rf)
 
-	assert.NoError(err)
+	require.NoError(t, err)
 	assert.Empty(mClient.deleteClusterCalls)
 	mk.AssertNotCalled(t, "PatchRedisFailoverFinalizers", mock.Anything, mock.Anything, mock.Anything, mock.Anything, mock.Anything)
 	mrfs.AssertNotCalled(t, "EnsureNotPresentRedisService", mock.Anything)
@@ -500,10 +584,11 @@ func TestHandleFinalizerRegistrationErrorPropagates(t *testing.T) {
 	patchErr := errors.New("patch boom")
 
 	config := generateConfig()
-	mk := &mK8SService.Services{}
+	mk := noAutoscalerState(noAppliedSecret(&mK8SService.Services{}))
 	mrfc := &mRFService.RedisFailoverCheck{}
 	mrfh := &mRFService.RedisFailoverHeal{}
-	mrfh.On("ApplyPassword", mock.Anything, mock.Anything, mock.Anything).Maybe().Return(true, nil)
+	mrfh.On("AbortOrphanedFailover", mock.Anything, mock.Anything).Maybe().Return(false, nil)
+	mrfh.On("ApplyPassword", mock.Anything, mock.Anything, mock.Anything).Maybe().Return(true, false, nil)
 	mrfh.On("ApplySentinelPassword", mock.Anything, mock.Anything).Maybe().Return(true, nil)
 	mrfs := &mRFService.RedisFailoverClient{}
 
@@ -532,10 +617,11 @@ func TestHandleDeletionFinalizerRemovalErrorPropagates(t *testing.T) {
 	patchErr := errors.New("patch boom")
 
 	config := generateConfig()
-	mk := &mK8SService.Services{}
+	mk := noAutoscalerState(noAppliedSecret(&mK8SService.Services{}))
 	mrfc := &mRFService.RedisFailoverCheck{}
 	mrfh := &mRFService.RedisFailoverHeal{}
-	mrfh.On("ApplyPassword", mock.Anything, mock.Anything, mock.Anything).Maybe().Return(true, nil)
+	mrfh.On("AbortOrphanedFailover", mock.Anything, mock.Anything).Maybe().Return(false, nil)
+	mrfh.On("ApplyPassword", mock.Anything, mock.Anything, mock.Anything).Maybe().Return(true, false, nil)
 	mrfh.On("ApplySentinelPassword", mock.Anything, mock.Anything).Maybe().Return(true, nil)
 	mrfs := &mRFService.RedisFailoverClient{}
 	mClient := &fakeRecorder{Recorder: metrics.Dummy}
@@ -583,14 +669,14 @@ func TestHandleRecordsClusterMetrics(t *testing.T) {
 		},
 		{
 			name: "validation failure reports cluster error",
-			setup: func(rf *redisfailoverv1.RedisFailover, mrfs *mRFService.RedisFailoverClient, mrfc *mRFService.RedisFailoverCheck) {
+			setup: func(rf *redisfailoverv1.RedisFailover, _ *mRFService.RedisFailoverClient, _ *mRFService.RedisFailoverCheck) {
 				rf.Name = "this-name-is-far-too-long-to-pass-the-forty-eight-character-limit"
 			},
 			wantMethod: "SetClusterError",
 		},
 		{
 			name: "ensure failure reports cluster error",
-			setup: func(rf *redisfailoverv1.RedisFailover, mrfs *mRFService.RedisFailoverClient, mrfc *mRFService.RedisFailoverCheck) {
+			setup: func(rf *redisfailoverv1.RedisFailover, mrfs *mRFService.RedisFailoverClient, _ *mRFService.RedisFailoverCheck) {
 				mrfs.On("EnsureNotPresentRedisService", rf).Once().Return(errors.New("ensure boom"))
 			},
 			wantMethod: "SetClusterError",
@@ -601,13 +687,16 @@ func TestHandleRecordsClusterMetrics(t *testing.T) {
 		t.Run(test.name, func(t *testing.T) {
 			rf := generateRF(false, true)
 			config := generateConfig()
-			mk := &mK8SService.Services{}
+			mk := noAutoscalerState(noAppliedSecret(&mK8SService.Services{}))
 			// Reached only by the successful-reconcile case (CheckAndHeal always
 			// defers updateStatus), but harmless to configure unconditionally.
 			mk.On("UpdateRedisFailoverStatus", mock.Anything, mock.Anything, mock.Anything, mock.Anything).Return()
+			// No redis pod is a stale Pending pod to delete.
+			mk.On("GetStatefulSetPods", rf.Namespace, mock.Anything).Maybe().Return(&corev1.PodList{}, nil)
 			mrfc := &mRFService.RedisFailoverCheck{}
 			mrfh := &mRFService.RedisFailoverHeal{}
-			mrfh.On("ApplyPassword", mock.Anything, mock.Anything, mock.Anything).Maybe().Return(true, nil)
+			mrfh.On("AbortOrphanedFailover", mock.Anything, mock.Anything).Maybe().Return(false, nil)
+			mrfh.On("ApplyPassword", mock.Anything, mock.Anything, mock.Anything).Maybe().Return(true, false, nil)
 			mrfh.On("ApplySentinelPassword", mock.Anything, mock.Anything).Maybe().Return(true, nil)
 			mrfs := &mRFService.RedisFailoverClient{}
 			test.setup(rf, mrfs, mrfc)

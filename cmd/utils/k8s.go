@@ -1,9 +1,11 @@
 package utils
 
 import (
+	"errors"
 	"fmt"
 
 	"k8s.io/client-go/kubernetes"
+	"k8s.io/client-go/metadata"
 	"k8s.io/client-go/rest"
 	"k8s.io/client-go/tools/clientcmd"
 
@@ -17,13 +19,13 @@ func LoadKubernetesConfig(flags *CMDFlags) (*rest.Config, error) {
 	if flags.Development {
 		config, err := clientcmd.BuildConfigFromFlags("", flags.KubeConfig)
 		if err != nil {
-			return nil, fmt.Errorf("could not load configuration: %s", err)
+			return nil, fmt.Errorf("could not load configuration: %w", err)
 		}
 		cfg = config
 	} else {
 		config, err := rest.InClusterConfig()
 		if err != nil {
-			return nil, fmt.Errorf("error loading kubernetes configuration inside cluster, check app is running outside kubernetes cluster or run in development mode: %s", err)
+			return nil, fmt.Errorf("error loading kubernetes configuration inside cluster, check app is running outside kubernetes cluster or run in development mode: %w", err)
 		}
 		cfg = config
 	}
@@ -34,21 +36,19 @@ func LoadKubernetesConfig(flags *CMDFlags) (*rest.Config, error) {
 	return cfg, nil
 }
 
-// CreateKubernetesClients create the clients to connect to kubernetes
-func CreateKubernetesClients(flags *CMDFlags) (kubernetes.Interface, redisfailoverclientset.Interface, error) {
+// CreateKubernetesClients create the clients to connect to kubernetes.
+func CreateKubernetesClients(flags *CMDFlags) (kubernetes.Interface, redisfailoverclientset.Interface, metadata.Interface, error) {
 	config, err := LoadKubernetesConfig(flags)
 	if err != nil {
-		return nil, nil, err
+		return nil, nil, nil, err
 	}
 
-	clientset, err := kubernetes.NewForConfig(config)
-	if err != nil {
-		return nil, nil, err
-	}
-	customClientset, err := redisfailoverclientset.NewForConfig(config)
-	if err != nil {
-		return nil, nil, err
+	clientset, kubeErr := kubernetes.NewForConfig(config)
+	customClientset, customErr := redisfailoverclientset.NewForConfig(config)
+	metadataClient, metadataErr := metadata.NewForConfig(config)
+	if err := errors.Join(kubeErr, customErr, metadataErr); err != nil {
+		return nil, nil, nil, err
 	}
 
-	return clientset, customClientset, nil
+	return clientset, customClientset, metadataClient, nil
 }

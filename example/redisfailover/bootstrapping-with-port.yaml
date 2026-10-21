@@ -5,8 +5,6 @@ metadata:
 spec:
   bootstrapNode:
     host: "127.0.0.1"
-    port: 6388
-  sentinel:
-    replicas: 3
+    port: "6388"
   redis:
     replicas: 3

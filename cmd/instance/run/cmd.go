@@ -1,17 +1,8 @@
-// Package run implements the instance manager run command.
-//
-// This follows the CloudNativePG (CNPG) model where the instance manager runs as
-// PID 1 and manages the database process as a child. This architecture has proven
-// reliable at scale in production Kubernetes environments.
-//
-// Key features (learned from CNPG):
-//   - Full lifecycle control over the Redis process
-//   - Clean signal handling with graceful shutdown and timeout escalation
-//   - Zombie process reaper (required when running as PID 1)
-//   - Startup tasks (RDB cleanup) before Redis starts
-//   - Process restart capability for unexpected crashes
-//
-// See: https://cloudnative-pg.io/documentation/current/instance_manager/
+// Package run implements the run command of the instance manager. The
+// manager runs as PID 1, so it reaps zombie processes. It removes old RDB
+// tempfiles before Redis starts, and it sends SIGKILL when Redis does not stop
+// after SIGTERM. It does not restart Redis: when Redis exits, the manager
+// exits too.
 package run
 
 import (
@@ -22,13 +13,14 @@ import (
 	"os/signal"
 	"path/filepath"
 	"strings"
+	"sync"
 	"syscall"
 	"time"
 
 	"github.com/spf13/cobra"
 )
 
-// healthServer is the global health server instance
+// healthServer is the global health server instance.
 var healthServer *HealthServer
 
 const (
@@ -36,12 +28,21 @@ const (
 	defaultDBFilename   = "dump.rdb"
 	defaultRedisConf    = "/redis/redis.conf"
 	defaultRedisCommand = "redis-server"
-
-	// Shutdown timeouts (following CNPG pattern)
-	// These provide escalation from graceful to forced shutdown
-	gracefulShutdownTimeout = 25 * time.Second // Time for SIGTERM before SIGKILL
-	maxShutdownTimeout      = 30 * time.Second // Total shutdown budget (matches K8s terminationGracePeriodSeconds)
 )
+
+// The shutdown sends SIGKILL after gracefulShutdownTimeout. maxShutdownTimeout
+// is the default Kubernetes grace period of 30s. They are variables so that
+// tests can make them short.
+var (
+	gracefulShutdownTimeout = 25 * time.Second
+	maxShutdownTimeout      = 30 * time.Second
+)
+
+// redisCommand is a variable so that tests can run a stand-in process.
+var redisCommand = defaultRedisCommand
+
+// readDir is a variable so that tests can inject directory read faults.
+var readDir = os.ReadDir
 
 var (
 	dataDir    string
@@ -51,31 +52,22 @@ var (
 	redisPort  string
 )
 
-// NewCmd creates the run command
+// NewCmd creates the run command.
 func NewCmd() *cobra.Command {
 	cmd := &cobra.Command{
 		Use:   "run",
 		Short: "Run Redis with instance management",
-		Long: `Run Redis server with full lifecycle management.
+		Long: `Run redis-server as a child process of this manager, which runs as PID 1.
 
-This command implements the instance manager pattern (similar to CloudNativePG)
-where the manager runs as PID 1 and manages Redis as a child process.
+At start, the command:
+  1. Removes the .rdb files other than --db-filename, so that old
+     tempfiles do not fill the disk.
+  2. Starts the health server.
+  3. Starts redis-server as a child process.
 
-On startup:
-  1. Cleans up stale RDB tempfiles to prevent disk exhaustion
-  2. Starts redis-server as a child process
-  3. Reaps zombie processes (required for PID 1)
-  4. Forwards signals to Redis for graceful shutdown
-
-Shutdown behavior (CNPG model):
-  - SIGTERM: Initiate graceful shutdown with timeout
-  - If Redis doesn't exit within timeout, escalate to SIGKILL
-  - Proper cleanup even under crash conditions
-
-This architecture provides:
-  - Clean signal handling and graceful shutdown
-  - Startup tasks before Redis begins accepting connections
-  - Foundation for health checks, metrics, and other lifecycle features`,
+The manager reaps zombie processes, because it is PID 1. On SIGTERM, SIGINT
+or SIGQUIT, it sends SIGTERM to Redis, and SIGKILL after 25s. The manager
+does not restart Redis: when Redis exits, the manager exits too.`,
 		RunE: runInstance,
 	}
 
@@ -88,31 +80,33 @@ This architecture provides:
 	return cmd
 }
 
-func runInstance(cmd *cobra.Command, args []string) error {
+func runInstance(_ *cobra.Command, _ []string) error {
 	fmt.Println("redis-instance: starting instance manager (CNPG-style)")
 	fmt.Printf("redis-instance: PID %d running as process manager\n", os.Getpid())
 
-	// Create a context that we can cancel on shutdown
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
-	// Step 1: Start zombie process reaper (CNPG pattern)
-	// As PID 1, we're responsible for reaping orphaned child processes
-	go runZombieReaper(ctx)
+	// PID 1 must reap the orphaned child processes. The reaper also reaps Redis. It must run until the process loop
+	// returns, because shutdownRedis needs it to see the Redis exit.
+	reaper := newZombieReaper()
+	reaperCtx, stopReaper := context.WithCancel(context.Background())
+	defer stopReaper()
+	go reaper.run(reaperCtx)
 
-	// Step 2: Perform startup cleanup
 	cleanupErr := performStartupCleanup()
 	if cleanupErr != nil {
-		// Log but don't fail - Redis should still be able to start
+		// Redis can start without the cleanup, so only log the error.
 		fmt.Printf("redis-instance: warning: startup cleanup failed: %v\n", cleanupErr)
 	}
 
-	// Step 3: Start health server (provides /healthz, /readyz, /status)
+	// The health server serves /healthz, /readyz and /status.
 	redisPassword := os.Getenv("REDIS_PASSWORD")
 	healthServer = NewHealthServer(healthPort, redisPort, redisPassword)
 	healthServer.SetCleanupDone(cleanupErr == nil)
 	if err := healthServer.Start(ctx); err != nil {
-		fmt.Printf("redis-instance: warning: failed to start health server: %v\n", err)
+		// Without the health endpoints the probes fail for ever, so stop here.
+		return fmt.Errorf("failed to start health server: %w", err)
 	}
 	defer func() {
 		shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), 5*time.Second)
@@ -122,54 +116,49 @@ func runInstance(cmd *cobra.Command, args []string) error {
 		}
 	}()
 
-	// Step 4: Main process loop (CNPG pattern)
-	// This loop allows for process restarts without manager exit
-	return runProcessLoop(ctx, cancel)
+	return runProcessLoop(ctx, cancel, reaper)
 }
 
-// runProcessLoop manages the Redis process lifecycle with restart capability.
-// Following CNPG pattern, this allows recovery from unexpected crashes.
-func runProcessLoop(ctx context.Context, cancel context.CancelFunc) error {
-	// Set up signal handling
+// runProcessLoop starts Redis and returns when Redis exits, or after the
+// shutdown on a signal. Each branch returns, so the loop does not restart
+// Redis.
+func runProcessLoop(ctx context.Context, _ context.CancelFunc, reaper *zombieReaper) error {
 	sigChan := make(chan os.Signal, 1)
 	signal.Notify(sigChan, syscall.SIGTERM, syscall.SIGINT, syscall.SIGQUIT)
 	defer signal.Stop(sigChan)
 
 	for {
-		// Start Redis as a child process.
-		//
-		// When REDIS_PASSWORD is set, pass requirepass/masterauth as arguments
-		// rather than writing them into redis.conf. The operator stopped baking
-		// the password into the ConfigMap (upstream Saremox/redis-operator#135);
-		// passing it here keeps the secret out of every cluster object while this
-		// manager stays PID 1 so SIGTERM still reaches redis for a clean shutdown.
+		// The password is in no ConfigMap, so REDIS_PASSWORD gives
+		// requirepass and masterauth as arguments.
 		redisArgs := []string{redisConf}
 		if pw := os.Getenv("REDIS_PASSWORD"); pw != "" {
 			redisArgs = append(redisArgs, "--requirepass", pw, "--masterauth", pw)
 		}
-		redisCmd := exec.CommandContext(ctx, defaultRedisCommand, redisArgs...)
+		// The reaper reaps Redis, so nothing calls redisCmd.Wait. Thus the
+		// command gets no cancel: CommandContext needs Wait to stop its watch
+		// goroutine, and shutdownRedis already handles ctx cancellation.
+		redisCmd := exec.CommandContext(context.WithoutCancel(ctx), redisCommand, redisArgs...) // #nosec G204 G702 -- the binary sets the command, and the pod spec sets the arguments.
+
 		redisCmd.Stdout = os.Stdout
 		redisCmd.Stderr = os.Stderr
 		redisCmd.Stdin = os.Stdin
 
 		fmt.Printf("redis-instance: starting redis-server with config %s\n", redisConf)
-		if err := redisCmd.Start(); err != nil {
+		doneChan, err := reaper.start(redisCmd)
+		if err != nil {
 			return fmt.Errorf("failed to start redis-server: %w", err)
 		}
+		// Release replaces Wait for the process handle. Stdin, Stdout and
+		// Stderr are *os.File values, so the Cmd holds no pipes and no copy
+		// goroutines that Wait must close.
+		defer func() { _ = redisCmd.Process.Release() }()
 
 		redisPid := redisCmd.Process.Pid
 		fmt.Printf("redis-instance: redis-server started with PID %d\n", redisPid)
 
-		// Notify health server of Redis PID
 		if healthServer != nil {
 			healthServer.SetRedisPID(redisPid)
 		}
-
-		// Wait for either Redis to exit or a signal
-		doneChan := make(chan error, 1)
-		go func() {
-			doneChan <- redisCmd.Wait()
-		}()
 
 		select {
 		case sig := <-sigChan:
@@ -182,27 +171,23 @@ func runProcessLoop(ctx context.Context, cancel context.CancelFunc) error {
 
 		case err := <-doneChan:
 			if err != nil {
-				// Redis exited unexpectedly
 				fmt.Printf("redis-instance: redis-server (PID %d) exited unexpectedly: %v\n", redisPid, err)
 
-				// Check if this is a context cancellation (we're shutting down)
+				// After a cancel, the exit is part of the shutdown.
 				if ctx.Err() != nil {
 					return nil
 				}
 
-				// For now, exit on unexpected crash
-				// Future: could implement restart with backoff
 				return fmt.Errorf("redis-server exited unexpectedly: %w", err)
 			}
-			// Clean exit
 			fmt.Printf("redis-instance: redis-server (PID %d) exited cleanly\n", redisPid)
 			return nil
 		}
 	}
 }
 
-// shutdownRedis handles graceful shutdown with timeout escalation (CNPG pattern).
-// First sends SIGTERM, then escalates to SIGKILL if Redis doesn't exit in time.
+// shutdownRedis sends SIGTERM to Redis, and SIGKILL when Redis does not exit
+// in gracefulShutdownTimeout.
 func shutdownRedis(cmd *exec.Cmd, doneChan <-chan error) error {
 	if cmd.Process == nil {
 		return nil
@@ -210,13 +195,11 @@ func shutdownRedis(cmd *exec.Cmd, doneChan <-chan error) error {
 
 	pid := cmd.Process.Pid
 
-	// Step 1: Send SIGTERM for graceful shutdown
 	fmt.Printf("redis-instance: sending SIGTERM to redis-server (PID %d)\n", pid)
 	if err := cmd.Process.Signal(syscall.SIGTERM); err != nil {
 		fmt.Printf("redis-instance: warning: failed to send SIGTERM: %v\n", err)
 	}
 
-	// Step 2: Wait for graceful shutdown with timeout
 	gracefulTimer := time.NewTimer(gracefulShutdownTimeout)
 	defer gracefulTimer.Stop()
 
@@ -230,13 +213,11 @@ func shutdownRedis(cmd *exec.Cmd, doneChan <-chan error) error {
 		return nil
 
 	case <-gracefulTimer.C:
-		// Graceful shutdown timeout - escalate to SIGKILL
 		fmt.Printf("redis-instance: graceful shutdown timeout (%v), sending SIGKILL\n", gracefulShutdownTimeout)
 		if err := cmd.Process.Kill(); err != nil {
 			fmt.Printf("redis-instance: warning: failed to send SIGKILL: %v\n", err)
 		}
 
-		// Wait for process to actually exit
 		maxTimer := time.NewTimer(maxShutdownTimeout - gracefulShutdownTimeout)
 		defer maxTimer.Stop()
 
@@ -250,43 +231,101 @@ func shutdownRedis(cmd *exec.Cmd, doneChan <-chan error) error {
 	}
 }
 
-// runZombieReaper handles SIGCHLD signals to reap orphaned child processes.
-// This is essential when running as PID 1 in a container (CNPG pattern).
+// zombieReaper reaps the child processes on SIGCHLD. In a container, PID 1
+// must reap the orphaned processes, or the zombie processes collect.
 //
-// When Redis forks (e.g., for BGSAVE or BGREWRITEAOF), those child processes
-// become orphans when they exit. As PID 1, we must reap them to prevent
-// zombie process accumulation.
-func runZombieReaper(ctx context.Context) {
-	sigChan := make(chan os.Signal, 1)
-	signal.Notify(sigChan, syscall.SIGCHLD)
-	defer signal.Stop(sigChan)
+// The reaper is the only caller of wait4 in this process. wait4(-1) also
+// reaps the Redis process, so a second waiter such as exec.Cmd.Wait can lose
+// the Redis exit status and fail with ECHILD. Start managed processes with
+// start, and do not call Wait on them.
+type zombieReaper struct {
+	sigChan chan os.Signal
+
+	mu      sync.Mutex
+	waiters map[int]chan error
+}
+
+// newZombieReaper subscribes to SIGCHLD before any child starts, so that
+// the reaper cannot miss a child exit.
+func newZombieReaper() *zombieReaper {
+	r := &zombieReaper{
+		sigChan: make(chan os.Signal, 1),
+		waiters: make(map[int]chan error),
+	}
+	signal.Notify(r.sigChan, syscall.SIGCHLD)
+	return r
+}
+
+// start starts cmd and returns a channel that receives its exit result.
+// The lock keeps the reaper from reaping the child before its PID is known.
+func (r *zombieReaper) start(cmd *exec.Cmd) (<-chan error, error) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+
+	if err := cmd.Start(); err != nil {
+		return nil, err
+	}
+	done := make(chan error, 1)
+	r.waiters[cmd.Process.Pid] = done
+	return done, nil
+}
+
+// run reaps children on each SIGCHLD until ctx is done.
+func (r *zombieReaper) run(ctx context.Context) {
+	defer signal.Stop(r.sigChan)
 
 	for {
 		select {
 		case <-ctx.Done():
 			return
-		case <-sigChan:
-			// Reap all zombie children
-			for {
-				var status syscall.WaitStatus
-				pid, err := syscall.Wait4(-1, &status, syscall.WNOHANG, nil)
-				if pid <= 0 || err != nil {
-					break
-				}
-				// Log only if it's not the main Redis process (which we handle separately)
-				fmt.Printf("redis-instance: reaped zombie process PID %d (status: %d)\n", pid, status.ExitStatus())
-			}
+		case <-r.sigChan:
+			r.reapAll()
 		}
 	}
 }
 
-// performStartupCleanup removes stale RDB tempfiles before Redis starts.
-// During BGSAVE, Redis creates temp-<pid>.rdb files that can accumulate if
-// Redis crashes repeatedly, eventually filling the disk.
+// reapAll reaps all zombie children and sends the exit result of each
+// managed process to its waiter.
+func (r *zombieReaper) reapAll() {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+
+	for {
+		var status syscall.WaitStatus
+		pid, err := syscall.Wait4(-1, &status, syscall.WNOHANG, nil)
+		if err == syscall.EINTR {
+			continue
+		}
+		if pid <= 0 || err != nil {
+			return
+		}
+		if done, ok := r.waiters[pid]; ok {
+			delete(r.waiters, pid)
+			done <- waitStatusError(status)
+			continue
+		}
+		fmt.Printf("redis-instance: reaped zombie process PID %d (status: %d)\n", pid, status.ExitStatus())
+	}
+}
+
+// waitStatusError returns the error that exec.Cmd.Wait gives for status.
+func waitStatusError(status syscall.WaitStatus) error {
+	switch {
+	case status.Exited() && status.ExitStatus() == 0:
+		return nil
+	case status.Signaled():
+		return fmt.Errorf("signal: %v", status.Signal())
+	default:
+		return fmt.Errorf("exit status %d", status.ExitStatus())
+	}
+}
+
+// performStartupCleanup removes the .rdb files other than dbFilename before
+// Redis starts. A BGSAVE writes temp-<pid>.rdb, and after each crash during a
+// save, one more such file stays until the disk is full.
 func performStartupCleanup() error {
 	fmt.Printf("redis-instance: performing startup cleanup in %s\n", dataDir)
 
-	// Check if data directory exists
 	info, err := os.Stat(dataDir)
 	if err != nil {
 		if os.IsNotExist(err) {
@@ -299,8 +338,7 @@ func performStartupCleanup() error {
 		return fmt.Errorf("%s is not a directory", dataDir)
 	}
 
-	// Find and remove stale RDB files
-	entries, err := os.ReadDir(dataDir)
+	entries, err := readDir(dataDir)
 	if err != nil {
 		return fmt.Errorf("failed to read data directory: %w", err)
 	}
@@ -315,19 +353,16 @@ func performStartupCleanup() error {
 
 		name := entry.Name()
 
-		// Skip non-RDB files
 		if !strings.HasSuffix(name, ".rdb") {
 			continue
 		}
 
-		// Preserve the main database file
 		if name == dbFilename {
 			continue
 		}
 
 		filePath := filepath.Join(dataDir, name)
 
-		// Get file size for reporting
 		fileInfo, err := entry.Info()
 		if err != nil {
 			fmt.Printf("redis-instance: warning: failed to get info for %s: %v\n", name, err)

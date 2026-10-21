@@ -6,8 +6,8 @@ import (
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/mock"
+	"github.com/stretchr/testify/require"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
-	"k8s.io/utils/ptr"
 
 	redisfailoverv1 "github.com/saremox/redis-operator/api/redisfailover/v1"
 	"github.com/saremox/redis-operator/log"
@@ -29,7 +29,7 @@ func generateConfig() rfOperator.Config {
 	}
 }
 
-func generateRF(enableExporter bool, bootstrapping bool) *redisfailoverv1.RedisFailover {
+func generateRF(enableExporter, bootstrapping bool) *redisfailoverv1.RedisFailover {
 	// Explicitly enable sentinel for tests that expect sentinel behavior
 	// (sentinel is disabled by default in v4.0.0+)
 	return &redisfailoverv1.RedisFailover{
@@ -45,7 +45,7 @@ func generateRF(enableExporter bool, bootstrapping bool) *redisfailoverv1.RedisF
 				},
 			},
 			Sentinel: redisfailoverv1.SentinelSettings{
-				Enabled:  ptr.To(true),
+				Enabled:  new(true),
 				Replicas: int32(3),
 			},
 			BootstrapNode: generateRFBootstrappingNode(bootstrapping),
@@ -98,8 +98,6 @@ func TestEnsure(t *testing.T) {
 
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
-			assert := assert.New(t)
-
 			rf := generateRF(test.exporter, test.bootstrapping)
 			if test.bootstrapping {
 				rf.Spec.BootstrapNode.AllowSentinels = test.bootstrappingAllowSentinels
@@ -109,6 +107,7 @@ func TestEnsure(t *testing.T) {
 			mk := &mK8SService.Services{}
 			mrfc := &mRFService.RedisFailoverCheck{}
 			mrfh := &mRFService.RedisFailoverHeal{}
+			mrfh.On("AbortOrphanedFailover", mock.Anything, mock.Anything).Maybe().Return(false, nil)
 			mrfs := &mRFService.RedisFailoverClient{}
 			if test.exporter {
 				mrfs.On("EnsureRedisService", rf, mock.Anything, mock.Anything).Once().Return(nil)
@@ -136,7 +135,7 @@ func TestEnsure(t *testing.T) {
 			handler := rfOperator.NewRedisFailoverHandler(config, mrfs, mrfc, mrfh, mk, metrics.Dummy, log.Dummy)
 			err := handler.Ensure(rf, map[string]string{}, []metav1.OwnerReference{}, metrics.Dummy)
 
-			assert.NoError(err)
+			require.NoError(t, err)
 			mrfs.AssertExpectations(t)
 		})
 	}
@@ -222,13 +221,14 @@ func TestEnsureErrorBranches(t *testing.T) {
 
 			rf := generateRF(test.exporter, false)
 			if !test.sentinelsAllowed {
-				rf.Spec.Sentinel.Enabled = ptr.To(false)
+				rf.Spec.Sentinel.Enabled = new(false)
 			}
 
 			config := generateConfig()
 			mk := &mK8SService.Services{}
 			mrfc := &mRFService.RedisFailoverCheck{}
 			mrfh := &mRFService.RedisFailoverHeal{}
+			mrfh.On("AbortOrphanedFailover", mock.Anything, mock.Anything).Maybe().Return(false, nil)
 			mrfs := &mRFService.RedisFailoverClient{}
 
 			wantErr := errors.New(test.steps[test.failAt] + " failed")

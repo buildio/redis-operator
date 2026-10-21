@@ -18,6 +18,7 @@ import (
 	clientfeatures "k8s.io/client-go/features"
 	clientfeaturestesting "k8s.io/client-go/features/testing"
 	fakekubernetes "k8s.io/client-go/kubernetes/fake"
+	fakemetadata "k8s.io/client-go/metadata/fake"
 	"k8s.io/client-go/tools/cache"
 
 	redisfailoverv1 "github.com/saremox/redis-operator/api/redisfailover/v1"
@@ -145,7 +146,7 @@ func TestNewRedisFailoverRetrieverWatchNilWatcherNoError(t *testing.T) {
 	assert.NotPanics(t, func() {
 		w, err = retriever.WatchWithContext(context.Background(), metav1.ListOptions{})
 	})
-	assert.NoError(t, err)
+	require.NoError(t, err)
 	assert.Nil(t, w)
 	mk.AssertExpectations(t)
 }
@@ -214,17 +215,21 @@ func TestNewBuildsController(t *testing.T) {
 	mr := &mRedisService.Client{}
 	k8sClient := fakekubernetes.NewClientset()
 
-	ctrl, err := New(cfg, mk, k8sClient, "test-namespace", mr, metrics.Dummy, log.Dummy)
+	ctrl, err := New(cfg, mk, k8sClient, fakemetadata.NewSimpleMetadataClient(fakemetadata.NewTestScheme()), "test-namespace", mr, metrics.Dummy, log.Dummy)
 
 	require.NoError(t, err)
 	assert.NotNil(t, ctrl)
 	mk.AssertExpectations(t)
 	mr.AssertExpectations(t)
+
+	c := ctrl.(*rfController)
+	c.handler.(*RedisFailoverHandler).requeue("ns/rf", 0)
+	assert.Eventually(t, func() bool { return c.queue.Len() == 1 }, 5*time.Second, 10*time.Millisecond, "the handler requeue reaches the controller queue")
 }
 
 // TestNewPropagatesLeaderElectionError covers the error path returned by
 // leaderelection.NewDefault: it validates its namespace argument and errors
-// out when it's empty, before ever touching the kubernetes client. This lets
+// out when it is empty, before ever touching the kubernetes client. This lets
 // us deterministically trigger New()'s `if err != nil { return nil, err }`
 // branch without needing a live cluster.
 func TestNewPropagatesLeaderElectionError(t *testing.T) {
@@ -237,17 +242,26 @@ func TestNewPropagatesLeaderElectionError(t *testing.T) {
 	mr := &mRedisService.Client{}
 	k8sClient := fakekubernetes.NewClientset()
 
-	ctrl, err := New(cfg, mk, k8sClient, "", mr, metrics.Dummy, log.Dummy)
+	ctrl, err := New(cfg, mk, k8sClient, fakemetadata.NewSimpleMetadataClient(fakemetadata.NewTestScheme()), "", mr, metrics.Dummy, log.Dummy)
 
-	assert.Error(t, err)
+	require.Error(t, err)
 	assert.Nil(t, ctrl)
 	mk.AssertExpectations(t)
 	mr.AssertExpectations(t)
 }
 
-func TestNewPropagatesControllerError(t *testing.T) {
-	ctrl, err := New(Config{SupportedNamespacesRegex: ".*"}, &mK8SService.Services{}, fakekubernetes.NewClientset(), "test-namespace", &mRedisService.Client{}, failingQueueMetrics{metrics.Dummy}, log.Dummy)
+func TestNewWatchesAuthSecretsOnlyWhenEnabled(t *testing.T) {
+	for _, watch := range []bool{false, true} {
+		cfg := Config{SupportedNamespacesRegex: ".*", WatchAuthSecrets: watch}
+		ctrl, err := New(cfg, &mK8SService.Services{}, fakekubernetes.NewClientset(), fakemetadata.NewSimpleMetadataClient(fakemetadata.NewTestScheme()), "test-namespace", &mRedisService.Client{}, metrics.Dummy, log.Dummy)
+		require.NoError(t, err)
+		assert.Equal(t, watch, ctrl.(*rfController).secretInformer != nil, "WatchAuthSecrets=%t", watch)
+	}
+}
 
-	assert.Error(t, err)
+func TestNewPropagatesControllerError(t *testing.T) {
+	ctrl, err := New(Config{SupportedNamespacesRegex: ".*"}, &mK8SService.Services{}, fakekubernetes.NewClientset(), fakemetadata.NewSimpleMetadataClient(fakemetadata.NewTestScheme()), "test-namespace", &mRedisService.Client{}, failingQueueMetrics{metrics.Dummy}, log.Dummy)
+
+	require.Error(t, err)
 	assert.Nil(t, ctrl)
 }

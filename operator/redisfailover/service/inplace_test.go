@@ -3,11 +3,13 @@ package service
 import (
 	"encoding/json"
 	"errors"
+	"slices"
 	"testing"
 	"time"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/mock"
+	"github.com/stretchr/testify/require"
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
@@ -15,11 +17,14 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/runtime/schema"
+	"k8s.io/apimachinery/pkg/util/validation/field"
 
 	redisfailoverv1 "github.com/saremox/redis-operator/api/redisfailover/v1"
 	"github.com/saremox/redis-operator/log"
 	mK8SService "github.com/saremox/redis-operator/mocks/service/k8s"
+	mRedisService "github.com/saremox/redis-operator/mocks/service/redis"
 	"github.com/saremox/redis-operator/service/k8s"
+	"github.com/saremox/redis-operator/service/redis"
 )
 
 const resizePod = "rfr-test-0"
@@ -39,7 +44,7 @@ func podTemplate(redis corev1.ResourceRequirements) corev1.PodTemplateSpec {
 }
 
 func revision(name string, t corev1.PodTemplateSpec) *appsv1.ControllerRevision {
-	raw, _ := json.Marshal(map[string]interface{}{"spec": map[string]interface{}{"template": t}})
+	raw, _ := json.Marshal(map[string]any{"spec": map[string]any{"template": t}})
 	return &appsv1.ControllerRevision{ObjectMeta: metav1.ObjectMeta{Name: name}, Data: runtime.RawExtension{Raw: raw}}
 }
 
@@ -82,8 +87,25 @@ type resizeCase struct {
 
 func runResize(t *testing.T, c resizeCase, setup func(ms *mK8SService.Services)) (ResizeResult, *mK8SService.Services, error) {
 	t.Helper()
-	rf := &redisfailoverv1.RedisFailover{ObjectMeta: metav1.ObjectMeta{Name: "test", Namespace: "testns"}}
+	result, ms, _, err := runResizeWithRedis(t, resizeRF(), c, setup, nil)
+	return result, ms, err
+}
+
+// runResizeWithRedis is runResize with a Redis client mock, which fails a
+// call that redisSetup does not expect.
+func runResizeWithRedis(t *testing.T, rf *redisfailoverv1.RedisFailover, c resizeCase, setup func(ms *mK8SService.Services), redisSetup func(mr *mRedisService.Client)) (ResizeResult, *mK8SService.Services, *mRedisService.Client, error) {
+	t.Helper()
+	return runResizeEffective(t, rf, c, AutoscalerLimits{}, setup, redisSetup)
+}
+
+// runResizeEffective is runResizeWithRedis with the limits of the autoscaler.
+func runResizeEffective(t *testing.T, rf *redisfailoverv1.RedisFailover, c resizeCase, limits AutoscalerLimits, setup func(ms *mK8SService.Services), redisSetup func(mr *mRedisService.Client)) (ResizeResult, *mK8SService.Services, *mRedisService.Client, error) {
+	t.Helper()
 	ms := &mK8SService.Services{}
+	mr := &mRedisService.Client{}
+	if redisSetup != nil {
+		redisSetup(mr)
+	}
 	ms.On("PodResizeSupport").Return(c.support, nil)
 	ms.On("GetPod", "testns", resizePod).Return(c.pod, nil)
 	ms.On("GetControllerRevision", "testns", "old").Return(revision("old", c.old), nil)
@@ -92,52 +114,52 @@ func runResize(t *testing.T, c resizeCase, setup func(ms *mK8SService.Services))
 	if setup != nil {
 		setup(ms)
 	}
-	result, err := NewRedisFailoverHealer(ms, nil, log.Dummy).ResizePodInPlace(rf, resizePod, "new")
-	return result, ms, err
+	result, err := NewRedisFailoverHealer(ms, mr, log.Dummy).ResizePodInPlace(rf, resizePod, "new", limits)
+	return result, ms, mr, err
 }
 
 var fullSupport = k8s.PodResizeSupport{Supported: true, MemoryLimitDecrease: true}
 
 func TestResizePodInPlaceRequestsTheResize(t *testing.T) {
-	old, new := resources("500m", "1Gi"), resources("1", "2Gi")
+	old, updated := resources("500m", "1Gi"), resources("1", "2Gi")
 	var got map[string]corev1.ResourceRequirements
-	result, ms, err := runResize(t, resizeCase{fullSupport, podTemplate(old), podTemplate(new), stalePod(old, old)}, func(ms *mK8SService.Services) {
+	result, ms, err := runResize(t, resizeCase{fullSupport, podTemplate(old), podTemplate(updated), stalePod(old, old)}, func(ms *mK8SService.Services) {
 		ms.On("ResizePod", "testns", resizePod, mock.Anything).Once().Run(func(args mock.Arguments) {
 			got = args.Get(2).(map[string]corev1.ResourceRequirements)
 		}).Return(nil)
 	})
-	assert.NoError(t, err)
+	require.NoError(t, err)
 	assert.Equal(t, ResizeWaiting, result.Action)
 	ms.AssertExpectations(t)
 	// Requests are defaulted to the limits, as the API server does for pods.
-	assert.Equal(t, withDefaultRequests(new), got[redisContainerName])
+	assert.Equal(t, withDefaultRequests(updated), got[redisContainerName])
 	assert.Contains(t, got, "exporter")
 }
 
 func TestResizePodInPlaceFollowsTheKubelet(t *testing.T) {
-	old, new := resources("500m", "1Gi"), resources("1", "2Gi")
+	old, updated := resources("500m", "1Gi"), resources("1", "2Gi")
 	tests := map[string]struct {
 		pod    *corev1.Pod
 		action ResizeAction
 	}{
-		"not applied yet":        {stalePod(new, old), ResizeWaiting},
-		"infeasible":             {stalePod(new, old, condition(corev1.PodResizePending, corev1.PodReasonInfeasible, 0)), ResizeRecreate},
-		"deferred":               {stalePod(new, old, condition(corev1.PodResizePending, corev1.PodReasonDeferred, time.Minute)), ResizeWaiting},
-		"deferred for too long":  {stalePod(new, old, condition(corev1.PodResizePending, corev1.PodReasonDeferred, time.Hour)), ResizeRecreate},
-		"in progress":            {stalePod(new, old, condition(corev1.PodResizeInProgress, "", time.Hour)), ResizeWaiting},
-		"failing":                {stalePod(new, old, condition(corev1.PodResizeInProgress, corev1.PodReasonError, time.Minute)), ResizeWaiting},
-		"failing for too long":   {stalePod(new, old, condition(corev1.PodResizeInProgress, corev1.PodReasonError, time.Hour)), ResizeRecreate},
-		"applied":                {stalePod(new, new), ResizeDone},
-		"pending after applying": {stalePod(new, new, condition(corev1.PodResizePending, corev1.PodReasonDeferred, 0)), ResizeWaiting},
+		"not applied yet":        {stalePod(updated, old), ResizeWaiting},
+		"infeasible":             {stalePod(updated, old, condition(corev1.PodResizePending, corev1.PodReasonInfeasible, 0)), ResizeRecreate},
+		"deferred":               {stalePod(updated, old, condition(corev1.PodResizePending, corev1.PodReasonDeferred, time.Minute)), ResizeWaiting},
+		"deferred for too long":  {stalePod(updated, old, condition(corev1.PodResizePending, corev1.PodReasonDeferred, time.Hour)), ResizeRecreate},
+		"in progress":            {stalePod(updated, old, condition(corev1.PodResizeInProgress, "", time.Hour)), ResizeWaiting},
+		"failing":                {stalePod(updated, old, condition(corev1.PodResizeInProgress, corev1.PodReasonError, time.Minute)), ResizeWaiting},
+		"failing for too long":   {stalePod(updated, old, condition(corev1.PodResizeInProgress, corev1.PodReasonError, time.Hour)), ResizeRecreate},
+		"applied":                {stalePod(updated, updated), ResizeDone},
+		"pending after applying": {stalePod(updated, updated, condition(corev1.PodResizePending, corev1.PodReasonDeferred, 0)), ResizeWaiting},
 	}
 	for name, test := range tests {
 		t.Run(name, func(t *testing.T) {
-			result, ms, err := runResize(t, resizeCase{fullSupport, podTemplate(old), podTemplate(new), test.pod}, func(ms *mK8SService.Services) {
+			result, ms, err := runResize(t, resizeCase{fullSupport, podTemplate(old), podTemplate(updated), test.pod}, func(ms *mK8SService.Services) {
 				if test.action == ResizeDone {
 					ms.On("UpdatePodLabels", "testns", resizePod, map[string]string{appsv1.ControllerRevisionHashLabelKey: "new"}).Once().Return(nil)
 				}
 			})
-			assert.NoError(t, err)
+			require.NoError(t, err)
 			assert.Equal(t, test.action, result.Action)
 			ms.AssertExpectations(t)
 			if test.action == ResizeDone {
@@ -147,30 +169,122 @@ func TestResizePodInPlaceFollowsTheKubelet(t *testing.T) {
 	}
 }
 
-// The kubelet's memory usage includes the page cache, so it can refuse a
-// memory decrease that the recreated pod fits.
+// The usage includes the page cache, so the kubelet can refuse a memory limit
+// that is sufficient for a recreated pod. Each retry fails, so a wait for the
+// timeout does not help.
 func TestResizePodInPlaceRecreatesForARefusedMemoryDecrease(t *testing.T) {
-	old, new := resources("1", "2Gi"), resources("1", "1Gi")
-	failing := func(age time.Duration) *corev1.Pod {
-		c := condition(corev1.PodResizeInProgress, corev1.PodReasonError, age)
-		c.Message = "cannot decrease memory limits: attempting to set container 'redis' memory limit (1073741824) below current usage (1181116006)"
-		return stalePod(new, old, c)
+	template := func(redis, exporter string) corev1.PodTemplateSpec {
+		t := podTemplate(resources("1", redis))
+		t.Spec.Containers[1].Resources = corev1.ResourceRequirements{Limits: corev1.ResourceList{corev1.ResourceMemory: resource.MustParse(exporter)}}
+		return t
 	}
-	result, _, err := runResize(t, resizeCase{fullSupport, podTemplate(old), podTemplate(new), failing(time.Minute)}, nil)
-	assert.NoError(t, err)
-	assert.Equal(t, ResizeWaiting, result.Action)
+	old, updated := template("2Gi", "128Mi"), template("1Gi", "64Mi")
+	withSidecar := func(pod *corev1.Pod) *corev1.Pod {
+		pod.Spec.Containers = append(pod.Spec.Containers, corev1.Container{Name: "istio-proxy", Resources: withDefaultRequests(resources("100m", "256Mi"))})
+		return pod
+	}
+	tests := map[string]struct {
+		pod     *corev1.Pod
+		message string
+	}{
+		"redis":    {podFrom(updated), `cannot decrease memory limits: attempting to set container "redis" memory limit (1073741824) below current usage (1181116006)`},
+		"exporter": {podFrom(updated), `cannot decrease memory limits: attempting to set container "exporter" memory limit (67108864) below current usage (70000000)`},
+		// 1Gi + 64Mi
+		"pod": {podFrom(updated), "cannot decrease memory limits: attempting to set pod memory limit (1140850688) below current usage (1181116006)"},
+		// 1Gi + 64Mi + 256Mi
+		"pod with an injected sidecar": {withSidecar(podFrom(updated)), "cannot decrease memory limits: attempting to set pod memory limit (1409286144) below current usage (1500000000)"},
+	}
+	for name, test := range tests {
+		t.Run(name, func(t *testing.T) {
+			c := condition(corev1.PodResizeInProgress, corev1.PodReasonError, 0)
+			c.Message = test.message
+			test.pod.Status.Conditions = []corev1.PodCondition{c}
+			result, _, err := runResize(t, resizeCase{fullSupport, old, updated, test.pod}, nil)
+			require.NoError(t, err)
+			assert.Equal(t, ResizeRecreate, result.Action)
+			assert.Equal(t, "resize failed: "+test.message, result.Message)
+		})
+	}
+}
 
-	result, _, err = runResize(t, resizeCase{fullSupport, podTemplate(old), podTemplate(new), failing(time.Hour)}, nil)
-	assert.NoError(t, err)
-	assert.Equal(t, ResizeRecreate, result.Action)
+func TestPodMemoryLimit(t *testing.T) {
+	memory := func(size string) corev1.ResourceRequirements {
+		return corev1.ResourceRequirements{Limits: corev1.ResourceList{corev1.ResourceMemory: resource.MustParse(size)}}
+	}
+	always := corev1.ContainerRestartPolicyAlways
+	pod := func(change func(*corev1.PodSpec)) *corev1.Pod {
+		p := &corev1.Pod{Spec: corev1.PodSpec{
+			Containers:     []corev1.Container{{Name: redisContainerName, Resources: memory("2Gi")}, {Name: "exporter", Resources: memory("64Mi")}},
+			InitContainers: []corev1.Container{{Name: "init", Resources: memory("32Mi")}},
+		}}
+		if change != nil {
+			change(&p.Spec)
+		}
+		return p
+	}
+	desired := map[string]corev1.ResourceRequirements{redisContainerName: memory("1Gi"), "exporter": memory("64Mi")}
+	mi := int64(1 << 20)
+	tests := map[string]struct {
+		pod  *corev1.Pod
+		want int64
+	}{
+		"containers":                      {pod(nil), 1088 * mi},
+		"a larger init container":         {pod(func(s *corev1.PodSpec) { s.InitContainers[0].Resources = memory("2Gi") }), 2048 * mi},
+		"a container without limit":       {pod(func(s *corev1.PodSpec) { s.Containers = append(s.Containers, corev1.Container{Name: "sidecar"}) }), 0},
+		"an init container without limit": {pod(func(s *corev1.PodSpec) { s.InitContainers[0].Resources = corev1.ResourceRequirements{} }), 0},
+		"pod-level resources":             {pod(func(s *corev1.PodSpec) { s.Resources = &corev1.ResourceRequirements{} }), 0},
+		"overhead":                        {pod(func(s *corev1.PodSpec) { s.Overhead = memory("10Mi").Limits }), 1098 * mi},
+		// The init container runs at the same time as the sidecar:
+		// max(1Gi + 64Mi + 256Mi, 256Mi + 1Gi).
+		"a native sidecar": {pod(func(s *corev1.PodSpec) {
+			s.InitContainers = append([]corev1.Container{{Name: "sidecar", RestartPolicy: &always, Resources: memory("256Mi")}}, s.InitContainers[0])
+			s.InitContainers[1].Resources = memory("1Gi")
+		}), 1344 * mi},
+	}
+	for name, test := range tests {
+		t.Run(name, func(t *testing.T) {
+			assert.Equal(t, test.want, podMemoryLimit(test.pod, desired))
+		})
+	}
+}
+
+// A refusal from a superseded request does not apply to the current request,
+// so the operator waits for a new report from the kubelet.
+func TestResizePodInPlaceIgnoresAStaleMemoryRefusal(t *testing.T) {
+	old, updated := resources("1", "2Gi"), resources("1", "1Gi")
+	refusal := func(generation int64, age time.Duration) corev1.PodCondition {
+		c := condition(corev1.PodResizeInProgress, corev1.PodReasonError, age)
+		c.Message = `cannot decrease memory limits: [attempting to set pod memory limit (536870912) below current usage (1181116006), attempting to set container "redis" memory limit (536870912) below current usage (1181116006)]`
+		c.ObservedGeneration = generation
+		return c
+	}
+	tests := map[string]struct {
+		condition  corev1.PodCondition
+		generation int64
+		action     ResizeAction
+	}{
+		"without a generation":               {refusal(0, 0), 2, ResizeWaiting},
+		"without a generation, for too long": {refusal(0, time.Hour), 2, ResizeRecreate},
+		"superseded":                         {refusal(1, 0), 2, ResizeWaiting},
+		"of the current generation":          {refusal(2, 0), 2, ResizeRecreate},
+	}
+	for name, test := range tests {
+		t.Run(name, func(t *testing.T) {
+			pod := stalePod(updated, old, test.condition)
+			pod.Generation = test.generation
+			result, _, _, err := runResizeWithRedis(t, resizeRF(), resizeCase{fullSupport, podTemplate(old), podTemplate(updated), pod}, nil, memoryInUse(512*mi))
+			require.NoError(t, err)
+			assert.Equal(t, test.action, result.Action)
+		})
+	}
 }
 
 // A resize that the kubelet neither applies nor reports on in time falls back
 // to recreating the pod.
 func TestResizePodInPlaceTimesOutWithoutCondition(t *testing.T) {
-	old, new := resources("500m", "1Gi"), resources("1", "2Gi")
+	old, updated := resources("500m", "1Gi"), resources("1", "2Gi")
 	requested := func(age time.Duration) *corev1.Pod {
-		pod := stalePod(new, old)
+		pod := stalePod(updated, old)
 		pod.Annotations = map[string]string{resizeRequestedAnnotation: time.Now().Add(-age).UTC().Format(time.RFC3339)}
 		return pod
 	}
@@ -178,32 +292,32 @@ func TestResizePodInPlaceTimesOutWithoutCondition(t *testing.T) {
 		ms.ExpectedCalls = ms.ExpectedCalls[:len(ms.ExpectedCalls)-1]
 	}
 
-	result, ms, err := runResize(t, resizeCase{fullSupport, podTemplate(old), podTemplate(new), requested(time.Minute)}, noAnnotation)
-	assert.NoError(t, err)
+	result, ms, err := runResize(t, resizeCase{fullSupport, podTemplate(old), podTemplate(updated), requested(time.Minute)}, noAnnotation)
+	require.NoError(t, err)
 	assert.Equal(t, ResizeWaiting, result.Action)
 	ms.AssertExpectations(t)
 
-	result, _, err = runResize(t, resizeCase{fullSupport, podTemplate(old), podTemplate(new), requested(time.Hour)}, noAnnotation)
-	assert.NoError(t, err)
+	result, _, err = runResize(t, resizeCase{fullSupport, podTemplate(old), podTemplate(updated), requested(time.Hour)}, noAnnotation)
+	require.NoError(t, err)
 	assert.Equal(t, ResizeRecreate, result.Action)
 	assert.Equal(t, "resize not applied by the kubelet", result.Message)
 
 	// Without a recorded request, the timeout starts now.
-	result, ms, err = runResize(t, resizeCase{fullSupport, podTemplate(old), podTemplate(new), stalePod(new, old)}, nil)
-	assert.NoError(t, err)
+	result, ms, err = runResize(t, resizeCase{fullSupport, podTemplate(old), podTemplate(updated), stalePod(updated, old)}, nil)
+	require.NoError(t, err)
 	assert.Equal(t, ResizeWaiting, result.Action)
 	ms.AssertCalled(t, "UpdatePodAnnotations", "testns", resizePod, mock.Anything)
 }
 
 // A condition from an earlier resize request is not acted on.
 func TestResizePodInPlaceIgnoresStaleConditions(t *testing.T) {
-	old, new := resources("500m", "1Gi"), resources("1", "2Gi")
+	old, updated := resources("500m", "1Gi"), resources("1", "2Gi")
 	stale := condition(corev1.PodResizePending, corev1.PodReasonInfeasible, time.Hour)
 	stale.ObservedGeneration = 1
-	pod := stalePod(new, old, stale)
+	pod := stalePod(updated, old, stale)
 	pod.Generation = 2
-	result, _, err := runResize(t, resizeCase{fullSupport, podTemplate(old), podTemplate(new), pod}, nil)
-	assert.NoError(t, err)
+	result, _, err := runResize(t, resizeCase{fullSupport, podTemplate(old), podTemplate(updated), pod}, nil)
+	require.NoError(t, err)
 	assert.Equal(t, ResizeWaiting, result.Action)
 }
 
@@ -223,7 +337,7 @@ func TestResizePodInPlaceKeepsAdmittedResources(t *testing.T) {
 			got = args.Get(2).(map[string]corev1.ResourceRequirements)
 		}).Return(nil)
 	})
-	assert.NoError(t, err)
+	require.NoError(t, err)
 	ms.AssertExpectations(t)
 	assert.Equal(t, admitted(memory("2Gi")), got[redisContainerName])
 
@@ -231,7 +345,7 @@ func TestResizePodInPlaceKeepsAdmittedResources(t *testing.T) {
 	result, _, err := runResize(t, resizeCase{fullSupport, podTemplate(memory("1Gi")), podTemplate(memory("2Gi")), stalePod(admitted(memory("2Gi")), admitted(memory("2Gi")))}, func(ms *mK8SService.Services) {
 		ms.On("UpdatePodLabels", "testns", resizePod, mock.Anything).Once().Return(nil)
 	})
-	assert.NoError(t, err)
+	require.NoError(t, err)
 	assert.Equal(t, ResizeDone, result.Action)
 }
 
@@ -254,7 +368,7 @@ func TestResizePodInPlaceRecreates(t *testing.T) {
 		old, new corev1.PodTemplateSpec
 		reason   string
 	}{
-		"unsupported cluster":         {k8s.PodResizeSupport{}, podTemplate(resources("1", "1Gi")), podTemplate(resources("2", "1Gi")), ""},
+		"unsupported cluster":         {k8s.PodResizeSupport{}, podTemplate(resources("1", "1Gi")), podTemplate(resources("2", "1Gi")), "an in-place resize needs Kubernetes 1.33 or later"},
 		"more than resources change":  {fullSupport, podTemplate(resources("1", "1Gi")), other, "the update changes more than container resources"},
 		"resource claims change":      {fullSupport, podTemplate(resources("1", "1Gi")), claimed, "the update changes more than container resources"},
 		"limit replaced":              {fullSupport, podTemplate(resources("1", "1Gi")), podTemplate(corev1.ResourceRequirements{Limits: corev1.ResourceList{corev1.ResourceCPU: resource.MustParse("1"), corev1.ResourceEphemeralStorage: resource.MustParse("1Gi")}}), "requests or limits are added or removed"},
@@ -265,7 +379,7 @@ func TestResizePodInPlaceRecreates(t *testing.T) {
 	for name, test := range tests {
 		t.Run(name, func(t *testing.T) {
 			result, _, err := runResize(t, resizeCase{test.support, test.old, test.new, podFrom(test.old)}, nil)
-			assert.NoError(t, err)
+			require.NoError(t, err)
 			assert.Equal(t, ResizeRecreate, result.Action)
 			assert.Equal(t, test.reason, result.Message)
 		})
@@ -278,7 +392,7 @@ func TestResizePodInPlaceRecreatesOnAKubeletWithoutSupport(t *testing.T) {
 	pod := podFrom(old)
 	pod.Status.ContainerStatuses = nil
 	result, _, err := runResize(t, resizeCase{fullSupport, old, podTemplate(resources("1", "2Gi")), pod}, nil)
-	assert.NoError(t, err)
+	require.NoError(t, err)
 	assert.Equal(t, ResizeRecreate, result.Action)
 	assert.Equal(t, "the kubelet does not report the container's resources", result.Message)
 }
@@ -291,9 +405,10 @@ func TestResizePodInPlaceRecreatesWithoutRevisionsOrSupport(t *testing.T) {
 	t.Run("disabled", func(t *testing.T) {
 		rf := rf.DeepCopy()
 		rf.Spec.Redis.InPlaceResize = "Disabled"
-		result, err := NewRedisFailoverHealer(&mK8SService.Services{}, nil, log.Dummy).ResizePodInPlace(rf, resizePod, "new")
-		assert.NoError(t, err)
+		result, err := NewRedisFailoverHealer(&mK8SService.Services{}, nil, log.Dummy).ResizePodInPlace(rf, resizePod, "new", AutoscalerLimits{})
+		require.NoError(t, err)
 		assert.Equal(t, ResizeRecreate, result.Action)
+		assert.Equal(t, "redis.inPlaceResize is Disabled", result.Message)
 	})
 
 	t.Run("revisions forbidden", func(t *testing.T) {
@@ -301,8 +416,8 @@ func TestResizePodInPlaceRecreatesWithoutRevisionsOrSupport(t *testing.T) {
 		ms.On("PodResizeSupport").Return(fullSupport, nil)
 		ms.On("GetPod", "testns", resizePod).Return(stalePod(old, old), nil)
 		ms.On("GetControllerRevision", "testns", "old").Return(nil, apierrors.NewForbidden(schema.GroupResource{Group: "apps", Resource: "controllerrevisions"}, "old", errors.New("rbac")))
-		result, err := NewRedisFailoverHealer(ms, nil, log.Dummy).ResizePodInPlace(rf, resizePod, "new")
-		assert.NoError(t, err)
+		result, err := NewRedisFailoverHealer(ms, nil, log.Dummy).ResizePodInPlace(rf, resizePod, "new", AutoscalerLimits{})
+		require.NoError(t, err)
 		assert.Equal(t, ResizeRecreate, result.Action)
 	})
 
@@ -318,25 +433,59 @@ func TestResizePodInPlaceRecreatesWithoutRevisionsOrSupport(t *testing.T) {
 					ms.On("GetControllerRevision", "testns", rev).Return(revision(rev, podTemplate(old)), nil)
 				}
 			}
-			result, err := NewRedisFailoverHealer(ms, nil, log.Dummy).ResizePodInPlace(rf, resizePod, "new")
-			assert.NoError(t, err)
+			result, err := NewRedisFailoverHealer(ms, nil, log.Dummy).ResizePodInPlace(rf, resizePod, "new", AutoscalerLimits{})
+			require.NoError(t, err)
 			assert.Equal(t, ResizeRecreate, result.Action)
 		})
 	}
 }
 
 func TestResizePodInPlaceErrors(t *testing.T) {
-	old, new := resources("500m", "1Gi"), resources("1", "2Gi")
+	old, updated := resources("500m", "1Gi"), resources("1", "2Gi")
 	fail := errors.New("boom")
 
 	t.Run("resize rejected", func(t *testing.T) {
 		forbidden := apierrors.NewForbidden(schema.GroupResource{Resource: "pods/resize"}, resizePod, fail)
-		result, _, err := runResize(t, resizeCase{fullSupport, podTemplate(old), podTemplate(new), stalePod(old, old)}, func(ms *mK8SService.Services) {
+		result, _, err := runResize(t, resizeCase{fullSupport, podTemplate(old), podTemplate(updated), stalePod(old, old)}, func(ms *mK8SService.Services) {
 			ms.On("ResizePod", "testns", resizePod, mock.Anything).Return(forbidden)
 		})
-		assert.NoError(t, err)
+		require.NoError(t, err)
 		assert.Equal(t, ResizeRecreate, result.Action)
 	})
+
+	// The messages are those of the Kubernetes authorizer and admission plugins.
+	pods := schema.GroupResource{Resource: "pods"}
+	rejections := map[string]struct {
+		err  error
+		want ResizeAction
+	}{
+		"missing RBAC":       {apierrors.NewForbidden(pods, resizePod, errors.New(`User "system:serviceaccount:default:redisoperator" cannot patch resource "pods/resize" in API group "" in the namespace "testns"`)), ResizeRecreate},
+		"invalid":            {apierrors.NewInvalid(schema.GroupKind{Kind: "Pod"}, resizePod, nil), ResizeRecreate},
+		"quota":              {apierrors.NewForbidden(pods, resizePod, errors.New("exceeded quota: compute, requested: limits.memory=1Gi, used: limits.memory=3Gi, limited: limits.memory=4Gi")), ResizeWaiting},
+		"LimitRange maximum": {apierrors.NewForbidden(pods, resizePod, errors.New("maximum memory usage per Container is 1536Mi, but limit is 2Gi")), ResizeWaiting},
+		"LimitRange ratio":   {apierrors.NewForbidden(pods, resizePod, errors.New("cpu max limit to request ratio per Container is 2, but provided ratio is 4.000000")), ResizeWaiting},
+		// A LimitRange default can fill the missing limit of a recreated pod, so the recreate can work.
+		"quota without limit":          {apierrors.NewForbidden(pods, resizePod, errors.New("failed quota: compute: must specify limits.cpu for: exporter")), ResizeRecreate},
+		"quota for a limited resource": {apierrors.NewForbidden(pods, resizePod, errors.New("insufficient quota to consume: requests.example.com/gpu")), ResizeWaiting},
+		// Only a 403 holds the rollout: another rejection recreates the pod.
+		"invalid with a quota text": {apierrors.NewInvalid(schema.GroupKind{Kind: "Pod"}, resizePod, field.ErrorList{field.Invalid(field.NewPath("spec"), "x", "exceeded quota: compute")}), ResizeRecreate},
+	}
+	for name, test := range rejections {
+		t.Run(name, func(t *testing.T) {
+			result, ms, err := runResize(t, resizeCase{fullSupport, podTemplate(old), podTemplate(updated), stalePod(old, old)}, func(ms *mK8SService.Services) {
+				ms.On("ResizePod", "testns", resizePod, mock.Anything).Once().Return(test.err)
+			})
+			require.NoError(t, err)
+			assert.Equal(t, test.want, result.Action)
+			// A pod annotation change queues the next reconcile at once.
+			ms.AssertNotCalled(t, "UpdatePodAnnotations", mock.Anything, mock.Anything, mock.Anything)
+			if test.want == ResizeWaiting {
+				assert.Equal(t, "resize of pod "+resizePod+" is blocked by a ResourceQuota or LimitRange: "+test.err.Error(), result.Message)
+			} else {
+				assert.Equal(t, "resize rejected: "+test.err.Error(), result.Message)
+			}
+		})
+	}
 
 	tests := map[string]func(ms *mK8SService.Services){
 		// Retried, as recreating the master would fail over.
@@ -361,25 +510,26 @@ func TestResizePodInPlaceErrors(t *testing.T) {
 	}
 	for name, setup := range tests {
 		t.Run(name, func(t *testing.T) {
-			_, _, err := runResize(t, resizeCase{fullSupport, podTemplate(old), podTemplate(new), stalePod(old, old)}, setup)
+			_, _, err := runResize(t, resizeCase{fullSupport, podTemplate(old), podTemplate(updated), stalePod(old, old)}, setup)
 			assert.ErrorIs(t, err, fail)
 		})
 	}
 
 	t.Run("corrupt revision", func(t *testing.T) {
-		_, _, err := runResize(t, resizeCase{fullSupport, podTemplate(old), podTemplate(new), stalePod(old, old)}, func(ms *mK8SService.Services) {
+		_, _, err := runResize(t, resizeCase{fullSupport, podTemplate(old), podTemplate(updated), stalePod(old, old)}, func(ms *mK8SService.Services) {
 			ms.ExpectedCalls = nil
 			ms.On("PodResizeSupport").Return(fullSupport, nil)
 			ms.On("GetPod", "testns", resizePod).Return(stalePod(old, old), nil)
 			ms.On("GetControllerRevision", "testns", "old").Return(&appsv1.ControllerRevision{Data: runtime.RawExtension{Raw: []byte("{")}}, nil)
 		})
-		assert.Error(t, err)
+		assert.ErrorContains(t, err, "decode controllerrevision testns/old: ")
 	})
 
-	for name, pod := range map[string]*corev1.Pod{"requesting the resize": stalePod(old, old), "recording the request": stalePod(new, old)} {
+	for name, pod := range map[string]*corev1.Pod{"requesting the resize": stalePod(old, old), "recording the request": stalePod(updated, old)} {
 		t.Run(name, func(t *testing.T) {
-			_, _, err := runResize(t, resizeCase{fullSupport, podTemplate(old), podTemplate(new), pod}, func(ms *mK8SService.Services) {
+			_, _, err := runResize(t, resizeCase{fullSupport, podTemplate(old), podTemplate(updated), pod}, func(ms *mK8SService.Services) {
 				ms.ExpectedCalls = ms.ExpectedCalls[:len(ms.ExpectedCalls)-1]
+				ms.On("ResizePod", "testns", resizePod, mock.Anything).Maybe().Return(nil)
 				ms.On("UpdatePodAnnotations", "testns", resizePod, mock.Anything).Return(fail)
 			})
 			assert.ErrorIs(t, err, fail)
@@ -387,14 +537,14 @@ func TestResizePodInPlaceErrors(t *testing.T) {
 	}
 
 	t.Run("relabelling", func(t *testing.T) {
-		_, _, err := runResize(t, resizeCase{fullSupport, podTemplate(old), podTemplate(new), stalePod(new, new)}, func(ms *mK8SService.Services) {
+		_, _, err := runResize(t, resizeCase{fullSupport, podTemplate(old), podTemplate(updated), stalePod(updated, updated)}, func(ms *mK8SService.Services) {
 			ms.On("UpdatePodLabels", "testns", resizePod, mock.Anything).Return(fail)
 		})
 		assert.ErrorIs(t, err, fail)
 	})
 
 	t.Run("clearing the request", func(t *testing.T) {
-		_, _, err := runResize(t, resizeCase{fullSupport, podTemplate(old), podTemplate(new), stalePod(new, new)}, func(ms *mK8SService.Services) {
+		_, _, err := runResize(t, resizeCase{fullSupport, podTemplate(old), podTemplate(updated), stalePod(updated, updated)}, func(ms *mK8SService.Services) {
 			ms.ExpectedCalls = ms.ExpectedCalls[:len(ms.ExpectedCalls)-1]
 			ms.On("UpdatePodLabels", "testns", resizePod, mock.Anything).Return(nil)
 			ms.On("UpdatePodAnnotations", "testns", resizePod, mock.Anything).Return(fail)
@@ -427,7 +577,7 @@ func TestResizePodInPlaceSupersededResize(t *testing.T) {
 			got = args.Get(2).(map[string]corev1.ResourceRequirements)
 		}).Return(nil)
 	})
-	assert.NoError(t, err)
+	require.NoError(t, err)
 	ms.AssertExpectations(t)
 	assert.Equal(t, withDefaultRequests(c), got[redisContainerName])
 
@@ -440,39 +590,401 @@ func TestResizePodInPlaceSupersededResize(t *testing.T) {
 			got = args.Get(2).(map[string]corev1.ResourceRequirements)
 		}).Return(nil)
 	})
-	assert.NoError(t, err)
+	require.NoError(t, err)
 	assert.Equal(t, withDefaultRequests(a), got[redisContainerName])
 
 	// Reverting a memory increase lowers the pod's limit, although the revisions have the same.
 	result, _, err := runResize(t, resizeCase{k8s.PodResizeSupport{Supported: true}, podTemplate(a), podTemplate(a), stalePod(c, c)}, nil)
-	assert.NoError(t, err)
+	require.NoError(t, err)
 	assert.Equal(t, ResizeRecreate, result.Action)
 	assert.Equal(t, "lowering a memory limit in place needs Kubernetes 1.35", result.Message)
 
-	// Before 1.35 the API server refuses to revert an increase the kubelet has not applied yet.
-	invalid := apierrors.NewInvalid(schema.GroupKind{Kind: "Pod"}, resizePod, nil)
-	result, _, err = runResize(t, resizeCase{k8s.PodResizeSupport{Supported: true}, podTemplate(a), podTemplate(a), stalePod(c, a)}, func(ms *mK8SService.Services) {
-		ms.On("ResizePod", "testns", resizePod, mock.Anything).Once().Return(invalid)
-	})
-	assert.NoError(t, err)
+	// Before 1.35 the API server refuses to revert an increase the kubelet has
+	// not applied, so the operator sends no resize.
+	result, ms, err = runResize(t, resizeCase{k8s.PodResizeSupport{Supported: true}, podTemplate(a), podTemplate(a), stalePod(c, a)}, nil)
+	require.NoError(t, err)
 	assert.Equal(t, ResizeRecreate, result.Action)
-	assert.Equal(t, "resize rejected: "+invalid.Error(), result.Message)
+	assert.Equal(t, "lowering a memory limit in place needs Kubernetes 1.35", result.Message)
+	ms.AssertNotCalled(t, "ResizePod", mock.Anything, mock.Anything, mock.Anything)
 }
 
 // A condition keeps its transition time when a newer resize supersedes the
 // one it reported on, so the timeout also counts from the latest request.
 func TestResizePodInPlaceTimesOutFromTheLatestRequest(t *testing.T) {
-	old, new := resources("500m", "1Gi"), resources("1", "2Gi")
+	old, updated := resources("500m", "1Gi"), resources("1", "2Gi")
 	for name, c := range map[string]corev1.PodCondition{
 		"deferred": condition(corev1.PodResizePending, corev1.PodReasonDeferred, time.Hour),
 		"failing":  condition(corev1.PodResizeInProgress, corev1.PodReasonError, time.Hour),
 	} {
 		t.Run(name, func(t *testing.T) {
-			pod := stalePod(new, old, c)
+			pod := stalePod(updated, old, c)
 			pod.Annotations = map[string]string{resizeRequestedAnnotation: time.Now().Add(-time.Minute).UTC().Format(time.RFC3339)}
-			result, _, err := runResize(t, resizeCase{fullSupport, podTemplate(old), podTemplate(new), pod}, nil)
-			assert.NoError(t, err)
+			result, _, err := runResize(t, resizeCase{fullSupport, podTemplate(old), podTemplate(updated), pod}, nil)
+			require.NoError(t, err)
 			assert.Equal(t, ResizeWaiting, result.Action)
 		})
 	}
+}
+
+func resizeRF() *redisfailoverv1.RedisFailover {
+	return &redisfailoverv1.RedisFailover{ObjectMeta: metav1.ObjectMeta{Name: "test", Namespace: "testns"}}
+}
+
+func memoryInUse(rss int64) func(mr *mRedisService.Client) {
+	return func(mr *mRedisService.Client) {
+		mr.On("GetMemoryInfo", "", "0", "").Once().Return(&redis.MemoryInfo{UsedMemoryRSS: rss}, nil)
+	}
+}
+
+// Redis often keeps the memory that evictions free. A fork for BGSAVE or a
+// full sync then gets the pod OOM-killed below the lowered limit.
+func TestResizePodInPlaceChecksTheMemoryInUse(t *testing.T) {
+	old, updated := resources("1", "2Gi"), resources("1", "1Gi")
+	lowering := resizeCase{fullSupport, podTemplate(old), podTemplate(updated), stalePod(old, old)}
+	resize := func(ms *mK8SService.Services) {
+		ms.On("ResizePod", "testns", resizePod, mock.Anything).Once().Return(nil)
+	}
+	fail := errors.New("boom")
+
+	t.Run("too high", func(t *testing.T) {
+		result, ms, mr, err := runResizeWithRedis(t, resizeRF(), lowering, nil, memoryInUse(993*mi))
+		require.NoError(t, err)
+		assert.Equal(t, ResizeRecreate, result.Action)
+		assert.Equal(t, "the Redis memory in use (993.0Mi) leaves less than 32Mi below the lowered limit 1024.0Mi", result.Message)
+		mr.AssertExpectations(t)
+		ms.AssertNotCalled(t, "ResizePod", mock.Anything, mock.Anything, mock.Anything)
+	})
+
+	t.Run("fits", func(t *testing.T) {
+		// 992Mi + 32Mi = 1Gi
+		result, ms, mr, err := runResizeWithRedis(t, resizeRF(), lowering, resize, memoryInUse(992*mi))
+		require.NoError(t, err)
+		assert.Equal(t, ResizeWaiting, result.Action)
+		ms.AssertExpectations(t)
+		mr.AssertExpectations(t)
+	})
+
+	t.Run("with a password and a port", func(t *testing.T) {
+		rf := resizeRF()
+		rf.Spec.Auth.SecretPath = "auth"
+		rf.Spec.Redis.Port = 6380
+		pod := stalePod(old, old)
+		pod.Status.PodIP = "10.0.0.1"
+		result, _, mr, err := runResizeWithRedis(t, rf, resizeCase{fullSupport, podTemplate(old), podTemplate(updated), pod}, func(ms *mK8SService.Services) {
+			ms.On("GetSecret", "testns", "auth").Return(&corev1.Secret{Data: map[string][]byte{"password": []byte("secret")}}, nil)
+		}, func(mr *mRedisService.Client) {
+			mr.On("GetMemoryInfo", "10.0.0.1", "6380", "secret").Once().Return(&redis.MemoryInfo{UsedMemoryRSS: 1000 * mi}, nil)
+		})
+		require.NoError(t, err)
+		assert.Equal(t, ResizeRecreate, result.Action)
+		mr.AssertExpectations(t)
+	})
+
+	t.Run("Redis not reachable", func(t *testing.T) {
+		_, ms, _, err := runResizeWithRedis(t, resizeRF(), lowering, nil, func(mr *mRedisService.Client) {
+			mr.On("GetMemoryInfo", "", "0", "").Once().Return(nil, fail)
+		})
+		require.ErrorIs(t, err, fail)
+		ms.AssertNotCalled(t, "ResizePod", mock.Anything, mock.Anything, mock.Anything)
+	})
+
+	t.Run("password not readable", func(t *testing.T) {
+		rf := resizeRF()
+		rf.Spec.Auth.SecretPath = "auth"
+		_, _, mr, err := runResizeWithRedis(t, rf, lowering, func(ms *mK8SService.Services) {
+			ms.On("GetSecret", "testns", "auth").Return(nil, fail)
+		}, nil)
+		require.ErrorIs(t, err, fail)
+		mr.AssertNotCalled(t, "GetMemoryInfo", mock.Anything, mock.Anything, mock.Anything)
+	})
+
+	withExporter := func(r corev1.ResourceRequirements, exporter string) corev1.PodTemplateSpec {
+		t := podTemplate(r)
+		t.Spec.Containers[1].Resources = corev1.ResourceRequirements{Limits: corev1.ResourceList{corev1.ResourceMemory: resource.MustParse(exporter)}}
+		return t
+	}
+	unchecked := map[string]struct {
+		c      resizeCase
+		action ResizeAction
+	}{
+		"raised limit":             {resizeCase{fullSupport, podTemplate(updated), podTemplate(old), stalePod(updated, updated)}, ResizeWaiting},
+		"cpu only":                 {resizeCase{fullSupport, podTemplate(updated), podTemplate(resources("2", "1Gi")), stalePod(updated, updated)}, ResizeWaiting},
+		"lowered exporter limit":   {resizeCase{fullSupport, withExporter(updated, "128Mi"), withExporter(updated, "64Mi"), podFrom(withExporter(updated, "128Mi"))}, ResizeWaiting},
+		"already at the new limit": {resizeCase{fullSupport, podTemplate(old), podTemplate(updated), stalePod(updated, updated)}, ResizeDone},
+	}
+	for name, test := range unchecked {
+		t.Run(name, func(t *testing.T) {
+			result, ms, mr, err := runResizeWithRedis(t, resizeRF(), test.c, func(ms *mK8SService.Services) {
+				ms.On("ResizePod", "testns", resizePod, mock.Anything).Maybe().Return(nil)
+				ms.On("UpdatePodLabels", "testns", resizePod, mock.Anything).Maybe().Return(nil)
+			}, nil)
+			require.NoError(t, err)
+			assert.Equal(t, test.action, result.Action)
+			ms.AssertExpectations(t)
+			mr.AssertNotCalled(t, "GetMemoryInfo", mock.Anything, mock.Anything, mock.Anything)
+		})
+	}
+}
+
+// Each outcome has the class of the autoscaler plan, and the user revision
+// keeps the action of each outcome.
+func TestResizePodInPlaceClass(t *testing.T) {
+	old, updated := resources("500m", "1Gi"), resources("1", "2Gi")
+	up := resizeCase{fullSupport, podTemplate(old), podTemplate(updated), stalePod(old, old)}
+	with := func(pod *corev1.Pod) resizeCase {
+		c := up
+		c.pod = pod
+		return c
+	}
+	requested := func(pod *corev1.Pod, age time.Duration) *corev1.Pod {
+		pod.Annotations = map[string]string{resizeRequestedAnnotation: time.Now().Add(-age).UTC().Format(time.RFC3339)}
+		return pod
+	}
+	resizeErr := func(err error) func(ms *mK8SService.Services) {
+		return func(ms *mK8SService.Services) {
+			ms.On("ResizePod", "testns", resizePod, mock.Anything).Once().Return(err)
+		}
+	}
+	pods := schema.GroupResource{Resource: "pods"}
+	other := podTemplate(updated)
+	other.Spec.Containers[0].Image = "redis:8"
+	removed := resources("1", "2Gi")
+	delete(removed.Limits, corev1.ResourceCPU)
+	removed.Requests = corev1.ResourceList{corev1.ResourceCPU: resource.MustParse("100m")}
+	storage := func(r corev1.ResourceRequirements, size string) corev1.PodTemplateSpec {
+		r.Limits[corev1.ResourceEphemeralStorage] = resource.MustParse(size)
+		return podTemplate(r)
+	}
+	disabled := resizeRF()
+	disabled.Spec.Redis.InPlaceResize = "Disabled"
+	noReport := stalePod(old, old)
+	noReport.Status.ContainerStatuses = nil
+	lower := resizeCase{fullSupport, podTemplate(updated), podTemplate(old), podFrom(podTemplate(updated))}
+
+	tests := map[string]struct {
+		rf     *redisfailoverv1.RedisFailover
+		c      resizeCase
+		setup  func(ms *mK8SService.Services)
+		redis  func(mr *mRedisService.Client)
+		action ResizeAction
+		class  ResizeClass
+	}{
+		"disabled":                          {rf: disabled, c: up, action: ResizeRecreate, class: ResizePermanent},
+		"unsupported cluster":               {c: resizeCase{k8s.PodResizeSupport{}, up.old, up.new, up.pod}, action: ResizeRecreate, class: ResizePermanent},
+		"pod revision not available":        {c: up, setup: revisionNotFound("old"), action: ResizeRecreate, class: ResizePermanent},
+		"update revision not available":     {c: up, setup: revisionNotFound("new"), action: ResizeRecreate, class: ResizePermanent},
+		"more than resources":               {c: resizeCase{fullSupport, up.old, other, up.pod}, action: ResizeRecreate, class: ResizeUserRevision},
+		"limits added or removed":           {c: resizeCase{fullSupport, up.old, podTemplate(removed), up.pod}, action: ResizeRecreate, class: ResizeUserRevision},
+		"other resources":                   {c: resizeCase{fullSupport, storage(resources("1", "1Gi"), "1Gi"), storage(resources("1", "1Gi"), "2Gi"), up.pod}, action: ResizeRecreate, class: ResizeUserRevision},
+		"kubelet does not report":           {c: with(noReport), action: ResizeRecreate, class: ResizePermanent},
+		"memory decrease before 1.35":       {c: resizeCase{k8s.PodResizeSupport{Supported: true}, lower.old, lower.new, lower.pod}, action: ResizeRecreate, class: ResizePermanent},
+		"memory in use":                     {c: lower, redis: memoryInUse(2000 * mi), action: ResizeRecreate, class: ResizePermanent},
+		"quota":                             {c: up, setup: resizeErr(apierrors.NewForbidden(pods, resizePod, errors.New("exceeded quota: compute"))), action: ResizeWaiting, class: ResizePermanent},
+		"resize forbidden":                  {c: up, setup: resizeErr(apierrors.NewForbidden(pods, resizePod, errors.New("rbac"))), action: ResizeRecreate, class: ResizePermanent},
+		"resize invalid":                    {c: up, setup: resizeErr(apierrors.NewInvalid(schema.GroupKind{Kind: "Pod"}, resizePod, nil)), action: ResizeRecreate, class: ResizePermanent},
+		"resize subresource not found":      {c: up, setup: resizeErr(apierrors.NewNotFound(pods, resizePod)), action: ResizeRecreate, class: ResizePermanent},
+		"resize method not supported":       {c: up, setup: resizeErr(apierrors.NewMethodNotSupported(pods, "patch")), action: ResizeRecreate, class: ResizePermanent},
+		"resize requested":                  {c: up, setup: resizeErr(nil), action: ResizeWaiting, class: ResizeTransient},
+		"infeasible":                        {c: with(stalePod(updated, old, condition(corev1.PodResizePending, corev1.PodReasonInfeasible, 0))), action: ResizeRecreate, class: ResizePermanent},
+		"deferred":                          {c: with(stalePod(updated, old, condition(corev1.PodResizePending, corev1.PodReasonDeferred, time.Minute))), action: ResizeWaiting, class: ResizeTransient},
+		"deferred for too long":             {c: with(stalePod(updated, old, condition(corev1.PodResizePending, corev1.PodReasonDeferred, time.Hour))), action: ResizeRecreate, class: ResizePermanent},
+		"in progress":                       {c: with(stalePod(updated, old, condition(corev1.PodResizeInProgress, "", time.Hour))), action: ResizeWaiting, class: ResizeTransient},
+		"error for too long":                {c: with(stalePod(updated, old, condition(corev1.PodResizeInProgress, corev1.PodReasonError, time.Hour))), action: ResizeRecreate, class: ResizePermanent},
+		"not applied yet":                   {c: with(requested(stalePod(updated, old), time.Minute)), action: ResizeWaiting, class: ResizeTransient},
+		"not applied for too long":          {c: with(requested(stalePod(updated, old), time.Hour)), action: ResizeRecreate, class: ResizePermanent},
+		"not applied, request not recorded": {c: with(stalePod(updated, old)), action: ResizeWaiting, class: ResizeTransient},
+		"applied": {c: with(stalePod(updated, updated)), setup: func(ms *mK8SService.Services) {
+			ms.On("UpdatePodLabels", "testns", resizePod, mock.Anything).Once().Return(nil)
+		}, action: ResizeDone},
+	}
+	for name, test := range tests {
+		t.Run(name, func(t *testing.T) {
+			rf := test.rf
+			if rf == nil {
+				rf = resizeRF()
+			}
+			result, _, _, err := runResizeWithRedis(t, rf, test.c, test.setup, test.redis)
+			require.NoError(t, err)
+			assert.Equal(t, test.action, result.Action)
+			assert.Equal(t, test.class, result.Class)
+			assert.False(t, result.AutoscalerRevision)
+		})
+	}
+}
+
+// revisionNotFound makes the ControllerRevision rev missing.
+func revisionNotFound(rev string) func(ms *mK8SService.Services) {
+	return func(ms *mK8SService.Services) {
+		ms.ExpectedCalls = slices.DeleteFunc(ms.ExpectedCalls, func(c *mock.Call) bool {
+			return c.Method == "GetControllerRevision" && c.Arguments[1] == rev
+		})
+		ms.On("GetControllerRevision", "testns", rev).Return(nil, apierrors.NewNotFound(schema.GroupResource{Group: "apps", Resource: "controllerrevisions"}, rev))
+	}
+}
+
+func TestAutoscalerRevision(t *testing.T) {
+	memory := func(request, limit string) corev1.PodTemplateSpec {
+		r := resources("1", limit)
+		if request != "" {
+			r.Requests = corev1.ResourceList{corev1.ResourceMemory: resource.MustParse(request)}
+		}
+		return podTemplate(r)
+	}
+	effective := AutoscalerLimits{Spec: 1 << 30, Effective: 2 << 30}
+	image := memory("", "2Gi")
+	image.Spec.Containers[0].Image = "redis:8"
+	cpu := memory("", "2Gi")
+	cpu.Spec.Containers[0].Resources.Limits[corev1.ResourceCPU] = resource.MustParse("2")
+	exporter := memory("", "2Gi")
+	exporter.Spec.Containers[1].Resources = corev1.ResourceRequirements{Limits: corev1.ResourceList{corev1.ResourceMemory: resource.MustParse("64Mi")}}
+	noLimit := memory("", "2Gi")
+	delete(noLimit.Spec.Containers[0].Resources.Limits, corev1.ResourceMemory)
+	noRedis := memory("", "2Gi")
+	noRedis.Spec.Containers[0].Name = "other"
+	tests := map[string]struct {
+		current, update corev1.PodTemplateSpec
+		limits          AutoscalerLimits
+		want            bool
+	}{
+		"memory limit":                      {memory("", "1Gi"), memory("", "2Gi"), effective, true},
+		"from an earlier effective limit":   {memory("", "1536Mi"), memory("", "2Gi"), effective, true},
+		"memoryMax lowered":                 {memory("", "2Gi"), memory("", "1536Mi"), AutoscalerLimits{Spec: 1 << 30, Effective: 1536 << 20}, false},
+		"same limit":                        {memory("", "2Gi"), memory("", "2Gi"), effective, false},
+		"pod revision below the spec limit": {memory("", "512Mi"), memory("", "2Gi"), effective, true},
+		"effective at the spec limit":       {memory("", "512Mi"), memory("", "1Gi"), AutoscalerLimits{Spec: 1 << 30, Effective: 1 << 30}, false}, "memory request equal to the limit": {memory("1Gi", "1Gi"), memory("2Gi", "2Gi"), effective, true},
+		"memory request below the limit": {memory("512Mi", "1Gi"), memory("512Mi", "2Gi"), effective, true},
+		"no autoscaler state":            {memory("", "1Gi"), memory("", "2Gi"), AutoscalerLimits{}, false},
+		"limit other than effective":     {memory("", "1Gi"), memory("", "2Gi"), AutoscalerLimits{Spec: 1 << 30, Effective: 3 << 30}, false},
+		"image change":                   {memory("", "1Gi"), image, effective, false},
+		"cpu change":                     {memory("", "1Gi"), cpu, effective, false},
+		"exporter change":                {memory("", "1Gi"), exporter, effective, false},
+		"request added":                  {memory("", "1Gi"), memory("2Gi", "2Gi"), effective, false},
+		"request removed":                {memory("1Gi", "1Gi"), memory("", "2Gi"), effective, false},
+		"request changed":                {memory("512Mi", "1Gi"), memory("768Mi", "2Gi"), effective, false},
+		"request changed, limit kept":    {memory("512Mi", "2Gi"), memory("768Mi", "2Gi"), effective, false},
+		"limit added":                    {noLimit, memory("", "2Gi"), effective, false},
+		"limit removed":                  {memory("", "1Gi"), noLimit, effective, false},
+		"no redis container":             {memory("", "1Gi"), noRedis, effective, false},
+	}
+	for name, test := range tests {
+		t.Run(name, func(t *testing.T) {
+			current := test.current.DeepCopy()
+			assert.Equal(t, test.want, autoscalerRevision(&test.current, &test.update, test.limits))
+			assert.Equal(t, current, &test.current)
+		})
+	}
+}
+
+// The rollout must know the revision of the autoscaler also when the cluster
+// refuses each resize. Without an effective limit, it reads nothing more.
+func TestResizePodInPlaceReportsAnAutoscalerRevision(t *testing.T) {
+	old, updated := resources("1", "1Gi"), resources("1", "2Gi")
+	effective := AutoscalerLimits{Spec: 1 << 30, Effective: 2 << 30}
+	infeasible := resizeCase{fullSupport, podTemplate(old), podTemplate(updated), stalePod(updated, old, condition(corev1.PodResizePending, corev1.PodReasonInfeasible, 0))}
+	disabled := resizeRF()
+	disabled.Spec.Redis.InPlaceResize = "Disabled"
+	tests := map[string]struct {
+		rf     *redisfailoverv1.RedisFailover
+		c      resizeCase
+		limits AutoscalerLimits
+		setup  func(ms *mK8SService.Services)
+		want   bool
+	}{
+		"infeasible":                    {resizeRF(), infeasible, effective, nil, true},
+		"infeasible without autoscaler": {resizeRF(), infeasible, AutoscalerLimits{}, nil, false},
+		// A lower memoryMax is a change of the user, so the pod takes the
+		// user path and is recreated.
+		"memoryMax lowered before 1.35": {resizeRF(), resizeCase{k8s.PodResizeSupport{Supported: true}, podTemplate(updated), podTemplate(resources("1", "1536Mi")), podFrom(podTemplate(updated))}, AutoscalerLimits{Spec: 1 << 30, Effective: 1536 << 20}, nil, false},
+		"disabled":                      {disabled, infeasible, effective, nil, true},
+		"unsupported cluster":           {resizeRF(), resizeCase{k8s.PodResizeSupport{}, infeasible.old, infeasible.new, infeasible.pod}, effective, nil, true},
+		// Without the revision, the pod can be on a step of the autoscaler,
+		// so it is not recreated.
+		"disabled, revision not available":          {disabled, infeasible, effective, revisionNotFound("old"), true},
+		"revision not available":                    {resizeRF(), infeasible, effective, revisionNotFound("old"), true},
+		"update revision not available":             {resizeRF(), infeasible, effective, revisionNotFound("new"), true},
+		"revision not available without autoscaler": {resizeRF(), infeasible, AutoscalerLimits{}, revisionNotFound("old"), false},
+	}
+	for name, test := range tests {
+		t.Run(name, func(t *testing.T) {
+			result, _, _, err := runResizeEffective(t, test.rf, test.c, test.limits, test.setup, nil)
+			require.NoError(t, err)
+			assert.Equal(t, ResizeRecreate, result.Action)
+			assert.Equal(t, ResizePermanent, result.Class)
+			assert.Equal(t, test.want, result.AutoscalerRevision)
+		})
+	}
+
+	fail := errors.New("boom")
+	for name, setup := range map[string]func(ms *mK8SService.Services){
+		"reading the pod": func(ms *mK8SService.Services) {
+			ms.ExpectedCalls = nil
+			ms.On("GetPod", "testns", resizePod).Return(nil, fail)
+		},
+		"reading a revision": func(ms *mK8SService.Services) {
+			ms.ExpectedCalls = nil
+			ms.On("GetPod", "testns", resizePod).Return(infeasible.pod, nil)
+			ms.On("GetControllerRevision", "testns", "old").Return(nil, fail)
+		},
+	} {
+		t.Run(name, func(t *testing.T) {
+			_, _, _, err := runResizeEffective(t, disabled, infeasible, effective, setup, nil)
+			assert.ErrorIs(t, err, fail)
+		})
+	}
+}
+
+func TestClearResizeRequested(t *testing.T) {
+	ms := &mK8SService.Services{}
+	ms.On("UpdatePodAnnotations", "testns", resizePod, map[string]string{resizeRequestedAnnotation: ""}).Once().Return(nil)
+	require.NoError(t, NewRedisFailoverHealer(ms, nil, log.Dummy).ClearResizeRequested(resizeRF(), resizePod))
+	ms.AssertExpectations(t)
+
+	fail := errors.New("boom")
+	ms = &mK8SService.Services{}
+	ms.On("UpdatePodAnnotations", "testns", resizePod, mock.Anything).Once().Return(fail)
+	assert.ErrorIs(t, NewRedisFailoverHealer(ms, nil, log.Dummy).ClearResizeRequested(resizeRF(), resizePod), fail)
+}
+
+func TestKeepsTemplate(t *testing.T) {
+	tmpl := podTemplate(resources("1", "2Gi"))
+	tests := []struct {
+		name string
+		pod  func() *corev1.Pod
+		want bool
+	}{
+		{"same resources", func() *corev1.Pod { return podFrom(tmpl) }, true},
+		{"larger redis memory limit", func() *corev1.Pod { return podFrom(podTemplate(resources("1", "3Gi"))) }, true},
+		{"smaller redis memory limit", func() *corev1.Pod { return podFrom(podTemplate(resources("1", "1Gi"))) }, false},
+		{"other cpu", func() *corev1.Pod { return podFrom(podTemplate(resources("2", "2Gi"))) }, false},
+		// The template requests its limit, so the pod keeps its own request.
+		{"larger limit, other request", func() *corev1.Pod {
+			r := resources("1", "3Gi")
+			r.Requests = corev1.ResourceList{corev1.ResourceCPU: resource.MustParse("1"), corev1.ResourceMemory: resource.MustParse("1Gi")}
+			return podFrom(podTemplate(r))
+		}, true},
+		{"no applied resources", func() *corev1.Pod {
+			pod := podFrom(tmpl)
+			pod.Status.ContainerStatuses[0].Resources = nil
+			return pod
+		}, false},
+		{"container missing in the spec", func() *corev1.Pod {
+			pod := podFrom(tmpl)
+			pod.Spec.Containers = pod.Spec.Containers[:1]
+			return pod
+		}, false},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			assert.Equal(t, test.want, keepsTemplate(test.pod(), &tmpl))
+		})
+	}
+
+	// A template request below the limit stays a request to keep.
+	r := resources("1", "2Gi")
+	r.Requests = corev1.ResourceList{corev1.ResourceCPU: resource.MustParse("1"), corev1.ResourceMemory: resource.MustParse("1Gi")}
+	lower := podTemplate(r)
+	other := r.DeepCopy()
+	other.Requests[corev1.ResourceMemory] = resource.MustParse("512Mi")
+	assert.True(t, keepsTemplate(podFrom(lower), &lower))
+	assert.False(t, keepsTemplate(podFrom(podTemplate(*other)), &lower))
 }

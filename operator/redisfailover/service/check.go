@@ -2,7 +2,6 @@ package service
 
 import (
 	"errors"
-	"fmt"
 	"strconv"
 	"time"
 
@@ -17,23 +16,7 @@ import (
 	"github.com/saremox/redis-operator/service/redis"
 )
 
-// ErrAmbiguousMasterCount is returned by GetMasterIP when it finds a number
-// of masters other than exactly one - either zero, or more than one
-// (split-brain). Callers that need to tell those two cases apart (e.g. to
-// avoid promoting yet another replica on top of an existing split-brain)
-// should check for this specific error rather than treating any GetMasterIP
-// failure as "no master".
-var ErrAmbiguousMasterCount = errors.New("number of redis nodes known as master is different than 1")
-
-// ReplicaInfo holds information about a Redis replica for failover decisions
-type ReplicaInfo struct {
-	IP                string
-	PodName           string
-	ReplicationOffset int64
-	IsReady           bool
-}
-
-// RedisFailoverCheck defines the interface able to check the correct status of redis failover
+// RedisFailoverCheck defines the interface able to check the correct status of redis failover.
 type RedisFailoverCheck interface {
 	CheckRedisNumber(rFailover *redisfailoverv1.RedisFailover) error
 	CheckSentinelNumber(rFailover *redisfailoverv1.RedisFailover) error
@@ -43,7 +26,11 @@ type RedisFailoverCheck interface {
 	CheckSentinelSlavesNumberQuorumInMemory(sentinel string, rFailover *redisfailoverv1.RedisFailover) error
 	CheckSentinelQuorum(rFailover *redisfailoverv1.RedisFailover) (int, error)
 	CheckIfMasterLocalhost(rFailover *redisfailoverv1.RedisFailover) (bool, error)
+	CheckSentinelsCannotFailover(rFailover *redisfailoverv1.RedisFailover) (bool, error)
 	CheckSentinelMonitor(sentinel string, monitor ...string) error
+	GetSentinelFailover(sentinel string) (redis.SentinelFailover, error)
+	GetSentinelMasterIPs(rFailover *redisfailoverv1.RedisFailover) ([]string, error)
+	GetUnknownSentinelAddrs(rFailover *redisfailoverv1.RedisFailover) (SentinelAddrs, error)
 	GetMasterIP(rFailover *redisfailoverv1.RedisFailover) (string, error)
 	GetNumberMasters(rFailover *redisfailoverv1.RedisFailover) (int, error)
 	GetRedisesIPs(rFailover *redisfailoverv1.RedisFailover) ([]string, error)
@@ -63,9 +50,10 @@ type RedisFailoverCheck interface {
 	CheckMasterHealth(rFailover *redisfailoverv1.RedisFailover) (bool, string, error)
 	GetBestReplicaForPromotion(rFailover *redisfailoverv1.RedisFailover) (*ReplicaInfo, error)
 	GetReplicaReplicationOffsets(rFailover *redisfailoverv1.RedisFailover) ([]ReplicaInfo, error)
+	GetAutoscalerInfo(rFailover *redisfailoverv1.RedisFailover, ip string) (*redis.AutoscalerInfo, error)
 }
 
-// RedisFailoverChecker is our implementation of RedisFailoverCheck interface
+// RedisFailoverChecker implements RedisFailoverCheck.
 type RedisFailoverChecker struct {
 	k8sService    k8s.Services
 	redisClient   redis.Client
@@ -74,7 +62,7 @@ type RedisFailoverChecker struct {
 	opts          options
 }
 
-// NewRedisFailoverChecker creates an object of the RedisFailoverChecker struct
+// NewRedisFailoverChecker creates an object of the RedisFailoverChecker struct.
 func NewRedisFailoverChecker(k8sService k8s.Services, redisClient redis.Client, logger log.Logger, metricsClient metrics.Recorder, opts ...Option) *RedisFailoverChecker {
 	return &RedisFailoverChecker{
 		k8sService:    k8sService,
@@ -85,7 +73,8 @@ func NewRedisFailoverChecker(k8sService k8s.Services, redisClient redis.Client, 
 	}
 }
 
-// CheckRedisNumber controls that the number of deployed redis is the same as the requested on the spec
+// CheckRedisNumber returns an error when the StatefulSet replicas differ from
+// redis.replicas.
 func (r *RedisFailoverChecker) CheckRedisNumber(rf *redisfailoverv1.RedisFailover) error {
 	ss, err := r.k8sService.GetStatefulSet(rf.Namespace, GetRedisName(rf))
 	if err != nil {
@@ -97,7 +86,8 @@ func (r *RedisFailoverChecker) CheckRedisNumber(rf *redisfailoverv1.RedisFailove
 	return nil
 }
 
-// CheckSentinelNumber controls that the number of deployed sentinels is the same as the requested on the spec
+// CheckSentinelNumber returns an error when the Deployment replicas differ
+// from sentinel.replicas.
 func (r *RedisFailoverChecker) CheckSentinelNumber(rf *redisfailoverv1.RedisFailover) error {
 	d, err := r.k8sService.GetDeployment(rf.Namespace, GetSentinelName(rf))
 	if err != nil {
@@ -109,324 +99,7 @@ func (r *RedisFailoverChecker) CheckSentinelNumber(rf *redisfailoverv1.RedisFail
 	return nil
 }
 
-// IsMasterPod reports whether the pod is labelled as the redis master.
-func IsMasterPod(pod *corev1.Pod) bool {
-	return pod.Labels[redisRoleLabelKey] == redisRoleLabelMaster
-}
-
-// applyMasterEvictionAnnotation keeps the cluster-autoscaler safe-to-evict
-// annotation in sync with a pod's role, but only when the RedisFailover opts in
-// via spec.redis.preventMasterEviction. The master is pinned (false) and slaves
-// are marked evictable (true). It reads the desired state off the already-fetched
-// pod object and skips the patch when the annotation is already correct, so it is
-// safe to call on every reconcile without extra API writes.
-func applyMasterEvictionAnnotation(k8sService k8s.Services, rf *redisfailoverv1.RedisFailover, pod corev1.Pod, isMaster bool) error {
-	if !rf.Spec.Redis.PreventMasterEviction {
-		return nil
-	}
-	desired := "true"
-	if isMaster {
-		desired = "false"
-	}
-	if pod.Annotations[masterSafeToEvictAnnotation] == desired {
-		return nil
-	}
-	return k8sService.UpdatePodAnnotations(rf.Namespace, pod.Name, map[string]string{masterSafeToEvictAnnotation: desired})
-}
-
-func (r *RedisFailoverChecker) setMasterLabelIfNecessary(rf *redisfailoverv1.RedisFailover, pod corev1.Pod) error {
-	if err := applyMasterEvictionAnnotation(r.k8sService, rf, pod, true); err != nil {
-		return err
-	}
-	for labelKey, labelValue := range pod.Labels {
-		if labelKey == redisRoleLabelKey && labelValue == redisRoleLabelMaster {
-			return nil
-		}
-	}
-	return r.k8sService.UpdatePodLabels(rf.Namespace, pod.Name, generateRedisMasterRoleLabel())
-}
-
-func (r *RedisFailoverChecker) setSlaveLabelIfNecessary(rf *redisfailoverv1.RedisFailover, pod corev1.Pod, port, password string) error {
-	return setSlaveLabel(r.k8sService, r.opts, rf, pod, port, password)
-}
-
-// CheckAllSlavesFromMaster controlls that all slaves have the same master (the real one)
-func (r *RedisFailoverChecker) CheckAllSlavesFromMaster(master string, rf *redisfailoverv1.RedisFailover) error {
-	rps, err := r.k8sService.GetStatefulSetPods(rf.Namespace, GetRedisName(rf))
-	if err != nil {
-		return err
-	}
-
-	password, err := k8s.GetRedisPassword(r.k8sService, rf)
-	if err != nil {
-		return err
-	}
-
-	rport := getRedisPort(rf.Spec.Redis.Port)
-	// wrongMasterErr records a reachable slave replicating from the wrong master.
-	// It is returned after the loop so that every reachable pod is still labelled
-	// first - otherwise a single misconfigured or unreachable pod early in the
-	// list would stop the new master from ever being labelled, leaving the master
-	// Service pointing nowhere.
-	var wrongMasterErr error
-	for _, rp := range rps.Items {
-		if rp.Status.PodIP == master {
-			err = r.setMasterLabelIfNecessary(rf, rp)
-			if err != nil {
-				return err
-			}
-		} else {
-			err = r.setSlaveLabelIfNecessary(rf, rp, rport, password)
-			if err != nil {
-				return err
-			}
-		}
-
-		if rp.DeletionTimestamp != nil {
-			// A terminating pod is going away, and dialing its IP can block
-			// for the whole connection timeout.
-			continue
-		}
-		slave, err := r.redisClient.GetSlaveOf(rp.Status.PodIP, rport, password)
-		if err != nil {
-			// The pod is unreachable - typically the old master on a downed node.
-			// It cannot be verified or repaired, so skip it and keep reconciling
-			// the pods that are reachable rather than aborting the whole heal.
-			r.logger.Errorf("Get slave of master failed, maybe this node is not ready, pod ip: %s", rp.Status.PodIP)
-			continue
-		}
-		if slave != "" && slave != master {
-			newErr := fmt.Errorf("slave %s don't have the master %s, has %s", rp.Status.PodIP, master, slave)
-			r.logger.Errorf("%v", newErr)
-			if wrongMasterErr == nil {
-				wrongMasterErr = newErr
-			}
-		}
-	}
-	return wrongMasterErr
-}
-
-// CheckSentinelNumberInMemory controls that the provided sentinel has only the living sentinels on its memory.
-func (r *RedisFailoverChecker) CheckSentinelNumberInMemory(sentinel string, rf *redisfailoverv1.RedisFailover) error {
-	nSentinels, err := r.redisClient.GetNumberSentinelsInMemory(sentinel)
-	if err != nil {
-		return err
-	} else if nSentinels != rf.Spec.Sentinel.Replicas {
-		return errors.New("sentinels in memory mismatch")
-	}
-	return nil
-}
-
-// CheckIfMasterLocalhost This function will check if the local host ip is set as the master for all currently available pods
-// This  can be used to detect the fresh boot of all the redis pods
-// This function returns true if it all available pods have local host ip as master,
-// false if atleast one of the ip is not local hostip
-// false and error if any function fails
-func (r *RedisFailoverChecker) CheckIfMasterLocalhost(rFailover *redisfailoverv1.RedisFailover) (bool, error) {
-
-	var lhmaster = 0
-	redisIps, err := r.GetRedisesIPs(rFailover)
-	if len(redisIps) == 0 || err != nil {
-		r.logger.Warningf("CheckIfMasterLocalhost GetRedisesIPs Failed- unable to fetch any redis Ips Currently")
-		return false, errors.New("unable to fetch any redis Ips Currently")
-	}
-	password, err := k8s.GetRedisPassword(r.k8sService, rFailover)
-	if err != nil {
-		r.logger.Errorf("CheckIfMasterLocalhost -- GetRedisPassword Failed")
-		return false, err
-	}
-	rport := getRedisPort(rFailover.Spec.Redis.Port)
-	for _, sip := range redisIps {
-		master, err := r.redisClient.GetSlaveOf(sip, rport, password)
-		if err != nil {
-			r.logger.Warningf("CheckIfMasterLocalhost -- GetSlaveOf Failed")
-			return false, err
-		} else if master == "" {
-			r.logger.Warningf("CheckIfMasterLocalhost -- Master already available ?? check manually")
-			return false, errors.New("unexpected master state, fix manually")
-		} else {
-			if master == "127.0.0.1" {
-				lhmaster++
-			}
-		}
-	}
-	if lhmaster == len(redisIps) {
-		r.logger.Infof("all available redis configured localhost as master , operator must heal")
-		return true, nil
-	}
-	r.logger.Infof("atleast one pod does not have localhost as master , operator should not heal")
-	return false, nil
-}
-
-// CheckSentinelQuorum This function will call the sentinel client apis to check with sentinel if the sentinel is in a state
-// to heal the redis system
-func (r *RedisFailoverChecker) CheckSentinelQuorum(rFailover *redisfailoverv1.RedisFailover) (int, error) {
-
-	var unhealthyCnt = -1
-
-	sentinels, err := r.GetSentinelsIPs(rFailover)
-	if err != nil {
-		r.logger.Warningf("CheckSentinelQuorum Error in getting sentinel Ip's")
-		return unhealthyCnt, err
-	}
-	if len(sentinels) < int(getQuorum(rFailover)) {
-		unhealthyCnt = int(getQuorum(rFailover)) - len(sentinels)
-		r.logger.Warningf("insufficnet sentinel to reach Quorum - Unhealthy count: %d", unhealthyCnt)
-		return unhealthyCnt, errors.New("insufficnet sentinel to reach Quorum")
-	}
-
-	unhealthyCnt = 0
-	for _, sip := range sentinels {
-		err = r.redisClient.SentinelCheckQuorum(sip)
-		if err != nil {
-			unhealthyCnt += 1
-		} else {
-			continue
-		}
-	}
-	if unhealthyCnt < int(getQuorum(rFailover)) {
-		return unhealthyCnt, nil
-	} else {
-		r.logger.Errorf("insufficnet sentinel to reach Quorum - Unhealthy count: %d", unhealthyCnt)
-		return unhealthyCnt, errors.New("insufficnet sentinel to reach Quorum")
-	}
-}
-
-// CheckSentinelSlavesNumberInMemory controls that the provided sentinel has only the expected slaves number.
-func (r *RedisFailoverChecker) CheckSentinelSlavesNumberInMemory(sentinel string, rf *redisfailoverv1.RedisFailover) error {
-	nSlaves, err := r.redisClient.GetNumberSentinelSlavesInMemory(sentinel)
-	if err != nil {
-		return err
-	} else {
-		if rf.Bootstrapping() {
-			if nSlaves != rf.Spec.Redis.Replicas {
-				return errors.New("redis slaves in sentinel memory mismatch")
-			}
-		} else {
-			if nSlaves != rf.Spec.Redis.Replicas-1 {
-				return errors.New("redis slaves in sentinel memory mismatch")
-			}
-		}
-	}
-	return nil
-}
-
-// CheckSentinelSlavesNumberQuorumInMemory controls that the provided sentinel
-// has at least a majority (quorum) of the expected slaves in memory, rather
-// than requiring the full set. Used before replacing a stale master during a
-// rolling update: gating on the full expected count
-// (CheckSentinelSlavesNumberInMemory) can block forever if a single replica
-// is permanently unavailable (e.g. a PVC stuck in a dead zone), even though a
-// safe failover is available via the reachable majority.
-func (r *RedisFailoverChecker) CheckSentinelSlavesNumberQuorumInMemory(sentinel string, rf *redisfailoverv1.RedisFailover) error {
-	nSlaves, err := r.redisClient.GetNumberSentinelSlavesInMemory(sentinel)
-	if err != nil {
-		return err
-	}
-	expected := rf.Spec.Redis.Replicas - 1
-	var quorum int32
-	if expected > 0 {
-		quorum = expected/2 + 1
-	}
-	if nSlaves < quorum {
-		return fmt.Errorf("redis slaves in sentinel memory below quorum: have %d, need at least %d of %d expected", nSlaves, quorum, expected)
-	}
-	return nil
-
-}
-
-// CheckSentinelMonitor controls if the sentinels are monitoring the expected master
-func (r *RedisFailoverChecker) CheckSentinelMonitor(sentinel string, monitor ...string) error {
-	monitorIP := monitor[0]
-	monitorPort := ""
-	if len(monitor) > 1 {
-		monitorPort = monitor[1]
-	}
-	actualMonitorIP, actualMonitorPort, err := r.redisClient.GetSentinelMonitor(sentinel)
-	if err != nil {
-		return err
-	}
-	if actualMonitorIP != monitorIP || (monitorPort != "" && monitorPort != actualMonitorPort) {
-		return fmt.Errorf("sentinel monitoring %s:%s instead %s:%s", actualMonitorIP, actualMonitorPort, monitorIP, monitorPort)
-	}
-	return nil
-}
-
-// GetMasterIP connects to all redis and returns the master of the redis failover
-func (r *RedisFailoverChecker) GetMasterIP(rf *redisfailoverv1.RedisFailover) (string, error) {
-	rips, err := r.GetRedisesIPs(rf)
-	if err != nil {
-		return "", err
-	}
-
-	password, err := k8s.GetRedisPassword(r.k8sService, rf)
-	if err != nil {
-		return "", err
-	}
-
-	var masters []string
-	rport := getRedisPort(rf.Spec.Redis.Port)
-	for _, rip := range rips {
-		master, err := r.redisClient.IsMaster(rip, rport, password)
-		if err != nil {
-			r.logger.Errorf("Get redis info failed, maybe this node is not ready, pod ip: %s", rip)
-			continue
-		}
-		if master {
-			masters = append(masters, rip)
-		}
-	}
-
-	if len(masters) != 1 {
-		return "", ErrAmbiguousMasterCount
-	}
-	return masters[0], nil
-}
-
-// GetNumberMasters returns the number of redis nodes that are working as a master.
-// A ready pod that does not answer may still be the master, so if no pod
-// answers as master it returns an error rather than zero, and callers don't
-// promote over it. A pod Kubernetes has marked not ready is skipped.
-func (r *RedisFailoverChecker) GetNumberMasters(rf *redisfailoverv1.RedisFailover) (int, error) {
-	nMasters := 0
-	rps, err := r.k8sService.GetStatefulSetPods(rf.Namespace, GetRedisName(rf))
-	if err != nil {
-		r.logger.Error(err.Error())
-		return nMasters, err
-	}
-
-	password, err := k8s.GetRedisPassword(r.k8sService, rf)
-	if err != nil {
-		r.logger.Errorf("Error getting password: %s", err.Error())
-		return nMasters, err
-	}
-
-	var unanswered error
-	rport := getRedisPort(rf.Spec.Redis.Port)
-	for i := range rps.Items {
-		rp := &rps.Items[i]
-		if rp.Status.Phase != corev1.PodRunning || rp.DeletionTimestamp != nil {
-			continue
-		}
-		master, err := r.redisClient.IsMaster(rp.Status.PodIP, rport, password)
-		if err != nil {
-			r.logger.Errorf("Get redis info failed, maybe this node is not ready, pod ip: %s", rp.Status.PodIP)
-			if unanswered == nil && util.PodIsReady(rp) {
-				unanswered = fmt.Errorf("ready redis pod %s did not answer: %w", rp.Name, err)
-			}
-			continue
-		}
-		if master {
-			nMasters++
-		}
-	}
-	if nMasters == 0 && unanswered != nil {
-		return nMasters, unanswered
-	}
-	return nMasters, nil
-}
-
-// GetRedisesIPs returns the IPs of the Redis nodes
+// GetRedisesIPs returns the IPs of the Redis nodes.
 func (r *RedisFailoverChecker) GetRedisesIPs(rf *redisfailoverv1.RedisFailover) ([]string, error) {
 	redises := []string{}
 	rps, err := r.k8sService.GetStatefulSetPods(rf.Namespace, GetRedisName(rf))
@@ -441,7 +114,7 @@ func (r *RedisFailoverChecker) GetRedisesIPs(rf *redisfailoverv1.RedisFailover) 
 	return redises, nil
 }
 
-// GetSentinelsIPs returns the IPs of the Sentinel nodes
+// GetSentinelsIPs returns the IPs of the Sentinel nodes.
 func (r *RedisFailoverChecker) GetSentinelsIPs(rf *redisfailoverv1.RedisFailover) ([]string, error) {
 	sentinels := []string{}
 	rps, err := r.k8sService.GetDeploymentPods(rf.Namespace, GetSentinelName(rf))
@@ -456,7 +129,7 @@ func (r *RedisFailoverChecker) GetSentinelsIPs(rf *redisfailoverv1.RedisFailover
 	return sentinels, nil
 }
 
-// GetMaxRedisPodTime returns the MAX uptime among the active Pods
+// GetMaxRedisPodTime returns the MAX uptime among the active Pods.
 func (r *RedisFailoverChecker) GetMaxRedisPodTime(rf *redisfailoverv1.RedisFailover) (time.Duration, error) {
 	maxTime := 0 * time.Hour
 	rps, err := r.k8sService.GetStatefulSetPods(rf.Namespace, GetRedisName(rf))
@@ -477,63 +150,15 @@ func (r *RedisFailoverChecker) GetMaxRedisPodTime(rf *redisfailoverv1.RedisFailo
 	return maxTime, nil
 }
 
-// GetRedisesSlavesPods returns pods names of the Redis secondary nodes
-func (r *RedisFailoverChecker) GetRedisesSlavesPods(rf *redisfailoverv1.RedisFailover) ([]string, error) {
-	redises := []string{}
-	rps, err := r.k8sService.GetStatefulSetPods(rf.Namespace, GetRedisName(rf))
-	if err != nil {
-		return nil, err
-	}
+// ErrUpdateRevisionNotObserved is the error of GetStatefulSetUpdateRevision
+// while the status of the StatefulSet does not show its latest template.
+var ErrUpdateRevisionNotObserved = errors.New("the statefulset status does not show the latest template")
 
-	password, err := k8s.GetRedisPassword(r.k8sService, rf)
-	if err != nil {
-		return redises, err
-	}
-
-	rport := getRedisPort(rf.Spec.Redis.Port)
-	for _, rp := range rps.Items {
-		if rp.Status.Phase == corev1.PodRunning && rp.DeletionTimestamp == nil { // Only work with running
-			master, err := r.redisClient.IsMaster(rp.Status.PodIP, rport, password)
-			if err != nil {
-				return []string{}, err
-			}
-			if !master {
-				redises = append(redises, rp.Name)
-			}
-		}
-	}
-	return redises, nil
-}
-
-// GetRedisesMasterPod returns pods names of the Redis secondary nodes
-func (r *RedisFailoverChecker) GetRedisesMasterPod(rFailover *redisfailoverv1.RedisFailover) (string, error) {
-	rps, err := r.k8sService.GetStatefulSetPods(rFailover.Namespace, GetRedisName(rFailover))
-	if err != nil {
-		return "", err
-	}
-
-	password, err := k8s.GetRedisPassword(r.k8sService, rFailover)
-	if err != nil {
-		return "", err
-	}
-
-	rport := getRedisPort(rFailover.Spec.Redis.Port)
-	for _, rp := range rps.Items {
-		if rp.Status.Phase == corev1.PodRunning && rp.DeletionTimestamp == nil { // Only work with running
-			master, err := r.redisClient.IsMaster(rp.Status.PodIP, rport, password)
-			if err != nil {
-				return "", err
-			}
-			if master {
-				return rp.Name, nil
-			}
-		}
-	}
-	return "", errors.New("redis nodes known as master not found")
-}
-
-// GetStatefulSetUpdateRevision returns the current version for the statefulSet
-// If the label doesn't exist, we return an empty value and no error, so previous versions don't break
+// GetStatefulSetUpdateRevision returns `status.updateRevision` of the redis
+// StatefulSet. The rollout updates each pod whose revision label differs.
+// Before the StatefulSet controller observes a template change, the status
+// names the revision before the change, and each pod on the latest template
+// looks stale. Then it returns ErrUpdateRevisionNotObserved.
 func (r *RedisFailoverChecker) GetStatefulSetUpdateRevision(rFailover *redisfailoverv1.RedisFailover) (string, error) {
 	ss, err := r.k8sService.GetStatefulSet(rFailover.Namespace, GetRedisName(rFailover))
 	if err != nil {
@@ -543,11 +168,16 @@ func (r *RedisFailoverChecker) GetStatefulSetUpdateRevision(rFailover *redisfail
 	if ss == nil {
 		return "", errors.New("statefulSet not found")
 	}
+	if ss.Status.ObservedGeneration < ss.Generation || ss.Status.UpdateRevision == "" {
+		return "", ErrUpdateRevisionNotObserved
+	}
 
 	return ss.Status.UpdateRevision, nil
 }
 
-// GetRedisRevisionHash returns the statefulset uid for the pod
+// GetRedisRevisionHash returns the controller-revision-hash label of the pod.
+// It returns "" while an in-place resize is pending, so the rollout treats the
+// pod as stale until the resize is applied.
 func (r *RedisFailoverChecker) GetRedisRevisionHash(podName string, rFailover *redisfailoverv1.RedisFailover) (string, error) {
 	pod, err := r.k8sService.GetPod(rFailover.Namespace, podName)
 	if err != nil {
@@ -563,8 +193,8 @@ func (r *RedisFailoverChecker) GetRedisRevisionHash(podName string, rFailover *r
 	}
 
 	// A pod being resized in place is on no revision until the resize is
-	// applied, even when its label matches again, e.g. after a revert.
-	if pod.Annotations[resizeRequestedAnnotation] != "" {
+	// applied, even when its label matches again, for example after a revert.
+	if ResizeRequested(pod) {
 		return "", nil
 	}
 
@@ -573,18 +203,17 @@ func (r *RedisFailoverChecker) GetRedisRevisionHash(podName string, rFailover *r
 	return val, nil
 }
 
-// CheckRedisSlavesReady returns true if the slave is ready (sync, connected, etc.)
-func (r *RedisFailoverChecker) CheckRedisSlavesReady(ip string, rFailover *redisfailoverv1.RedisFailover) (bool, error) {
+// GetAutoscalerInfo reads the INFO fields of the memory autoscaler from the
+// Redis at ip.
+func (r *RedisFailoverChecker) GetAutoscalerInfo(rFailover *redisfailoverv1.RedisFailover, ip string) (*redis.AutoscalerInfo, error) {
 	password, err := k8s.GetRedisPassword(r.k8sService, rFailover)
 	if err != nil {
-		return false, err
+		return nil, err
 	}
-
-	port := getRedisPort(rFailover.Spec.Redis.Port)
-	return r.redisClient.SlaveIsReady(ip, port, password)
+	return r.redisClient.GetAutoscalerInfo(ip, getRedisPort(rFailover.Spec.Redis.Port), password)
 }
 
-// IsRedisRunning returns true if all the pods are Running
+// IsRedisRunning returns true if all the pods are Running.
 func (r *RedisFailoverChecker) IsRedisRunning(rFailover *redisfailoverv1.RedisFailover) bool {
 	dp, err := r.k8sService.GetStatefulSetPods(rFailover.Namespace, GetRedisName(rFailover))
 	return err == nil && len(dp.Items) > int(rFailover.Spec.Redis.Replicas-1) && AreAllRunning(dp, int(rFailover.Spec.Redis.Replicas))
@@ -598,7 +227,7 @@ func (r *RedisFailoverChecker) IsRedisRunningQuorum(rFailover *redisfailoverv1.R
 	return err == nil && AreQuorumRunning(dp, int(rFailover.Spec.Redis.Replicas))
 }
 
-// IsSentinelRunning returns true if all the pods are Running
+// IsSentinelRunning returns true if all the pods are Running.
 func (r *RedisFailoverChecker) IsSentinelRunning(rFailover *redisfailoverv1.RedisFailover) bool {
 	dp, err := r.k8sService.GetDeploymentPods(rFailover.Namespace, GetSentinelName(rFailover))
 	return err == nil && len(dp.Items) > int(rFailover.Spec.Sentinel.Replicas-1) && AreAllRunning(dp, int(rFailover.Spec.Sentinel.Replicas))
@@ -612,142 +241,17 @@ func (r *RedisFailoverChecker) IsSentinelRunningQuorum(rFailover *redisfailoverv
 	return err == nil && AreQuorumRunning(dp, int(rFailover.Spec.Sentinel.Replicas))
 }
 
-// IsClusterRunning returns true if all the pods in the given redisfailover are Running
+// IsClusterRunning returns true if all the pods in the given redisfailover are Running.
 func (r *RedisFailoverChecker) IsClusterRunning(rFailover *redisfailoverv1.RedisFailover) bool {
 	return r.IsSentinelRunning(rFailover) && r.IsRedisRunning(rFailover)
-}
-
-// CheckMasterHealth checks if the current master is healthy and reachable.
-// Returns (healthy, masterIP, error)
-func (r *RedisFailoverChecker) CheckMasterHealth(rf *redisfailoverv1.RedisFailover) (bool, string, error) {
-	masterIP, err := r.GetMasterIP(rf)
-	if err != nil {
-		// ErrAmbiguousMasterCount covers both "no master" and "more than one
-		// master" (split-brain); silently treating both as "no master, go
-		// promote a replica" would make an existing split-brain worse by
-		// promoting yet another one. Corroborate with a second, independent
-		// count: this isn't perfectly atomic with the scan GetMasterIP just
-		// did, but it correctly catches the common case where more than one
-		// master is already present.
-		if errors.Is(err, ErrAmbiguousMasterCount) {
-			if n, nErr := r.GetNumberMasters(rf); nErr == nil && n > 1 {
-				return false, "", fmt.Errorf("split-brain detected: %d redis nodes claim to be master, refusing to promote another replica", n)
-			}
-		}
-		// No master found (or GetMasterIP failed for an unrelated reason,
-		// e.g. listing pods failed - treated the same as "no master" here,
-		// matching this function's prior behavior for those cases).
-		return false, "", nil
-	}
-
-	password, err := k8s.GetRedisPassword(r.k8sService, rf)
-	if err != nil {
-		return false, masterIP, err
-	}
-
-	port := getRedisPort(rf.Spec.Redis.Port)
-
-	// Check if master responds to ping
-	isMaster, err := r.redisClient.IsMaster(masterIP, port, password)
-	if err != nil {
-		r.logger.WithField("ip", masterIP).Warnf("Master health check failed: %v", err)
-		return false, masterIP, nil
-	}
-
-	return isMaster, masterIP, nil
-}
-
-// GetBestReplicaForPromotion returns the best replica to promote as master.
-// Selection is based on replication offset (highest wins) to minimize data loss.
-func (r *RedisFailoverChecker) GetBestReplicaForPromotion(rf *redisfailoverv1.RedisFailover) (*ReplicaInfo, error) {
-	replicas, err := r.GetReplicaReplicationOffsets(rf)
-	if err != nil {
-		return nil, err
-	}
-
-	if len(replicas) == 0 {
-		return nil, errors.New("no replicas available for promotion")
-	}
-
-	// Find replica with highest replication offset that is ready
-	var best *ReplicaInfo
-	for i := range replicas {
-		replica := &replicas[i]
-		if !replica.IsReady {
-			continue
-		}
-		if best == nil || replica.ReplicationOffset > best.ReplicationOffset {
-			best = replica
-		}
-	}
-
-	// If no ready replica found, fall back to any replica with highest offset
-	if best == nil {
-		for i := range replicas {
-			replica := &replicas[i]
-			if best == nil || replica.ReplicationOffset > best.ReplicationOffset {
-				best = replica
-			}
-		}
-	}
-
-	if best == nil {
-		return nil, errors.New("no suitable replica found for promotion")
-	}
-
-	r.logger.Infof("Selected replica %s (offset: %d) for promotion", best.IP, best.ReplicationOffset)
-	return best, nil
-}
-
-// GetReplicaReplicationOffsets returns replication offset information for all replicas
-func (r *RedisFailoverChecker) GetReplicaReplicationOffsets(rf *redisfailoverv1.RedisFailover) ([]ReplicaInfo, error) {
-	rps, err := r.k8sService.GetStatefulSetPods(rf.Namespace, GetRedisName(rf))
-	if err != nil {
-		return nil, err
-	}
-
-	password, err := k8s.GetRedisPassword(r.k8sService, rf)
-	if err != nil {
-		return nil, err
-	}
-
-	port := getRedisPort(rf.Spec.Redis.Port)
-	var replicas []ReplicaInfo
-
-	for _, rp := range rps.Items {
-		if rp.Status.Phase != corev1.PodRunning || rp.DeletionTimestamp != nil {
-			continue
-		}
-
-		replInfo, err := r.redisClient.GetReplicationInfo(rp.Status.PodIP, port, password)
-		if err != nil {
-			r.logger.WithField("ip", rp.Status.PodIP).Warnf("Failed to get replication info: %v", err)
-			continue
-		}
-
-		// Skip masters
-		if replInfo.Role == "master" {
-			continue
-		}
-
-		// Check if replica is ready (not syncing, link up)
-		isReady := !replInfo.SyncInProgress && replInfo.MasterLinkStatus == "up"
-
-		replicas = append(replicas, ReplicaInfo{
-			IP:                rp.Status.PodIP,
-			PodName:           rp.Name,
-			ReplicationOffset: replInfo.SlaveReplOffset,
-			IsReady:           isReady,
-		})
-	}
-
-	return replicas, nil
 }
 
 func getRedisPort(p int32) string {
 	return strconv.Itoa(int(p))
 }
 
+// AreAllRunning reports whether no pod is Pending or in deletion, and at least
+// expectedRunningPods pods are not terminal.
 func AreAllRunning(pods *corev1.PodList, expectedRunningPods int) bool {
 	var runningPods int
 	for _, pod := range pods.Items {
@@ -762,10 +266,10 @@ func AreAllRunning(pods *corev1.PodList, expectedRunningPods int) bool {
 	return runningPods >= expectedRunningPods
 }
 
-// AreQuorumRunning reports whether at least a majority (quorum) of the expected
-// pods are Running. Scheduling and terminal pods are not counted, but a minority
-// of Pending pods no longer blocks the result, so the operator can keep healing
-// the surviving pods after a partial outage instead of waiting for the full set.
+// AreQuorumRunning reports whether a quorum (majority) of the expected pods
+// runs. It does not count scheduling and terminal pods. After a partial
+// outage, the operator can thus heal the other pods while a minority of pods
+// is Pending.
 func AreQuorumRunning(pods *corev1.PodList, expectedReplicas int) bool {
 	var runningPods int
 	for i := range pods.Items {

@@ -3,24 +3,31 @@ package redisfailover
 import (
 	"context"
 	"errors"
+	"fmt"
+	"runtime/debug"
 	"sync"
 	"time"
 
 	corev1 "k8s.io/api/core/v1"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/util/wait"
 	"k8s.io/apimachinery/pkg/watch"
 	"k8s.io/client-go/kubernetes"
+	"k8s.io/client-go/metadata"
 	"k8s.io/client-go/tools/cache"
 	"k8s.io/client-go/util/workqueue"
 
+	redisfailoverv1 "github.com/saremox/redis-operator/api/redisfailover/v1"
 	"github.com/saremox/redis-operator/log"
 	"github.com/saremox/redis-operator/metrics"
 )
 
 const controllerName = "redisfailover"
+
+const conflictRetryDelay = time.Second
 
 // Controller runs the operator until its context is done.
 type Controller interface {
@@ -30,28 +37,32 @@ type Controller interface {
 // Handler reconciles one object.
 type Handler interface {
 	Handle(ctx context.Context, obj runtime.Object) error
+	// Forget drops the state for an object that is gone.
+	Forget(key string)
 }
 
 // rfController reconciles RedisFailovers from one queue keyed by RedisFailover.
 // Events on a RedisFailover's pods queue that RedisFailover, so a pod change
 // (deleted, recreated, ready) drives the next reconcile without waiting for
-// the resync.
+// the resync. With a Secret watch, an auth Secret event also queues its
+// RedisFailovers.
 type rfController struct {
-	handler     Handler
-	rfInformer  cache.SharedIndexInformer
-	podInformer cache.SharedIndexInformer
-	queue       workqueue.TypedInterface[string]
-	workers     int
-	leRunner    leaderRunner
-	metrics     metrics.ControllerRecorder
-	logger      log.Logger
+	handler        Handler
+	rfInformer     cache.SharedIndexInformer
+	podInformer    cache.SharedIndexInformer
+	secretInformer cache.SharedIndexInformer // nil without a Secret watch
+	queue          workqueue.TypedInterface[string]
+	workers        int
+	leRunner       leaderRunner
+	metrics        metrics.ControllerRecorder
+	logger         log.Logger
 
 	// queuedAt feeds the in-queue duration metric.
 	mu       sync.Mutex
 	queuedAt map[string]time.Time
 }
 
-func newRFController(handler Handler, rfLW, podLW cache.ListerWatcher, resync time.Duration, workers int, leRunner leaderRunner, mrec metrics.ControllerRecorder, logger log.Logger) (*rfController, error) {
+func newRFController(handler Handler, rfLW, podLW, secretLW cache.ListerWatcher, resync time.Duration, workers int, leRunner leaderRunner, mrec metrics.ControllerRecorder, logger log.Logger) (*rfController, error) {
 	if resync <= 0 {
 		resync = 3 * time.Minute
 	}
@@ -60,7 +71,7 @@ func newRFController(handler Handler, rfLW, podLW cache.ListerWatcher, resync ti
 	}
 	c := &rfController{
 		handler:     handler,
-		rfInformer:  cache.NewSharedIndexInformer(rfLW, nil, resync, cache.Indexers{}),
+		rfInformer:  cache.NewSharedIndexInformer(rfLW, nil, resync, cache.Indexers{authSecretIndex: authSecretKey}),
 		podInformer: cache.NewSharedIndexInformer(podLW, &corev1.Pod{}, 0, cache.Indexers{}),
 		queue:       workqueue.NewTyped[string](),
 		workers:     workers,
@@ -73,11 +84,18 @@ func newRFController(handler Handler, rfLW, podLW cache.ListerWatcher, resync ti
 	// Only the metrics registration can fail here; the informers are new.
 	_, rfErr := c.rfInformer.AddEventHandlerWithResyncPeriod(c.eventHandler(rfKey), resync)
 	_, podErr := c.podInformer.AddEventHandler(c.eventHandler(c.podOwner))
+	var secretErr error
+	if secretLW != nil {
+		c.secretInformer = cache.NewSharedIndexInformer(secretLW, &metav1.PartialObjectMetadata{}, 0, cache.Indexers{})
+		_, err := c.secretInformer.AddEventHandler(c.secretEventHandler())
+		secretErr = errors.Join(c.secretInformer.SetTransform(secretKeyOnly), err)
+	}
 	queueLen := func(context.Context) int { return c.queue.Len() }
 	if err := errors.Join(
 		c.podInformer.SetTransform(podMetadataOnly),
 		rfErr,
 		podErr,
+		secretErr,
 		mrec.RegisterResourceQueueLengthFunc(controllerName, queueLen),
 	); err != nil {
 		return nil, err
@@ -98,6 +116,32 @@ func podMetadataOnly(obj any) (any, error) {
 		ResourceVersion: pod.ResourceVersion,
 		Labels:          pod.Labels,
 	}}, nil
+}
+
+// secretKeyOnly keeps only the key and the resource version, because the
+// cache holds every Secret in the cluster.
+func secretKeyOnly(obj any) (any, error) {
+	secret, ok := obj.(*metav1.PartialObjectMetadata)
+	if !ok {
+		return obj, nil
+	}
+	return &metav1.PartialObjectMetadata{ObjectMeta: metav1.ObjectMeta{
+		Name:            secret.Name,
+		Namespace:       secret.Namespace,
+		UID:             secret.UID,
+		ResourceVersion: secret.ResourceVersion,
+	}}, nil
+}
+
+// authSecretIndex lets a Secret event find its RedisFailovers without a scan.
+const authSecretIndex = "authSecret"
+
+func authSecretKey(obj any) ([]string, error) {
+	rf, ok := obj.(*redisfailoverv1.RedisFailover)
+	if !ok || rf.Spec.Auth.SecretPath == "" {
+		return nil, nil
+	}
+	return []string{rf.Namespace + "/" + rf.Spec.Auth.SecretPath}, nil
 }
 
 func rfKey(obj any) (string, bool) {
@@ -134,7 +178,7 @@ func (c *rfController) podOwner(obj any) (string, bool) {
 func (c *rfController) eventHandler(keyOf func(any) (string, bool)) cache.ResourceEventHandler {
 	enqueue := func(obj any) {
 		if key, ok := keyOf(obj); ok {
-			c.enqueue(key)
+			c.enqueue(context.Background(), key)
 		}
 	}
 	return cache.ResourceEventHandlerFuncs{
@@ -144,24 +188,62 @@ func (c *rfController) eventHandler(keyOf func(any) (string, bool)) cache.Resour
 			oldKey, oldOK := keyOf(old)
 			key, ok := keyOf(obj)
 			if oldOK && (!ok || oldKey != key) {
-				c.enqueue(oldKey)
+				c.enqueue(context.Background(), oldKey)
 			}
 			if ok {
-				c.enqueue(key)
+				c.enqueue(context.Background(), key)
 			}
 		},
 		DeleteFunc: enqueue,
 	}
 }
 
-func (c *rfController) enqueue(key string) {
+// secretEventHandler queues each RedisFailover that uses the changed Secret.
+// The RedisFailover informer holds only supported namespaces, so other
+// Secrets queue nothing.
+func (c *rfController) secretEventHandler() cache.ResourceEventHandler {
+	enqueue := func(obj any) {
+		key, ok := rfKey(obj)
+		if !ok {
+			return
+		}
+		rfKeys, _ := c.rfInformer.GetIndexer().IndexKeys(authSecretIndex, key)
+		for _, k := range rfKeys {
+			c.enqueue(context.Background(), k)
+		}
+	}
+	return cache.ResourceEventHandlerFuncs{
+		AddFunc: enqueue,
+		UpdateFunc: func(old, obj any) {
+			// A relist sends unchanged Secrets again. The handler queues an
+			// object of an unknown type, because no version can show that it
+			// did not change.
+			oldMeta, oldOK := old.(*metav1.PartialObjectMetadata)
+			newMeta, newOK := obj.(*metav1.PartialObjectMetadata)
+			if oldOK && newOK && oldMeta.ResourceVersion == newMeta.ResourceVersion {
+				return
+			}
+			enqueue(obj)
+		},
+		DeleteFunc: enqueue,
+	}
+}
+
+// enqueue queues key. The informer event handlers have no context of their
+// own, so they pass context.Background.
+func (c *rfController) enqueue(ctx context.Context, key string) {
 	c.mu.Lock()
 	if _, ok := c.queuedAt[key]; !ok {
 		c.queuedAt[key] = time.Now()
 	}
 	c.mu.Unlock()
-	c.metrics.IncResourceEventQueued(context.Background(), controllerName, false)
+	c.metrics.IncResourceEventQueued(ctx, controllerName, false)
 	c.queue.Add(key)
+}
+
+// enqueueAfter uses a timer, because the queue has no delay.
+func (c *rfController) enqueueAfter(ctx context.Context, key string, d time.Duration) {
+	time.AfterFunc(d, func() { c.enqueue(ctx, key) })
 }
 
 // Run satisfies Controller.
@@ -176,8 +258,11 @@ func (c *rfController) run(ctx context.Context) error {
 	c.logger.Infof("starting controller")
 	go c.rfInformer.RunWithContext(ctx)
 	go c.podInformer.RunWithContext(ctx)
-	// Pod events only speed reconciles up, so a pod watch that can't sync
-	// (e.g. RBAC) must not block reconciling.
+	if c.secretInformer != nil {
+		go c.secretInformer.RunWithContext(ctx)
+	}
+	// Pod and Secret events only make reconciles faster, so a watch that cannot
+	// sync (for example, without RBAC access) must not block them.
 	// The wait only fails once ctx is done, i.e. on shutdown.
 	if !cache.WaitForNamedCacheSyncWithContext(ctx, c.rfInformer.HasSynced) {
 		c.logger.Infof("controller stopped before its cache synced")
@@ -223,17 +308,45 @@ func (c *rfController) processNext(ctx context.Context) bool {
 	err := c.process(ctx, key)
 	c.metrics.ObserveResourceProcessingDuration(ctx, controllerName, err == nil, start)
 	if err != nil {
-		c.logger.WithField("object-key", key).Errorf("error on object processing: %v", err)
+		namespace, name, _ := cache.SplitMetaNamespaceKey(key)
+		logger := c.logger.WithField("object-key", key).WithField("redisfailover", name).WithField("namespace", namespace)
+		if apierrors.IsConflict(err) {
+			// The write used an old copy of the object. A reconcile with the
+			// new copy fixes that, so it is not a fault.
+			logger.Infof("the object changed before the write, the reconcile runs again: %v", err)
+			c.enqueueAfter(ctx, key, conflictRetryDelay)
+			return true
+		}
+		logger.Errorf("error on object processing: %v", err)
 	}
 	return true
 }
 
-func (c *rfController) process(ctx context.Context, key string) error {
+// process turns a panic of one reconcile into an error. Replies from Redis
+// and Sentinel come from tenant images, and one bad reply must not stop the
+// operator for all tenants. The next resync reconciles the object again.
+func (c *rfController) process(ctx context.Context, key string) (err error) {
+	defer func() {
+		if r := recover(); r != nil {
+			namespace, name, _ := cache.SplitMetaNamespaceKey(key)
+			c.logger.WithField("object-key", key).WithField("redisfailover", name).WithField("namespace", namespace).Errorf("panic on object processing: %v\n%s", r, debug.Stack())
+			err = errors.New("panic on object processing")
+		}
+	}()
 	obj, exists, err := c.rfInformer.GetIndexer().GetByKey(key)
-	if err != nil || !exists {
-		return err
+	if err != nil {
+		return fmt.Errorf("get %s from the informer cache: %w", key, err)
 	}
-	return c.handler.Handle(ctx, obj.(runtime.Object))
+	if !exists {
+		c.handler.Forget(key)
+		return nil
+	}
+	object, ok := obj.(runtime.Object)
+	if !ok {
+		return fmt.Errorf("object %s is a %T, not a runtime.Object", key, obj)
+	}
+	// The handler changes the object, and the informer cache shares it.
+	return c.handler.Handle(ctx, object.DeepCopyObject())
 }
 
 // newPodListWatch lists and watches the pods of every RedisFailover.
@@ -246,6 +359,22 @@ func newPodListWatch(k8sClient kubernetes.Interface) *cache.ListWatch {
 		WatchFuncWithContext: func(ctx context.Context, options metav1.ListOptions) (watch.Interface, error) {
 			options.LabelSelector = rfLabelNameKey
 			return k8sClient.CoreV1().Pods("").Watch(ctx, options)
+		},
+	}
+}
+
+// newSecretListWatch requests only metadata. The metadata can still contain
+// Secret data in the last-applied-configuration annotation, so the transform
+// keeps only the key fields. No selector can find only the auth Secrets, so it
+// watches all.
+func newSecretListWatch(metaClient metadata.Interface) *cache.ListWatch {
+	secrets := metaClient.Resource(corev1.SchemeGroupVersion.WithResource("secrets"))
+	return &cache.ListWatch{
+		ListWithContextFunc: func(ctx context.Context, options metav1.ListOptions) (runtime.Object, error) {
+			return secrets.List(ctx, options)
+		},
+		WatchFuncWithContext: func(ctx context.Context, options metav1.ListOptions) (watch.Interface, error) {
+			return secrets.Watch(ctx, options)
 		},
 	}
 }

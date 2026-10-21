@@ -32,7 +32,8 @@ spec:
     name: v1
     schema:
       openAPIV3Schema:
-        description: RedisFailover represents a Redis failover
+        description: RedisFailover is a Redis master with replicas that the operator
+          deploys and repairs.
         properties:
           apiVersion:
             description: |-
@@ -52,35 +53,60 @@ spec:
           metadata:
             type: object
           spec:
-            description: RedisFailoverSpec represents a Redis failover spec
+            description: |-
+              Spec is the desired state. The operator does not reconcile a spec that
+              fails validation, and the status then shows the error.
             properties:
               auth:
-                description: AuthSettings contains settings about auth
+                description: Auth configures the Redis password. Without it, Redis
+                  has no password.
                 properties:
                   secretPath:
+                    description: |-
+                      SecretPath is the name of a Secret in the namespace of the RedisFailover.
+                      Its key password is the Redis password. Sentinel has no password.
                     type: string
                 type: object
               bootstrapNode:
-                description: BootstrapSettings contains settings about a potential
-                  bootstrap node
+                description: |-
+                  BootstrapNode is an external Redis. All Redis pods replicate from it, so
+                  that the clients can move from that Redis to this RedisFailover.
                 properties:
                   allowSentinels:
+                    description: |-
+                      AllowSentinels lets the operator deploy the Sentinels, which then
+                      monitor the external Redis. It applies only when sentinel.enabled is
+                      true. Defaults to false.
                     type: boolean
                   host:
+                    description: |-
+                      Host is the IP address of the external Redis, or the ClusterIP of a
+                      Service. Validation requires it.
                     type: string
                   port:
+                    description: Port is the port of the external Redis. Defaults
+                      to 6379.
                     type: string
                 type: object
               labelWhitelist:
+                description: |-
+                  LabelWhitelist is a list of RE2 regular expressions. The operator copies
+                  a label of the RedisFailover to the objects that it creates only when
+                  the label key matches one expression. Without a list, the operator
+                  copies all labels. The operator ignores an expression that does not
+                  compile.
                 items:
                   type: string
                 type: array
               redis:
-                description: RedisSettings defines the specification of the redis
-                  cluster
+                description: Redis configures the Redis StatefulSet rfr-<NAME> and
+                  its pods.
                 properties:
                   affinity:
-                    description: Affinity is a group of affinity scheduling rules.
+                    description: |-
+                      Affinity replaces the default affinity of the Redis pods. The default is
+                      a preferred pod anti-affinity, so the scheduler tries to put each Redis
+                      pod on a different node.
                     properties:
                       nodeAffinity:
                         description: Describes node affinity scheduling rules for
@@ -998,15 +1024,70 @@ spec:
                             x-kubernetes-list-type: atomic
                         type: object
                     type: object
+                  autoscaling:
+                    description: |-
+                      Autoscaling lets the operator compute the memory limit of the redis
+                      container from the memory use. Unset means Off.
+                    properties:
+                      memoryMax:
+                        anyOf:
+                        - type: integer
+                        - type: string
+                        description: |-
+                          MemoryMax is the largest memory limit that the autoscaler recommends.
+                          It must not be less than redis.resources.limits.memory. When it is
+                          equal, the autoscaler recommends no step. The modes Recommend and Auto
+                          need it.
+                        pattern: ^(\+|-)?(([0-9]+(\.[0-9]*)?)|(\.[0-9]+))(([KMGTPE]i)|[numkMGTPE]|([eE](\+|-)?(([0-9]+(\.[0-9]*)?)|(\.[0-9]+))))?$
+                        x-kubernetes-int-or-string: true
+                      mode:
+                        description: |-
+                          Mode is Off, Recommend or Auto. Recommend shows a memory limit in
+                          status.autoscaling and changes no pod. Auto also raises the memory
+                          limit of the pods in place. It needs redis.maxMemory, a memory request
+                          equal to the limit or unset, and Kubernetes 1.33 or later. With
+                          bootstrapNode, only Off is valid. Defaults to Off.
+                        enum:
+                        - "Off"
+                        - Recommend
+                        - Auto
+                        type: string
+                      recreateAfter:
+                        description: |-
+                          RecreateAfter is reserved for the time after which Auto recreates a pod
+                          that it cannot resize in place. The operator does not use it, and
+                          validation rejects it with Auto. Other modes accept 0s, or 5m and more.
+                          The value has at most 16 characters and each number at most 6 digits,
+                          because a value that overflows stops the decode of all RedisFailovers.
+                        maxLength: 16
+                        pattern: ^[-+]?(0|(([0-9]{1,6}(\.[0-9]{0,6})?|\.[0-9]{1,6})(ns|us|µs|μs|ms|s|m|h))+)$
+                        type: string
+                      workload:
+                        description: |-
+                          Workload is Auto, Store or Cache. Auto uses the maxmemory-policy:
+                          allkeys-* is a cache, noeviction a store, and volatile-* a store until
+                          Redis evicts a key. Defaults to Auto.
+                        enum:
+                        - Auto
+                        - Store
+                        - Cache
+                        type: string
+                    type: object
                   command:
+                    description: |-
+                      Command replaces the default redis command. With auth.secretPath, the
+                      default passes the password to redis-server, so a custom command must
+                      pass --requirepass and --masterauth from $REDIS_PASSWORD itself.
+                      Otherwise Redis runs with no password.
                     items:
                       type: string
                     type: array
                   containerSecurityContext:
                     description: |-
-                      SecurityContext holds security configuration that will be applied to a container.
-                      Some fields are present in both SecurityContext and PodSecurityContext.  When both
-                      are set, the values in SecurityContext take precedence.
+                      ContainerSecurityContext applies to the Redis container and to the init
+                      container that removes RDB tempfiles. A field that is not set keeps the
+                      default of the operator. A capabilities value replaces the default drop
+                      of ALL.
                     properties:
                       allowPrivilegeEscalation:
                         description: |-
@@ -1077,7 +1158,6 @@ spec:
                           procMount denotes the type of proc mount to use for the containers.
                           The default value is Default which uses the container runtime defaults for
                           readonly paths and masked paths.
-                          This requires the ProcMountType feature flag to be enabled.
                           Note that this field cannot be set when spec.os.name is windows.
                         type: string
                       readOnlyRootFilesystem:
@@ -1198,24 +1278,42 @@ spec:
                         type: object
                     type: object
                   customCommandRenames:
+                    description: |-
+                      CustomCommandRenames writes rename-command entries to redis.conf.
+                      Validation rejects a rename of a command that the RedisFailover needs.
                     items:
-                      description: RedisCommandRename defines the specification of
-                        a "rename-command" configuration option
+                      description: |-
+                        RedisCommandRename is a "rename-command" entry of redis.conf.
+                        It must not rename a command that the operator, the pod scripts or the replicas send:
+                        AUTH, CLIENT, CONFIG, INFO, PING, PSYNC, REPLCONF, REPLICAOF or SLAVEOF. With Sentinels,
+                        it must not rename EXEC, MULTI, PUBLISH or SUBSCRIBE. With an aclfile, it must not rename ACL.
+                        The shutdown script also sends SAVE. Validation allows a rename of SAVE, but then that SAVE fails.
                       properties:
                         from:
+                          description: |-
+                            From is the command to rename. It can contain only letters and
+                            underscores.
                           type: string
                         to:
+                          description: |-
+                            To is the name that replaces From. It can contain only letters and
+                            underscores. An empty value disables the command.
                           type: string
                       type: object
                     type: array
                   customConfig:
+                    description: |-
+                      CustomConfig is a list of "parameter value" entries. The operator
+                      applies each entry with CONFIG SET on each Redis, and sends ACL LOAD for
+                      aclfile, so a change restarts no pod. Do not set port, bind or dir,
+                      because the operator controls them.
                     items:
                       type: string
                     type: array
                   customLivenessProbe:
                     description: |-
-                      Probe describes a health check to be performed against a container to determine whether it is
-                      alive or ready to receive traffic.
+                      CustomLivenessProbe replaces the default liveness probe of the Redis
+                      container, which sends PING.
                     properties:
                       exec:
                         description: Exec specifies a command to execute in the container.
@@ -1241,6 +1339,13 @@ spec:
                       grpc:
                         description: GRPC specifies a GRPC HealthCheckRequest.
                         properties:
+                          mode:
+                            description: |-
+                              mode specifies the connection mode for the gRPC health probe.
+                              Set to "TLS" to use TLS without certificate verification.
+                              Set to "Plaintext" to use a plaintext (insecure) connection explicitly.
+                              If not specified, the probe uses a plaintext (insecure) connection.
+                            type: string
                           port:
                             description: Port number of the gRPC service. Number must
                               be in the range 1 to 65535.
@@ -1298,6 +1403,11 @@ spec:
                               Number must be in the range 1 to 65535.
                               Name must be an IANA_SVC_NAME.
                             x-kubernetes-int-or-string: true
+                          protocol:
+                            description: |-
+                              Protocol selects the wire protocol for the probe connection.
+                              Nil defaults to HTTP/1.1.
+                            type: string
                           scheme:
                             description: |-
                               Scheme to use for connecting to the host.
@@ -1367,8 +1477,9 @@ spec:
                     type: object
                   customReadinessProbe:
                     description: |-
-                      Probe describes a health check to be performed against a container to determine whether it is
-                      alive or ready to receive traffic.
+                      CustomReadinessProbe replaces the default readiness probe of the Redis
+                      container. The default probe keeps a replica not ready while it syncs
+                      with the master, or has no master.
                     properties:
                       exec:
                         description: Exec specifies a command to execute in the container.
@@ -1394,6 +1505,13 @@ spec:
                       grpc:
                         description: GRPC specifies a GRPC HealthCheckRequest.
                         properties:
+                          mode:
+                            description: |-
+                              mode specifies the connection mode for the gRPC health probe.
+                              Set to "TLS" to use TLS without certificate verification.
+                              Set to "Plaintext" to use a plaintext (insecure) connection explicitly.
+                              If not specified, the probe uses a plaintext (insecure) connection.
+                            type: string
                           port:
                             description: Port number of the gRPC service. Number must
                               be in the range 1 to 65535.
@@ -1451,6 +1569,11 @@ spec:
                               Number must be in the range 1 to 65535.
                               Name must be an IANA_SVC_NAME.
                             x-kubernetes-int-or-string: true
+                          protocol:
+                            description: |-
+                              Protocol selects the wire protocol for the probe connection.
+                              Nil defaults to HTTP/1.1.
+                            type: string
                           scheme:
                             description: |-
                               Scheme to use for connecting to the host.
@@ -1520,8 +1643,8 @@ spec:
                     type: object
                   customStartupProbe:
                     description: |-
-                      Probe describes a health check to be performed against a container to determine whether it is
-                      alive or ready to receive traffic.
+                      CustomStartupProbe is the startup probe of the Redis container. Without
+                      it, the container has a startup probe only with startupConfigMap.
                     properties:
                       exec:
                         description: Exec specifies a command to execute in the container.
@@ -1547,6 +1670,13 @@ spec:
                       grpc:
                         description: GRPC specifies a GRPC HealthCheckRequest.
                         properties:
+                          mode:
+                            description: |-
+                              mode specifies the connection mode for the gRPC health probe.
+                              Set to "TLS" to use TLS without certificate verification.
+                              Set to "Plaintext" to use a plaintext (insecure) connection explicitly.
+                              If not specified, the probe uses a plaintext (insecure) connection.
+                            type: string
                           port:
                             description: Port number of the gRPC service. Number must
                               be in the range 1 to 65535.
@@ -1604,6 +1734,11 @@ spec:
                               Number must be in the range 1 to 65535.
                               Name must be an IANA_SVC_NAME.
                             x-kubernetes-int-or-string: true
+                          protocol:
+                            description: |-
+                              Protocol selects the wire protocol for the probe connection.
+                              Nil defaults to HTTP/1.1.
+                            type: string
                           scheme:
                             description: |-
                               Scheme to use for connecting to the host.
@@ -1672,11 +1807,20 @@ spec:
                         type: integer
                     type: object
                   disablePodDisruptionBudget:
+                    description: |-
+                      DisablePodDisruptionBudget removes the PodDisruptionBudget of the Redis
+                      pods. Defaults to false.
                     type: boolean
                   dnsPolicy:
-                    description: DNSPolicy defines how a pod's DNS will be configured.
+                    description: DNSPolicy is the DNS policy of the Redis pods. Defaults
+                      to ClusterFirst.
                     type: string
                   env:
+                    description: |-
+                      Env adds environment variables to the Redis container. The operator
+                      variables REDIS_ADDR, REDIS_PORT, REDIS_USER and, with auth.secretPath,
+                      REDIS_PASSWORD replace a variable with the same name. Do not set REDIS_PASSWORD here:
+                      without auth.secretPath, the pod scripts use it as the password.
                     items:
                       description: EnvVar represents an environment variable present
                         in a Container.
@@ -1706,7 +1850,9 @@ spec:
                               description: Selects a key of a ConfigMap.
                               properties:
                                 key:
-                                  description: The key to select.
+                                  description: |-
+                                    The key to select from the ConfigMap's Data field.
+                                    Keys in the BinaryData field are not currently propagated to container env vars.
                                   type: string
                                 name:
                                   default: ""
@@ -1834,18 +1980,19 @@ spec:
                       type: object
                     type: array
                   exporter:
-                    description: Exporter defines the specification for the redis/sentinel
-                      exporter
+                    description: |-
+                      Exporter configures a metrics exporter sidecar in each Redis pod. When it
+                      is enabled, the operator also creates the Service rfr-<NAME> for its port.
                     properties:
                       args:
+                        description: Args are the arguments of the exporter container.
                         items:
                           type: string
                         type: array
                       containerSecurityContext:
                         description: |-
-                          SecurityContext holds security configuration that will be applied to a container.
-                          Some fields are present in both SecurityContext and PodSecurityContext.  When both
-                          are set, the values in SecurityContext take precedence.
+                          ContainerSecurityContext applies to the exporter container. A field
+                          that is not set keeps the default of the operator.
                         properties:
                           allowPrivilegeEscalation:
                             description: |-
@@ -1916,7 +2063,6 @@ spec:
                               procMount denotes the type of proc mount to use for the containers.
                               The default value is Default which uses the container runtime defaults for
                               readonly paths and masked paths.
-                              This requires the ProcMountType feature flag to be enabled.
                               Note that this field cannot be set when spec.os.name is windows.
                             type: string
                           readOnlyRootFilesystem:
@@ -2037,8 +2183,15 @@ spec:
                             type: object
                         type: object
                       enabled:
+                        description: Enabled adds the exporter sidecar. Defaults to
+                          false.
                         type: boolean
                       env:
+                        description: |-
+                          Env adds environment variables to the exporter container. In the Redis
+                          exporter, a REDIS_USER or REDIS_PASSWORD entry replaces the value of
+                          the operator. The variables of the operator replace other entries with
+                          the same name.
                         items:
                           description: EnvVar represents an environment variable present
                             in a Container.
@@ -2068,7 +2221,9 @@ spec:
                                   description: Selects a key of a ConfigMap.
                                   properties:
                                     key:
-                                      description: The key to select.
+                                      description: |-
+                                        The key to select from the ConfigMap's Data field.
+                                        Keys in the BinaryData field are not currently propagated to container env vars.
                                       type: string
                                     name:
                                       default: ""
@@ -2196,10 +2351,14 @@ spec:
                           type: object
                         type: array
                       image:
+                        description: |-
+                          Image is the image of the exporter container. Without a value, the
+                          operator uses its default redis_exporter image.
                         type: string
                       imagePullPolicy:
-                        description: PullPolicy describes a policy for if/when to
-                          pull a container image
+                        description: |-
+                          ImagePullPolicy is the image pull policy of the exporter container.
+                          Defaults to Always.
                         type: string
                       port:
                         description: |-
@@ -2211,8 +2370,10 @@ spec:
                         minimum: 0
                         type: integer
                       resources:
-                        description: ResourceRequirements describes the compute resource
-                          requirements.
+                        description: |-
+                          Resources replace the default resources of the exporter container:
+                          requests of 10m CPU and 50Mi memory, limits of 1000m CPU and 100Mi
+                          memory.
                         properties:
                           claims:
                             description: |-
@@ -2272,6 +2433,9 @@ spec:
                         type: object
                     type: object
                   extraContainers:
+                    description: |-
+                      ExtraContainers are more containers in each Redis pod. They get the same
+                      environment variables of the operator as initContainers.
                     items:
                       description: A single application container that you want to
                         run within a pod.
@@ -2337,7 +2501,9 @@ spec:
                                     description: Selects a key of a ConfigMap.
                                     properties:
                                       key:
-                                        description: The key to select.
+                                        description: |-
+                                          The key to select from the ConfigMap's Data field.
+                                          Keys in the BinaryData field are not currently propagated to container env vars.
                                         type: string
                                       name:
                                         default: ""
@@ -2608,6 +2774,11 @@ spec:
                                         Number must be in the range 1 to 65535.
                                         Name must be an IANA_SVC_NAME.
                                       x-kubernetes-int-or-string: true
+                                    protocol:
+                                      description: |-
+                                        Protocol selects the wire protocol for the probe connection.
+                                        Nil defaults to HTTP/1.1.
+                                      type: string
                                     scheme:
                                       description: |-
                                         Scheme to use for connecting to the host.
@@ -2721,6 +2892,11 @@ spec:
                                         Number must be in the range 1 to 65535.
                                         Name must be an IANA_SVC_NAME.
                                       x-kubernetes-int-or-string: true
+                                    protocol:
+                                      description: |-
+                                        Protocol selects the wire protocol for the probe connection.
+                                        Nil defaults to HTTP/1.1.
+                                      type: string
                                     scheme:
                                       description: |-
                                         Scheme to use for connecting to the host.
@@ -2803,6 +2979,13 @@ spec:
                             grpc:
                               description: GRPC specifies a GRPC HealthCheckRequest.
                               properties:
+                                mode:
+                                  description: |-
+                                    mode specifies the connection mode for the gRPC health probe.
+                                    Set to "TLS" to use TLS without certificate verification.
+                                    Set to "Plaintext" to use a plaintext (insecure) connection explicitly.
+                                    If not specified, the probe uses a plaintext (insecure) connection.
+                                  type: string
                                 port:
                                   description: Port number of the gRPC service. Number
                                     must be in the range 1 to 65535.
@@ -2861,6 +3044,11 @@ spec:
                                     Number must be in the range 1 to 65535.
                                     Name must be an IANA_SVC_NAME.
                                   x-kubernetes-int-or-string: true
+                                protocol:
+                                  description: |-
+                                    Protocol selects the wire protocol for the probe connection.
+                                    Nil defaults to HTTP/1.1.
+                                  type: string
                                 scheme:
                                   description: |-
                                     Scheme to use for connecting to the host.
@@ -3018,6 +3206,13 @@ spec:
                             grpc:
                               description: GRPC specifies a GRPC HealthCheckRequest.
                               properties:
+                                mode:
+                                  description: |-
+                                    mode specifies the connection mode for the gRPC health probe.
+                                    Set to "TLS" to use TLS without certificate verification.
+                                    Set to "Plaintext" to use a plaintext (insecure) connection explicitly.
+                                    If not specified, the probe uses a plaintext (insecure) connection.
+                                  type: string
                                 port:
                                   description: Port number of the gRPC service. Number
                                     must be in the range 1 to 65535.
@@ -3076,6 +3271,11 @@ spec:
                                     Number must be in the range 1 to 65535.
                                     Name must be an IANA_SVC_NAME.
                                   x-kubernetes-int-or-string: true
+                                protocol:
+                                  description: |-
+                                    Protocol selects the wire protocol for the probe connection.
+                                    Nil defaults to HTTP/1.1.
+                                  type: string
                                 scheme:
                                   description: |-
                                     Scheme to use for connecting to the host.
@@ -3377,7 +3577,6 @@ spec:
                                 procMount denotes the type of proc mount to use for the containers.
                                 The default value is Default which uses the container runtime defaults for
                                 readonly paths and masked paths.
-                                This requires the ProcMountType feature flag to be enabled.
                                 Note that this field cannot be set when spec.os.name is windows.
                               type: string
                             readOnlyRootFilesystem:
@@ -3532,6 +3731,13 @@ spec:
                             grpc:
                               description: GRPC specifies a GRPC HealthCheckRequest.
                               properties:
+                                mode:
+                                  description: |-
+                                    mode specifies the connection mode for the gRPC health probe.
+                                    Set to "TLS" to use TLS without certificate verification.
+                                    Set to "Plaintext" to use a plaintext (insecure) connection explicitly.
+                                    If not specified, the probe uses a plaintext (insecure) connection.
+                                  type: string
                                 port:
                                   description: Port number of the gRPC service. Number
                                     must be in the range 1 to 65535.
@@ -3590,6 +3796,11 @@ spec:
                                     Number must be in the range 1 to 65535.
                                     Name must be an IANA_SVC_NAME.
                                   x-kubernetes-int-or-string: true
+                                protocol:
+                                  description: |-
+                                    Protocol selects the wire protocol for the probe connection.
+                                    Nil defaults to HTTP/1.1.
+                                  type: string
                                 scheme:
                                   description: |-
                                     Scheme to use for connecting to the host.
@@ -3730,10 +3941,21 @@ spec:
                             description: VolumeMount describes a mounting of a Volume
                               within a container.
                             properties:
-                              mountPath:
+                              bindMountOptions:
                                 description: |-
-                                  Path within the container at which the volume should be mounted.  Must
-                                  not contain ':'.
+                                  bindMountOptions is the list of additional bind mount options to apply when
+                                  mounting this volume into the container. Allowed values are noexec,
+                                  nodev, and nosuid. These are Linux mount options and have no effect on
+                                  Windows nodes.
+                                  This field is not supported with image volumes.
+                                  This is an alpha field and requires enabling the VolumeBindMountOptions feature gate.
+                                items:
+                                  type: string
+                                type: array
+                                x-kubernetes-list-type: set
+                              mountPath:
+                                description: Path within the container at which the
+                                  volume should be mounted.
                                 type: string
                               mountPropagation:
                                 description: |-
@@ -3803,14 +4025,27 @@ spec:
                       type: object
                     type: array
                   extraVolumeMounts:
+                    description: ExtraVolumeMounts are more volume mounts in the Redis
+                      container.
                     items:
                       description: VolumeMount describes a mounting of a Volume within
                         a container.
                       properties:
-                        mountPath:
+                        bindMountOptions:
                           description: |-
-                            Path within the container at which the volume should be mounted.  Must
-                            not contain ':'.
+                            bindMountOptions is the list of additional bind mount options to apply when
+                            mounting this volume into the container. Allowed values are noexec,
+                            nodev, and nosuid. These are Linux mount options and have no effect on
+                            Windows nodes.
+                            This field is not supported with image volumes.
+                            This is an alpha field and requires enabling the VolumeBindMountOptions feature gate.
+                          items:
+                            type: string
+                          type: array
+                          x-kubernetes-list-type: set
+                        mountPath:
+                          description: Path within the container at which the volume
+                            should be mounted.
                           type: string
                         mountPropagation:
                           description: |-
@@ -3866,6 +4101,7 @@ spec:
                       type: object
                     type: array
                   extraVolumes:
+                    description: ExtraVolumes are more volumes in the Redis pods.
                     items:
                       description: Volume represents a named volume in a pod that
                         may be accessed by any container in the pod.
@@ -4081,6 +4317,13 @@ spec:
                                 mode, like fsGroup, and the result can be other mode bits set.
                               format: int32
                               type: integer
+                            defaultUser:
+                              description: |-
+                                defaultUser is Optional: The owner UID of the created files by default.
+                                The defaultUser field is only used as a fallback when the item-level user field is unset.
+                                (Alpha) This field requires the AtomicWriteVolumeUserFields feature gate to be enabled.
+                              format: int64
+                              type: integer
                             items:
                               description: |-
                                 items if unspecified, each key-value pair in the Data field of the referenced
@@ -4114,6 +4357,13 @@ spec:
                                       May not contain the path element '..'.
                                       May not start with the string '..'.
                                     type: string
+                                  user:
+                                    description: |-
+                                      user is Optional: The owner UID of the created file.
+                                      If specified, the item-level user field takes precedence over defaultUser.
+                                      (Alpha) This field requires the AtomicWriteVolumeUserFields feature gate to be enabled.
+                                    format: int64
+                                    type: integer
                                 required:
                                 - key
                                 - path
@@ -4201,6 +4451,13 @@ spec:
                                 mode, like fsGroup, and the result can be other mode bits set.
                               format: int32
                               type: integer
+                            defaultUser:
+                              description: |-
+                                defaultUser is Optional: The owner UID of the created files by default.
+                                The defaultUser field is only used as a fallback when the item-level user field is unset.
+                                (Alpha) This field requires the AtomicWriteVolumeUserFields feature gate to be enabled.
+                              format: int64
+                              type: integer
                             items:
                               description: Items is a list of downward API volume
                                 file
@@ -4266,6 +4523,13 @@ spec:
                                     - resource
                                     type: object
                                     x-kubernetes-map-type: atomic
+                                  user:
+                                    description: |-
+                                      user is Optional: The owner UID of the created file.
+                                      If specified, the item-level user field takes precedence over defaultUser.
+                                      (Alpha) This field requires the AtomicWriteVolumeUserFields feature gate to be enabled.
+                                    format: int64
+                                    type: integer
                                 required:
                                 - path
                                 type: object
@@ -4284,6 +4548,18 @@ spec:
                                 Must be an empty string (default) or Memory.
                                 More info: https://kubernetes.io/docs/concepts/storage/volumes#emptydir
                               type: string
+                            mode:
+                              description: |-
+                                mode specifies the permission bits for the emptyDir directory, in numeric
+                                notation (e.g., 0755, 01777). Must be a value between 0000 and 01777.
+                                If not specified, defaults to 0777.
+                                This might be in conflict with other options that affect the file
+                                mode, like fsGroup. If fsGroup is specified, the fsGroup permissions
+                                will override the mode specified here.
+                                This field has no effect on Windows.
+                                This field is alpha and requires EmptyDirVolumeMode featuregate to be enabled.
+                              format: int32
+                              type: integer
                             sizeLimit:
                               anyOf:
                               - type: integer
@@ -4377,8 +4653,8 @@ spec:
                                         * An existing PVC (PersistentVolumeClaim)
                                         If the provisioner or an external controller can support the specified data source,
                                         it will create a new volume based on the contents of the specified data source.
-                                        When the AnyVolumeDataSource feature gate is enabled, dataSource contents will be copied to dataSourceRef,
-                                        and dataSourceRef contents will be copied to dataSource when dataSourceRef.namespace is not specified.
+                                        dataSource contents will be copied to dataSourceRef, and dataSourceRef contents will be
+                                        copied to dataSource when dataSourceRef.namespace is not specified.
                                         If the namespace is specified, then dataSourceRef will not be copied to dataSource.
                                       properties:
                                         apiGroup:
@@ -4423,7 +4699,6 @@ spec:
                                           specified.
                                         * While dataSource only allows local objects, dataSourceRef allows objects
                                           in any namespaces.
-                                        (Beta) Using this field requires the AnyVolumeDataSource feature gate to be enabled.
                                         (Alpha) Using the namespace field of dataSourceRef requires the CrossNamespaceVolumeDataSource feature gate to be enabled.
                                       properties:
                                         apiGroup:
@@ -4785,7 +5060,7 @@ spec:
                             A failure to resolve or pull the image during pod startup will block containers from starting and may add significant latency. Failures will be retried using normal volume backoff and will be reported on the pod reason and message.
                             The types of objects that may be mounted by this volume are defined by the container runtime implementation on a host machine and at minimum must include all valid types supported by the container image field.
                             The OCI object gets mounted in a single directory (spec.containers[*].volumeMounts.mountPath) by merging the manifest layers in the same way as for container images.
-                            The volume will be mounted read-only (ro) and non-executable files (noexec).
+                            The volume will be mounted read-only (ro).
                             Sub path mounts for containers are not supported (spec.containers[*].volumeMounts.subpath) before 1.33.
                             The field spec.securityContext.fsGroupChangePolicy has no effect on this volume type.
                           properties:
@@ -4957,8 +5232,7 @@ spec:
                           description: |-
                             portworxVolume represents a portworx volume attached and mounted on kubelets host machine.
                             Deprecated: PortworxVolume is deprecated. All operations for the in-tree portworxVolume type
-                            are redirected to the pxd.portworx.com CSI driver when the CSIMigrationPortworx feature-gate
-                            is on.
+                            are redirected to the pxd.portworx.com CSI driver.
                           properties:
                             fsType:
                               description: |-
@@ -4991,6 +5265,13 @@ spec:
                                 This might be in conflict with other options that affect the file
                                 mode, like fsGroup, and the result can be other mode bits set.
                               format: int32
+                              type: integer
+                            defaultUser:
+                              description: |-
+                                defaultUser is Optional: The owner UID of the created files by default.
+                                The defaultUser field is only used as a fallback when the item-level user field is unset.
+                                (Alpha) This field requires the AtomicWriteVolumeUserFields feature gate to be enabled.
+                              format: int64
                               type: integer
                             sources:
                               description: |-
@@ -5091,6 +5372,13 @@ spec:
                                           Mutually-exclusive with name.  The contents of all selected
                                           ClusterTrustBundles will be unified and deduplicated.
                                         type: string
+                                      user:
+                                        description: |-
+                                          user is Optional: The owner UID of the created file.
+                                          If specified, the item-level user field takes precedence over defaultUser.
+                                          (Alpha) This field requires the AtomicWriteVolumeUserFields feature gate to be enabled.
+                                        format: int64
+                                        type: integer
                                     required:
                                     - path
                                     type: object
@@ -5131,6 +5419,13 @@ spec:
                                                 May not contain the path element '..'.
                                                 May not start with the string '..'.
                                               type: string
+                                            user:
+                                              description: |-
+                                                user is Optional: The owner UID of the created file.
+                                                If specified, the item-level user field takes precedence over defaultUser.
+                                                (Alpha) This field requires the AtomicWriteVolumeUserFields feature gate to be enabled.
+                                              format: int64
+                                              type: integer
                                           required:
                                           - key
                                           - path
@@ -5227,6 +5522,13 @@ spec:
                                               - resource
                                               type: object
                                               x-kubernetes-map-type: atomic
+                                            user:
+                                              description: |-
+                                                user is Optional: The owner UID of the created file.
+                                                If specified, the item-level user field takes precedence over defaultUser.
+                                                (Alpha) This field requires the AtomicWriteVolumeUserFields feature gate to be enabled.
+                                              format: int64
+                                              type: integer
                                           required:
                                           - path
                                           type: object
@@ -5334,6 +5636,13 @@ spec:
                                         description: Kubelet's generated CSRs will
                                           be addressed to this signer.
                                         type: string
+                                      user:
+                                        description: |-
+                                          user is Optional: The owner UID of the created file.
+                                          If specified, the item-level user field takes precedence over defaultUser.
+                                          (Alpha) This field requires the AtomicWriteVolumeUserFields feature gate to be enabled.
+                                        format: int64
+                                        type: integer
                                       userAnnotations:
                                         additionalProperties:
                                           type: string
@@ -5393,6 +5702,13 @@ spec:
                                                 May not contain the path element '..'.
                                                 May not start with the string '..'.
                                               type: string
+                                            user:
+                                              description: |-
+                                                user is Optional: The owner UID of the created file.
+                                                If specified, the item-level user field takes precedence over defaultUser.
+                                                (Alpha) This field requires the AtomicWriteVolumeUserFields feature gate to be enabled.
+                                              format: int64
+                                              type: integer
                                           required:
                                           - key
                                           - path
@@ -5440,6 +5756,13 @@ spec:
                                           path is the path relative to the mount point of the file to project the
                                           token into.
                                         type: string
+                                      user:
+                                        description: |-
+                                          user is Optional: The owner UID of the created file.
+                                          If specified, the item-level user field takes precedence over defaultUser.
+                                          (Alpha) This field requires the AtomicWriteVolumeUserFields feature gate to be enabled.
+                                        format: int64
+                                        type: integer
                                     required:
                                     - path
                                     type: object
@@ -5646,6 +5969,13 @@ spec:
                                 mode, like fsGroup, and the result can be other mode bits set.
                               format: int32
                               type: integer
+                            defaultUser:
+                              description: |-
+                                defaultUser is Optional: The owner UID of the created files by default.
+                                The defaultUser field is only used as a fallback when the item-level user field is unset.
+                                (Alpha) This field requires the AtomicWriteVolumeUserFields feature gate to be enabled.
+                              format: int64
+                              type: integer
                             items:
                               description: |-
                                 items If unspecified, each key-value pair in the Data field of the referenced
@@ -5679,6 +6009,13 @@ spec:
                                       May not contain the path element '..'.
                                       May not start with the string '..'.
                                     type: string
+                                  user:
+                                    description: |-
+                                      user is Optional: The owner UID of the created file.
+                                      If specified, the item-level user field takes precedence over defaultUser.
+                                      (Alpha) This field requires the AtomicWriteVolumeUserFields feature gate to be enabled.
+                                    format: int64
+                                    type: integer
                                 required:
                                 - key
                                 - path
@@ -5774,14 +6111,24 @@ spec:
                       type: object
                     type: array
                   hostNetwork:
+                    description: HostNetwork runs the Redis pods in the network namespace
+                      of the node.
                     type: boolean
                   image:
+                    description: |-
+                      Image is the image of the Redis container and of the init container that
+                      removes RDB tempfiles. Without a value, the operator uses its default
+                      Redis image.
                     type: string
                   imagePullPolicy:
-                    description: PullPolicy describes a policy for if/when to pull
-                      a container image
+                    description: |-
+                      ImagePullPolicy applies to the Redis container and to the init
+                      container that removes RDB tempfiles. Defaults to Always.
                     type: string
                   imagePullSecrets:
+                    description: |-
+                      ImagePullSecrets are the Secrets that the Redis pods use to pull their
+                      images.
                     items:
                       description: |-
                         LocalObjectReference contains enough information to let you locate the
@@ -5801,14 +6148,19 @@ spec:
                     type: array
                   inPlaceResize:
                     description: |-
-                      InPlaceResize controls whether redis pods whose update only changes
-                      container resources are resized in place instead of being recreated.
-                      Defaults to Enabled.
+                      InPlaceResize controls whether the operator resizes a redis pod in place
+                      when an update changes only the container resources. Otherwise the
+                      operator recreates the pod. A resize needs Kubernetes 1.33 or later, and
+                      1.35 to lower a memory limit. Defaults to Enabled.
                     enum:
                     - Enabled
                     - Disabled
                     type: string
                   initContainers:
+                    description: |-
+                      InitContainers run after the init container that removes RDB tempfiles.
+                      The operator adds REDIS_ADDR, REDIS_PORT, REDIS_USER and, with
+                      auth.secretPath, REDIS_PASSWORD to their environment.
                     items:
                       description: A single application container that you want to
                         run within a pod.
@@ -5874,7 +6226,9 @@ spec:
                                     description: Selects a key of a ConfigMap.
                                     properties:
                                       key:
-                                        description: The key to select.
+                                        description: |-
+                                          The key to select from the ConfigMap's Data field.
+                                          Keys in the BinaryData field are not currently propagated to container env vars.
                                         type: string
                                       name:
                                         default: ""
@@ -6145,6 +6499,11 @@ spec:
                                         Number must be in the range 1 to 65535.
                                         Name must be an IANA_SVC_NAME.
                                       x-kubernetes-int-or-string: true
+                                    protocol:
+                                      description: |-
+                                        Protocol selects the wire protocol for the probe connection.
+                                        Nil defaults to HTTP/1.1.
+                                      type: string
                                     scheme:
                                       description: |-
                                         Scheme to use for connecting to the host.
@@ -6258,6 +6617,11 @@ spec:
                                         Number must be in the range 1 to 65535.
                                         Name must be an IANA_SVC_NAME.
                                       x-kubernetes-int-or-string: true
+                                    protocol:
+                                      description: |-
+                                        Protocol selects the wire protocol for the probe connection.
+                                        Nil defaults to HTTP/1.1.
+                                      type: string
                                     scheme:
                                       description: |-
                                         Scheme to use for connecting to the host.
@@ -6340,6 +6704,13 @@ spec:
                             grpc:
                               description: GRPC specifies a GRPC HealthCheckRequest.
                               properties:
+                                mode:
+                                  description: |-
+                                    mode specifies the connection mode for the gRPC health probe.
+                                    Set to "TLS" to use TLS without certificate verification.
+                                    Set to "Plaintext" to use a plaintext (insecure) connection explicitly.
+                                    If not specified, the probe uses a plaintext (insecure) connection.
+                                  type: string
                                 port:
                                   description: Port number of the gRPC service. Number
                                     must be in the range 1 to 65535.
@@ -6398,6 +6769,11 @@ spec:
                                     Number must be in the range 1 to 65535.
                                     Name must be an IANA_SVC_NAME.
                                   x-kubernetes-int-or-string: true
+                                protocol:
+                                  description: |-
+                                    Protocol selects the wire protocol for the probe connection.
+                                    Nil defaults to HTTP/1.1.
+                                  type: string
                                 scheme:
                                   description: |-
                                     Scheme to use for connecting to the host.
@@ -6555,6 +6931,13 @@ spec:
                             grpc:
                               description: GRPC specifies a GRPC HealthCheckRequest.
                               properties:
+                                mode:
+                                  description: |-
+                                    mode specifies the connection mode for the gRPC health probe.
+                                    Set to "TLS" to use TLS without certificate verification.
+                                    Set to "Plaintext" to use a plaintext (insecure) connection explicitly.
+                                    If not specified, the probe uses a plaintext (insecure) connection.
+                                  type: string
                                 port:
                                   description: Port number of the gRPC service. Number
                                     must be in the range 1 to 65535.
@@ -6613,6 +6996,11 @@ spec:
                                     Number must be in the range 1 to 65535.
                                     Name must be an IANA_SVC_NAME.
                                   x-kubernetes-int-or-string: true
+                                protocol:
+                                  description: |-
+                                    Protocol selects the wire protocol for the probe connection.
+                                    Nil defaults to HTTP/1.1.
+                                  type: string
                                 scheme:
                                   description: |-
                                     Scheme to use for connecting to the host.
@@ -6914,7 +7302,6 @@ spec:
                                 procMount denotes the type of proc mount to use for the containers.
                                 The default value is Default which uses the container runtime defaults for
                                 readonly paths and masked paths.
-                                This requires the ProcMountType feature flag to be enabled.
                                 Note that this field cannot be set when spec.os.name is windows.
                               type: string
                             readOnlyRootFilesystem:
@@ -7069,6 +7456,13 @@ spec:
                             grpc:
                               description: GRPC specifies a GRPC HealthCheckRequest.
                               properties:
+                                mode:
+                                  description: |-
+                                    mode specifies the connection mode for the gRPC health probe.
+                                    Set to "TLS" to use TLS without certificate verification.
+                                    Set to "Plaintext" to use a plaintext (insecure) connection explicitly.
+                                    If not specified, the probe uses a plaintext (insecure) connection.
+                                  type: string
                                 port:
                                   description: Port number of the gRPC service. Number
                                     must be in the range 1 to 65535.
@@ -7127,6 +7521,11 @@ spec:
                                     Number must be in the range 1 to 65535.
                                     Name must be an IANA_SVC_NAME.
                                   x-kubernetes-int-or-string: true
+                                protocol:
+                                  description: |-
+                                    Protocol selects the wire protocol for the probe connection.
+                                    Nil defaults to HTTP/1.1.
+                                  type: string
                                 scheme:
                                   description: |-
                                     Scheme to use for connecting to the host.
@@ -7267,10 +7666,21 @@ spec:
                             description: VolumeMount describes a mounting of a Volume
                               within a container.
                             properties:
-                              mountPath:
+                              bindMountOptions:
                                 description: |-
-                                  Path within the container at which the volume should be mounted.  Must
-                                  not contain ':'.
+                                  bindMountOptions is the list of additional bind mount options to apply when
+                                  mounting this volume into the container. Allowed values are noexec,
+                                  nodev, and nosuid. These are Linux mount options and have no effect on
+                                  Windows nodes.
+                                  This field is not supported with image volumes.
+                                  This is an alpha field and requires enabling the VolumeBindMountOptions feature gate.
+                                items:
+                                  type: string
+                                type: array
+                                x-kubernetes-list-type: set
+                              mountPath:
+                                description: Path within the container at which the
+                                  volume should be mounted.
                                 type: string
                               mountPropagation:
                                 description: |-
@@ -7341,16 +7751,22 @@ spec:
                     type: array
                   instanceManagerImage:
                     description: |-
-                      InstanceManagerImage is the image containing the redis-instance binary.
-                      When specified, the instance manager runs as PID 1 and manages Redis,
-                      following the CloudNativePG model. This enables RDB cleanup on startup
-                      and proper signal handling for graceful shutdown.
-                      See: https://cloudnative-pg.io/documentation/current/instance_manager/
+                      InstanceManagerImage is the image that holds the redis-instance binary.
+                      An init container copies the binary from this image to a shared volume,
+                      and the Redis container runs it as PID 1. The manager removes the RDB
+                      tempfiles before Redis starts, serves the health endpoints that the
+                      probes use, and forwards the stop signals. Without a value, the
+                      operator uses DefaultInstanceManagerImage.
                     type: string
                   maxMemory:
                     description: |-
                       MaxMemory lets the operator set maxmemory and maxmemory-policy from the
                       redis container's memory limit. Values set in customConfig take precedence.
+                      It needs a memory limit of at least 64Mi. It uses the smallest limit of
+                      all redis pods, because a failover can promote any replica. It sets
+                      replica-ignore-maxmemory yes, so customConfig cannot set it to no.
+                      Only an allkeys-* policy lowers maxmemory below the memory in use. With
+                      another policy, the operator keeps the old value and holds the pod rollout.
                     properties:
                       percent:
                         description: |-
@@ -7376,10 +7792,16 @@ spec:
                   nodeSelector:
                     additionalProperties:
                       type: string
+                    description: NodeSelector limits the Redis pods to the nodes with
+                      these labels.
                     type: object
                   podAnnotations:
                     additionalProperties:
                       type: string
+                    description: |-
+                      PodAnnotations are annotations that the operator adds to the Redis pods.
+                      The operator also sets the annotation redisfailovers.databases.spotahome.com/secret-checksum, so
+                      that a password change restarts the pods.
                     type: object
                   podDisruptionBudgetMinAvailable:
                     anyOf:
@@ -7390,23 +7812,32 @@ spec:
                       minAvailable for the redis pods. Defaults to 2 (or 1 when replicas <= 2).
                     x-kubernetes-int-or-string: true
                   port:
+                    description: |-
+                      Port is the Redis port in each pod and in the Services rfrm-<NAME> and
+                      rfrs-<NAME>. Defaults to 6379.
                     format: int32
                     type: integer
                   preventMasterEviction:
                     description: |-
                       PreventMasterEviction, when true, annotates the current master pod with
                       cluster-autoscaler.kubernetes.io/safe-to-evict=false so the cluster
-                      autoscaler will not drain the node running the master. Slaves are marked
-                      evictable. Defaults to false.
+                      autoscaler does not drain the node of the master. The operator marks the
+                      replicas as evictable. Defaults to false.
                     type: boolean
                   priorityClassName:
+                    description: |-
+                      PriorityClassName is the PriorityClass of the Redis pods. The operator
+                      does not create the PriorityClass.
                     type: string
                   replicas:
+                    description: Replicas is the number of Redis pods. Defaults to
+                      3.
                     format: int32
                     type: integer
                   resources:
-                    description: ResourceRequirements describes the compute resource
-                      requirements.
+                    description: |-
+                      Resources are the compute resources of the Redis container. maxMemory
+                      and autoscaling use its memory limit.
                     properties:
                       claims:
                         description: |-
@@ -7466,9 +7897,9 @@ spec:
                     type: object
                   securityContext:
                     description: |-
-                      PodSecurityContext holds pod-level security attributes and common container settings.
-                      Some fields are also present in container.securityContext.  Field values of
-                      container.securityContext take precedence over field values of PodSecurityContext.
+                      SecurityContext is the pod security context of the Redis pods. A field
+                      that is not set keeps the default of the operator: user, group and
+                      fsGroup 1000, runAsNonRoot and the RuntimeDefault seccomp profile.
                     properties:
                       appArmorProfile:
                         description: |-
@@ -7561,11 +7992,8 @@ spec:
                           Eligible volumes are in-tree FibreChannel and iSCSI volumes, and all CSI volumes
                           whose CSI driver announces SELinux support by setting spec.seLinuxMount: true in their
                           CSIDriver instance. Other volumes are always re-labelled recursively.
-                          "MountOption" value is allowed only when SELinuxMount feature gate is enabled.
 
-                          If not specified and SELinuxMount feature gate is enabled, "MountOption" is used.
-                          If not specified and SELinuxMount feature gate is disabled, "MountOption" is used for ReadWriteOncePod volumes
-                          and "Recursive" for all other volumes.
+                          If not specified, "MountOption" is used.
 
                           This field affects only Pods that have SELinux label set, either in PodSecurityContext or in SecurityContext of all containers.
 
@@ -7700,23 +8128,41 @@ spec:
                         type: object
                     type: object
                   serviceAccountName:
+                    description: |-
+                      ServiceAccountName is the ServiceAccount of the Redis pods, which the
+                      user creates. Without a value, the pods use the default ServiceAccount
+                      and do not mount its token.
                     type: string
                   serviceAnnotations:
                     additionalProperties:
                       type: string
+                    description: |-
+                      ServiceAnnotations are annotations that the operator adds to the
+                      Services rfr-<NAME>, rfrm-<NAME> and rfrs-<NAME>. On rfr-<NAME>, they replace a default prometheus.io
+                      annotation with the same key.
                     type: object
                   shutdownConfigMap:
+                    description: |-
+                      ShutdownConfigMap is the name of a ConfigMap with a shutdown.sh key, in
+                      the namespace of the RedisFailover. Its script replaces the default
+                      preStop script, also the write pause before a Sentinel failover. The
+                      ConfigMap must exist, or the reconcile fails.
                     type: string
                   startupConfigMap:
+                    description: |-
+                      StartupConfigMap is the name of a ConfigMap with a startup.sh key. The
+                      operator mounts it at /redis-startup and runs the script as the startup
+                      probe, unless customStartupProbe is set.
                     type: string
                   storage:
-                    description: RedisStorage defines the structure used to store
-                      the Redis Data
+                    description: |-
+                      Storage configures the data volume at /data. Without a value, it is an
+                      emptyDir, so Kubernetes deletes the data with the pod.
                     properties:
                       emptyDir:
                         description: |-
-                          Represents an empty directory for a pod.
-                          Empty directory volumes support ownership management and SELinux relabeling.
+                          EmptyDir configures the emptyDir data volume, for example its medium or
+                          sizeLimit. The operator ignores it when persistentVolumeClaim is set.
                         properties:
                           medium:
                             description: |-
@@ -7725,6 +8171,18 @@ spec:
                               Must be an empty string (default) or Memory.
                               More info: https://kubernetes.io/docs/concepts/storage/volumes#emptydir
                             type: string
+                          mode:
+                            description: |-
+                              mode specifies the permission bits for the emptyDir directory, in numeric
+                              notation (e.g., 0755, 01777). Must be a value between 0000 and 01777.
+                              If not specified, defaults to 0777.
+                              This might be in conflict with other options that affect the file
+                              mode, like fsGroup. If fsGroup is specified, the fsGroup permissions
+                              will override the mode specified here.
+                              This field has no effect on Windows.
+                              This field is alpha and requires EmptyDirVolumeMode featuregate to be enabled.
+                            format: int32
+                            type: integer
                           sizeLimit:
                             anyOf:
                             - type: integer
@@ -7740,11 +8198,18 @@ spec:
                             x-kubernetes-int-or-string: true
                         type: object
                       keepAfterDeletion:
+                        description: |-
+                          KeepAfterDeletion keeps the PVCs when Kubernetes deletes the
+                          RedisFailover. The operator removes the owner reference of the
+                          RedisFailover from the PVCs. When the field is false again, the operator
+                          does not add the owner reference.
                         type: boolean
                       persistentVolumeClaim:
                         description: |-
-                          EmbeddedPersistentVolumeClaim is an embedded version of k8s.io/api/core/v1.PersistentVolumeClaim.
-                          It contains TypeMeta and a reduced ObjectMeta.
+                          PersistentVolumeClaim is the volume claim template of the Redis
+                          StatefulSet. The operator increases the storage request of the PVCs to
+                          a larger request here. It does not make a PVC smaller. The operator
+                          ignores other changes to the claim.
                         properties:
                           apiVersion:
                             description: |-
@@ -7762,8 +8227,8 @@ spec:
                               More info: https://git.k8s.io/community/contributors/devel/sig-architecture/api-conventions.md#types-kinds
                             type: string
                           metadata:
-                            description: EmbeddedMetadata contains metadata relevant
-                              to an EmbeddedResource.
+                            description: EmbeddedObjectMetadata holds the name, the
+                              labels and the annotations of the PVC.
                             properties:
                               annotations:
                                 additionalProperties:
@@ -7813,8 +8278,8 @@ spec:
                                   * An existing PVC (PersistentVolumeClaim)
                                   If the provisioner or an external controller can support the specified data source,
                                   it will create a new volume based on the contents of the specified data source.
-                                  When the AnyVolumeDataSource feature gate is enabled, dataSource contents will be copied to dataSourceRef,
-                                  and dataSourceRef contents will be copied to dataSource when dataSourceRef.namespace is not specified.
+                                  dataSource contents will be copied to dataSourceRef, and dataSourceRef contents will be
+                                  copied to dataSource when dataSourceRef.namespace is not specified.
                                   If the namespace is specified, then dataSourceRef will not be copied to dataSource.
                                 properties:
                                   apiGroup:
@@ -7859,7 +8324,6 @@ spec:
                                     specified.
                                   * While dataSource only allows local objects, dataSourceRef allows objects
                                     in any namespaces.
-                                  (Beta) Using this field requires the AnyVolumeDataSource feature gate to be enabled.
                                   (Alpha) Using the namespace field of dataSourceRef requires the CrossNamespaceVolumeDataSource feature gate to be enabled.
                                 properties:
                                   apiGroup:
@@ -8153,6 +8617,55 @@ spec:
                                   currentVolumeAttributesClassName is the current name of the VolumeAttributesClass the PVC is using.
                                   When unset, there is no VolumeAttributeClass applied to this PersistentVolumeClaim
                                 type: string
+                              healthStatus:
+                                description: |-
+                                  healthStatus contains the latest controller-reported health information
+                                  for the volume bound to this claim.
+                                properties:
+                                  healthConditions:
+                                    description: |-
+                                      conditions is the set of adverse conditions reported by
+                                      the CSI controller plugin. An empty list means no adverse condition.
+                                      At most 16 conditions may be reported.
+                                    items:
+                                      description: VolumeHealthCondition represents
+                                        an adverse health condition reported for a
+                                        volume.
+                                      properties:
+                                        message:
+                                          description: |-
+                                            message is a human-readable description.
+                                            Maximum permitted length of a message is 1024 bytes.
+                                          type: string
+                                        reason:
+                                          description: |-
+                                            reason is a brief CamelCase machine-parseable reason.
+                                            Together with status it forms the unique identity of a condition entry.
+                                            Maximum permitted length of a reason is 256 bytes.
+                                          type: string
+                                        status:
+                                          description: |-
+                                            status is the machine-parseable health category.
+                                            Possible values:
+                                            - "Inaccessible": the volume cannot be accessed.
+                                            - "DataLoss": data loss has been detected on the volume.
+                                            - "Degraded": the volume is functioning with reduced capability.
+                                          type: string
+                                      required:
+                                      - reason
+                                      - status
+                                      type: object
+                                    type: array
+                                    x-kubernetes-list-map-keys:
+                                    - status
+                                    - reason
+                                    x-kubernetes-list-type: map
+                                  lastTransitionTime:
+                                    description: lastTransitionTime is when the current
+                                      set of conditions first appeared.
+                                    format: date-time
+                                    type: string
+                                type: object
                               modifyVolumeStatus:
                                 description: |-
                                   ModifyVolumeStatus represents the status object of ControllerModifyVolume operation.
@@ -8189,9 +8702,14 @@ spec:
                         type: object
                     type: object
                   terminationGracePeriod:
+                    description: |-
+                      TerminationGracePeriodSeconds is the grace period of the Redis pods in
+                      seconds. Defaults to 30. The shutdown script must end in this time. It
+                      needs the time of its SAVE, plus about 19s with Sentinel.
                     format: int64
                     type: integer
                   tolerations:
+                    description: Tolerations are the tolerations of the Redis pods.
                     items:
                       description: |-
                         The pod this Toleration is attached to tolerates any taint that matches
@@ -8231,6 +8749,9 @@ spec:
                       type: object
                     type: array
                   topologySpreadConstraints:
+                    description: |-
+                      TopologySpreadConstraints are the topology spread constraints of the
+                      Redis pods.
                     items:
                       description: TopologySpreadConstraint specifies how to spread
                         matching pods among the given topology.
@@ -8405,11 +8926,15 @@ spec:
                     type: array
                 type: object
               sentinel:
-                description: SentinelSettings defines the specification of the sentinel
-                  cluster
+                description: |-
+                  Sentinel configures the Sentinel Deployment rfs-<NAME>, and selects
+                  whether Sentinel or the operator does the failover.
                 properties:
                   affinity:
-                    description: Affinity is a group of affinity scheduling rules.
+                    description: |-
+                      Affinity replaces the default affinity of the Sentinel pods. The default
+                      is a preferred pod anti-affinity, so the scheduler tries to put each
+                      Sentinel pod on a different node.
                     properties:
                       nodeAffinity:
                         description: Describes node affinity scheduling rules for
@@ -9328,18 +9853,19 @@ spec:
                         type: object
                     type: object
                   command:
+                    description: |-
+                      Command replaces the default Sentinel command, redis-server
+                      /redis/sentinel.conf --sentinel.
                     items:
                       type: string
                     type: array
                   configCopy:
-                    description: SentinelConfigCopy defines the specification for
-                      the sentinel exporter
+                    description: ConfigCopy configures the init container sentinel-config-copy.
                     properties:
                       containerSecurityContext:
                         description: |-
-                          SecurityContext holds security configuration that will be applied to a container.
-                          Some fields are present in both SecurityContext and PodSecurityContext.  When both
-                          are set, the values in SecurityContext take precedence.
+                          ContainerSecurityContext applies to the init container. A field that is
+                          not set keeps the default of the operator.
                         properties:
                           allowPrivilegeEscalation:
                             description: |-
@@ -9410,7 +9936,6 @@ spec:
                               procMount denotes the type of proc mount to use for the containers.
                               The default value is Default which uses the container runtime defaults for
                               readonly paths and masked paths.
-                              This requires the ProcMountType feature flag to be enabled.
                               Note that this field cannot be set when spec.os.name is windows.
                             type: string
                           readOnlyRootFilesystem:
@@ -9533,9 +10058,9 @@ spec:
                     type: object
                   containerSecurityContext:
                     description: |-
-                      SecurityContext holds security configuration that will be applied to a container.
-                      Some fields are present in both SecurityContext and PodSecurityContext.  When both
-                      are set, the values in SecurityContext take precedence.
+                      ContainerSecurityContext applies to the Sentinel container. A field that
+                      is not set keeps the default of the operator. A capabilities value
+                      replaces the default drop of ALL.
                     properties:
                       allowPrivilegeEscalation:
                         description: |-
@@ -9606,7 +10131,6 @@ spec:
                           procMount denotes the type of proc mount to use for the containers.
                           The default value is Default which uses the container runtime defaults for
                           readonly paths and masked paths.
-                          This requires the ProcMountType feature flag to be enabled.
                           Note that this field cannot be set when spec.os.name is windows.
                         type: string
                       readOnlyRootFilesystem:
@@ -9727,13 +10251,18 @@ spec:
                         type: object
                     type: object
                   customConfig:
+                    description: |-
+                      CustomConfig is a list of "parameter value" entries. The operator
+                      applies each entry with SENTINEL SET mymaster on each Sentinel. It adds
+                      down-after-milliseconds 5000 and failover-timeout 10000, unless the
+                      list sets them.
                     items:
                       type: string
                     type: array
                   customLivenessProbe:
                     description: |-
-                      Probe describes a health check to be performed against a container to determine whether it is
-                      alive or ready to receive traffic.
+                      CustomLivenessProbe replaces the default liveness probe of the Sentinel
+                      container, which sends PING.
                     properties:
                       exec:
                         description: Exec specifies a command to execute in the container.
@@ -9759,6 +10288,13 @@ spec:
                       grpc:
                         description: GRPC specifies a GRPC HealthCheckRequest.
                         properties:
+                          mode:
+                            description: |-
+                              mode specifies the connection mode for the gRPC health probe.
+                              Set to "TLS" to use TLS without certificate verification.
+                              Set to "Plaintext" to use a plaintext (insecure) connection explicitly.
+                              If not specified, the probe uses a plaintext (insecure) connection.
+                            type: string
                           port:
                             description: Port number of the gRPC service. Number must
                               be in the range 1 to 65535.
@@ -9816,6 +10352,11 @@ spec:
                               Number must be in the range 1 to 65535.
                               Name must be an IANA_SVC_NAME.
                             x-kubernetes-int-or-string: true
+                          protocol:
+                            description: |-
+                              Protocol selects the wire protocol for the probe connection.
+                              Nil defaults to HTTP/1.1.
+                            type: string
                           scheme:
                             description: |-
                               Scheme to use for connecting to the host.
@@ -9885,8 +10426,9 @@ spec:
                     type: object
                   customReadinessProbe:
                     description: |-
-                      Probe describes a health check to be performed against a container to determine whether it is
-                      alive or ready to receive traffic.
+                      CustomReadinessProbe replaces the default readiness probe of the
+                      Sentinel container. The default probe keeps a Sentinel not ready until
+                      it monitors a master and SENTINEL CKQUORUM succeeds.
                     properties:
                       exec:
                         description: Exec specifies a command to execute in the container.
@@ -9912,6 +10454,13 @@ spec:
                       grpc:
                         description: GRPC specifies a GRPC HealthCheckRequest.
                         properties:
+                          mode:
+                            description: |-
+                              mode specifies the connection mode for the gRPC health probe.
+                              Set to "TLS" to use TLS without certificate verification.
+                              Set to "Plaintext" to use a plaintext (insecure) connection explicitly.
+                              If not specified, the probe uses a plaintext (insecure) connection.
+                            type: string
                           port:
                             description: Port number of the gRPC service. Number must
                               be in the range 1 to 65535.
@@ -9969,6 +10518,11 @@ spec:
                               Number must be in the range 1 to 65535.
                               Name must be an IANA_SVC_NAME.
                             x-kubernetes-int-or-string: true
+                          protocol:
+                            description: |-
+                              Protocol selects the wire protocol for the probe connection.
+                              Nil defaults to HTTP/1.1.
+                            type: string
                           scheme:
                             description: |-
                               Scheme to use for connecting to the host.
@@ -10038,8 +10592,9 @@ spec:
                     type: object
                   customStartupProbe:
                     description: |-
-                      Probe describes a health check to be performed against a container to determine whether it is
-                      alive or ready to receive traffic.
+                      CustomStartupProbe is the startup probe of the Sentinel container.
+                      Without it, the container has a startup probe only with
+                      startupConfigMap.
                     properties:
                       exec:
                         description: Exec specifies a command to execute in the container.
@@ -10065,6 +10620,13 @@ spec:
                       grpc:
                         description: GRPC specifies a GRPC HealthCheckRequest.
                         properties:
+                          mode:
+                            description: |-
+                              mode specifies the connection mode for the gRPC health probe.
+                              Set to "TLS" to use TLS without certificate verification.
+                              Set to "Plaintext" to use a plaintext (insecure) connection explicitly.
+                              If not specified, the probe uses a plaintext (insecure) connection.
+                            type: string
                           port:
                             description: Port number of the gRPC service. Number must
                               be in the range 1 to 65535.
@@ -10122,6 +10684,11 @@ spec:
                               Number must be in the range 1 to 65535.
                               Name must be an IANA_SVC_NAME.
                             x-kubernetes-int-or-string: true
+                          protocol:
+                            description: |-
+                              Protocol selects the wire protocol for the probe connection.
+                              Nil defaults to HTTP/1.1.
+                            type: string
                           scheme:
                             description: |-
                               Scheme to use for connecting to the host.
@@ -10190,16 +10757,24 @@ spec:
                         type: integer
                     type: object
                   disablePodDisruptionBudget:
+                    description: |-
+                      DisablePodDisruptionBudget removes the PodDisruptionBudget of the
+                      Sentinel pods. Defaults to false.
                     type: boolean
                   dnsPolicy:
-                    description: DNSPolicy defines how a pod's DNS will be configured.
+                    description: |-
+                      DNSPolicy is the DNS policy of the Sentinel pods. Defaults to
+                      ClusterFirst.
                     type: string
                   enabled:
                     description: |-
-                      Enabled controls whether Sentinel is deployed. When false, the operator
-                      manages failover instead of Sentinel. Defaults to true.
+                      Enabled deploys Sentinel, and Sentinel does the failover. When false,
+                      the operator does the failover. Defaults to false.
                     type: boolean
                   env:
+                    description: |-
+                      Env adds environment variables to the Sentinel container. The operator
+                      adds no variables of its own to this container.
                     items:
                       description: EnvVar represents an environment variable present
                         in a Container.
@@ -10229,7 +10804,9 @@ spec:
                               description: Selects a key of a ConfigMap.
                               properties:
                                 key:
-                                  description: The key to select.
+                                  description: |-
+                                    The key to select from the ConfigMap's Data field.
+                                    Keys in the BinaryData field are not currently propagated to container env vars.
                                   type: string
                                 name:
                                   default: ""
@@ -10357,18 +10934,19 @@ spec:
                       type: object
                     type: array
                   exporter:
-                    description: Exporter defines the specification for the redis/sentinel
-                      exporter
+                    description: |-
+                      Exporter configures a metrics exporter sidecar in each Sentinel pod. When
+                      it is enabled, the Service rfs-<NAME> also exposes its port.
                     properties:
                       args:
+                        description: Args are the arguments of the exporter container.
                         items:
                           type: string
                         type: array
                       containerSecurityContext:
                         description: |-
-                          SecurityContext holds security configuration that will be applied to a container.
-                          Some fields are present in both SecurityContext and PodSecurityContext.  When both
-                          are set, the values in SecurityContext take precedence.
+                          ContainerSecurityContext applies to the exporter container. A field
+                          that is not set keeps the default of the operator.
                         properties:
                           allowPrivilegeEscalation:
                             description: |-
@@ -10439,7 +11017,6 @@ spec:
                               procMount denotes the type of proc mount to use for the containers.
                               The default value is Default which uses the container runtime defaults for
                               readonly paths and masked paths.
-                              This requires the ProcMountType feature flag to be enabled.
                               Note that this field cannot be set when spec.os.name is windows.
                             type: string
                           readOnlyRootFilesystem:
@@ -10560,8 +11137,15 @@ spec:
                             type: object
                         type: object
                       enabled:
+                        description: Enabled adds the exporter sidecar. Defaults to
+                          false.
                         type: boolean
                       env:
+                        description: |-
+                          Env adds environment variables to the exporter container. In the Redis
+                          exporter, a REDIS_USER or REDIS_PASSWORD entry replaces the value of
+                          the operator. The variables of the operator replace other entries with
+                          the same name.
                         items:
                           description: EnvVar represents an environment variable present
                             in a Container.
@@ -10591,7 +11175,9 @@ spec:
                                   description: Selects a key of a ConfigMap.
                                   properties:
                                     key:
-                                      description: The key to select.
+                                      description: |-
+                                        The key to select from the ConfigMap's Data field.
+                                        Keys in the BinaryData field are not currently propagated to container env vars.
                                       type: string
                                     name:
                                       default: ""
@@ -10719,10 +11305,14 @@ spec:
                           type: object
                         type: array
                       image:
+                        description: |-
+                          Image is the image of the exporter container. Without a value, the
+                          operator uses its default redis_exporter image.
                         type: string
                       imagePullPolicy:
-                        description: PullPolicy describes a policy for if/when to
-                          pull a container image
+                        description: |-
+                          ImagePullPolicy is the image pull policy of the exporter container.
+                          Defaults to Always.
                         type: string
                       port:
                         description: |-
@@ -10734,8 +11324,10 @@ spec:
                         minimum: 0
                         type: integer
                       resources:
-                        description: ResourceRequirements describes the compute resource
-                          requirements.
+                        description: |-
+                          Resources replace the default resources of the exporter container:
+                          requests of 10m CPU and 50Mi memory, limits of 1000m CPU and 100Mi
+                          memory.
                         properties:
                           claims:
                             description: |-
@@ -10795,6 +11387,8 @@ spec:
                         type: object
                     type: object
                   extraContainers:
+                    description: ExtraContainers are more containers in each Sentinel
+                      pod.
                     items:
                       description: A single application container that you want to
                         run within a pod.
@@ -10860,7 +11454,9 @@ spec:
                                     description: Selects a key of a ConfigMap.
                                     properties:
                                       key:
-                                        description: The key to select.
+                                        description: |-
+                                          The key to select from the ConfigMap's Data field.
+                                          Keys in the BinaryData field are not currently propagated to container env vars.
                                         type: string
                                       name:
                                         default: ""
@@ -11131,6 +11727,11 @@ spec:
                                         Number must be in the range 1 to 65535.
                                         Name must be an IANA_SVC_NAME.
                                       x-kubernetes-int-or-string: true
+                                    protocol:
+                                      description: |-
+                                        Protocol selects the wire protocol for the probe connection.
+                                        Nil defaults to HTTP/1.1.
+                                      type: string
                                     scheme:
                                       description: |-
                                         Scheme to use for connecting to the host.
@@ -11244,6 +11845,11 @@ spec:
                                         Number must be in the range 1 to 65535.
                                         Name must be an IANA_SVC_NAME.
                                       x-kubernetes-int-or-string: true
+                                    protocol:
+                                      description: |-
+                                        Protocol selects the wire protocol for the probe connection.
+                                        Nil defaults to HTTP/1.1.
+                                      type: string
                                     scheme:
                                       description: |-
                                         Scheme to use for connecting to the host.
@@ -11326,6 +11932,13 @@ spec:
                             grpc:
                               description: GRPC specifies a GRPC HealthCheckRequest.
                               properties:
+                                mode:
+                                  description: |-
+                                    mode specifies the connection mode for the gRPC health probe.
+                                    Set to "TLS" to use TLS without certificate verification.
+                                    Set to "Plaintext" to use a plaintext (insecure) connection explicitly.
+                                    If not specified, the probe uses a plaintext (insecure) connection.
+                                  type: string
                                 port:
                                   description: Port number of the gRPC service. Number
                                     must be in the range 1 to 65535.
@@ -11384,6 +11997,11 @@ spec:
                                     Number must be in the range 1 to 65535.
                                     Name must be an IANA_SVC_NAME.
                                   x-kubernetes-int-or-string: true
+                                protocol:
+                                  description: |-
+                                    Protocol selects the wire protocol for the probe connection.
+                                    Nil defaults to HTTP/1.1.
+                                  type: string
                                 scheme:
                                   description: |-
                                     Scheme to use for connecting to the host.
@@ -11541,6 +12159,13 @@ spec:
                             grpc:
                               description: GRPC specifies a GRPC HealthCheckRequest.
                               properties:
+                                mode:
+                                  description: |-
+                                    mode specifies the connection mode for the gRPC health probe.
+                                    Set to "TLS" to use TLS without certificate verification.
+                                    Set to "Plaintext" to use a plaintext (insecure) connection explicitly.
+                                    If not specified, the probe uses a plaintext (insecure) connection.
+                                  type: string
                                 port:
                                   description: Port number of the gRPC service. Number
                                     must be in the range 1 to 65535.
@@ -11599,6 +12224,11 @@ spec:
                                     Number must be in the range 1 to 65535.
                                     Name must be an IANA_SVC_NAME.
                                   x-kubernetes-int-or-string: true
+                                protocol:
+                                  description: |-
+                                    Protocol selects the wire protocol for the probe connection.
+                                    Nil defaults to HTTP/1.1.
+                                  type: string
                                 scheme:
                                   description: |-
                                     Scheme to use for connecting to the host.
@@ -11900,7 +12530,6 @@ spec:
                                 procMount denotes the type of proc mount to use for the containers.
                                 The default value is Default which uses the container runtime defaults for
                                 readonly paths and masked paths.
-                                This requires the ProcMountType feature flag to be enabled.
                                 Note that this field cannot be set when spec.os.name is windows.
                               type: string
                             readOnlyRootFilesystem:
@@ -12055,6 +12684,13 @@ spec:
                             grpc:
                               description: GRPC specifies a GRPC HealthCheckRequest.
                               properties:
+                                mode:
+                                  description: |-
+                                    mode specifies the connection mode for the gRPC health probe.
+                                    Set to "TLS" to use TLS without certificate verification.
+                                    Set to "Plaintext" to use a plaintext (insecure) connection explicitly.
+                                    If not specified, the probe uses a plaintext (insecure) connection.
+                                  type: string
                                 port:
                                   description: Port number of the gRPC service. Number
                                     must be in the range 1 to 65535.
@@ -12113,6 +12749,11 @@ spec:
                                     Number must be in the range 1 to 65535.
                                     Name must be an IANA_SVC_NAME.
                                   x-kubernetes-int-or-string: true
+                                protocol:
+                                  description: |-
+                                    Protocol selects the wire protocol for the probe connection.
+                                    Nil defaults to HTTP/1.1.
+                                  type: string
                                 scheme:
                                   description: |-
                                     Scheme to use for connecting to the host.
@@ -12253,10 +12894,21 @@ spec:
                             description: VolumeMount describes a mounting of a Volume
                               within a container.
                             properties:
-                              mountPath:
+                              bindMountOptions:
                                 description: |-
-                                  Path within the container at which the volume should be mounted.  Must
-                                  not contain ':'.
+                                  bindMountOptions is the list of additional bind mount options to apply when
+                                  mounting this volume into the container. Allowed values are noexec,
+                                  nodev, and nosuid. These are Linux mount options and have no effect on
+                                  Windows nodes.
+                                  This field is not supported with image volumes.
+                                  This is an alpha field and requires enabling the VolumeBindMountOptions feature gate.
+                                items:
+                                  type: string
+                                type: array
+                                x-kubernetes-list-type: set
+                              mountPath:
+                                description: Path within the container at which the
+                                  volume should be mounted.
                                 type: string
                               mountPropagation:
                                 description: |-
@@ -12326,14 +12978,27 @@ spec:
                       type: object
                     type: array
                   extraVolumeMounts:
+                    description: ExtraVolumeMounts are more volume mounts in the Sentinel
+                      container.
                     items:
                       description: VolumeMount describes a mounting of a Volume within
                         a container.
                       properties:
-                        mountPath:
+                        bindMountOptions:
                           description: |-
-                            Path within the container at which the volume should be mounted.  Must
-                            not contain ':'.
+                            bindMountOptions is the list of additional bind mount options to apply when
+                            mounting this volume into the container. Allowed values are noexec,
+                            nodev, and nosuid. These are Linux mount options and have no effect on
+                            Windows nodes.
+                            This field is not supported with image volumes.
+                            This is an alpha field and requires enabling the VolumeBindMountOptions feature gate.
+                          items:
+                            type: string
+                          type: array
+                          x-kubernetes-list-type: set
+                        mountPath:
+                          description: Path within the container at which the volume
+                            should be mounted.
                           type: string
                         mountPropagation:
                           description: |-
@@ -12389,6 +13054,7 @@ spec:
                       type: object
                     type: array
                   extraVolumes:
+                    description: ExtraVolumes are more volumes in the Sentinel pods.
                     items:
                       description: Volume represents a named volume in a pod that
                         may be accessed by any container in the pod.
@@ -12604,6 +13270,13 @@ spec:
                                 mode, like fsGroup, and the result can be other mode bits set.
                               format: int32
                               type: integer
+                            defaultUser:
+                              description: |-
+                                defaultUser is Optional: The owner UID of the created files by default.
+                                The defaultUser field is only used as a fallback when the item-level user field is unset.
+                                (Alpha) This field requires the AtomicWriteVolumeUserFields feature gate to be enabled.
+                              format: int64
+                              type: integer
                             items:
                               description: |-
                                 items if unspecified, each key-value pair in the Data field of the referenced
@@ -12637,6 +13310,13 @@ spec:
                                       May not contain the path element '..'.
                                       May not start with the string '..'.
                                     type: string
+                                  user:
+                                    description: |-
+                                      user is Optional: The owner UID of the created file.
+                                      If specified, the item-level user field takes precedence over defaultUser.
+                                      (Alpha) This field requires the AtomicWriteVolumeUserFields feature gate to be enabled.
+                                    format: int64
+                                    type: integer
                                 required:
                                 - key
                                 - path
@@ -12724,6 +13404,13 @@ spec:
                                 mode, like fsGroup, and the result can be other mode bits set.
                               format: int32
                               type: integer
+                            defaultUser:
+                              description: |-
+                                defaultUser is Optional: The owner UID of the created files by default.
+                                The defaultUser field is only used as a fallback when the item-level user field is unset.
+                                (Alpha) This field requires the AtomicWriteVolumeUserFields feature gate to be enabled.
+                              format: int64
+                              type: integer
                             items:
                               description: Items is a list of downward API volume
                                 file
@@ -12789,6 +13476,13 @@ spec:
                                     - resource
                                     type: object
                                     x-kubernetes-map-type: atomic
+                                  user:
+                                    description: |-
+                                      user is Optional: The owner UID of the created file.
+                                      If specified, the item-level user field takes precedence over defaultUser.
+                                      (Alpha) This field requires the AtomicWriteVolumeUserFields feature gate to be enabled.
+                                    format: int64
+                                    type: integer
                                 required:
                                 - path
                                 type: object
@@ -12807,6 +13501,18 @@ spec:
                                 Must be an empty string (default) or Memory.
                                 More info: https://kubernetes.io/docs/concepts/storage/volumes#emptydir
                               type: string
+                            mode:
+                              description: |-
+                                mode specifies the permission bits for the emptyDir directory, in numeric
+                                notation (e.g., 0755, 01777). Must be a value between 0000 and 01777.
+                                If not specified, defaults to 0777.
+                                This might be in conflict with other options that affect the file
+                                mode, like fsGroup. If fsGroup is specified, the fsGroup permissions
+                                will override the mode specified here.
+                                This field has no effect on Windows.
+                                This field is alpha and requires EmptyDirVolumeMode featuregate to be enabled.
+                              format: int32
+                              type: integer
                             sizeLimit:
                               anyOf:
                               - type: integer
@@ -12900,8 +13606,8 @@ spec:
                                         * An existing PVC (PersistentVolumeClaim)
                                         If the provisioner or an external controller can support the specified data source,
                                         it will create a new volume based on the contents of the specified data source.
-                                        When the AnyVolumeDataSource feature gate is enabled, dataSource contents will be copied to dataSourceRef,
-                                        and dataSourceRef contents will be copied to dataSource when dataSourceRef.namespace is not specified.
+                                        dataSource contents will be copied to dataSourceRef, and dataSourceRef contents will be
+                                        copied to dataSource when dataSourceRef.namespace is not specified.
                                         If the namespace is specified, then dataSourceRef will not be copied to dataSource.
                                       properties:
                                         apiGroup:
@@ -12946,7 +13652,6 @@ spec:
                                           specified.
                                         * While dataSource only allows local objects, dataSourceRef allows objects
                                           in any namespaces.
-                                        (Beta) Using this field requires the AnyVolumeDataSource feature gate to be enabled.
                                         (Alpha) Using the namespace field of dataSourceRef requires the CrossNamespaceVolumeDataSource feature gate to be enabled.
                                       properties:
                                         apiGroup:
@@ -13308,7 +14013,7 @@ spec:
                             A failure to resolve or pull the image during pod startup will block containers from starting and may add significant latency. Failures will be retried using normal volume backoff and will be reported on the pod reason and message.
                             The types of objects that may be mounted by this volume are defined by the container runtime implementation on a host machine and at minimum must include all valid types supported by the container image field.
                             The OCI object gets mounted in a single directory (spec.containers[*].volumeMounts.mountPath) by merging the manifest layers in the same way as for container images.
-                            The volume will be mounted read-only (ro) and non-executable files (noexec).
+                            The volume will be mounted read-only (ro).
                             Sub path mounts for containers are not supported (spec.containers[*].volumeMounts.subpath) before 1.33.
                             The field spec.securityContext.fsGroupChangePolicy has no effect on this volume type.
                           properties:
@@ -13480,8 +14185,7 @@ spec:
                           description: |-
                             portworxVolume represents a portworx volume attached and mounted on kubelets host machine.
                             Deprecated: PortworxVolume is deprecated. All operations for the in-tree portworxVolume type
-                            are redirected to the pxd.portworx.com CSI driver when the CSIMigrationPortworx feature-gate
-                            is on.
+                            are redirected to the pxd.portworx.com CSI driver.
                           properties:
                             fsType:
                               description: |-
@@ -13514,6 +14218,13 @@ spec:
                                 This might be in conflict with other options that affect the file
                                 mode, like fsGroup, and the result can be other mode bits set.
                               format: int32
+                              type: integer
+                            defaultUser:
+                              description: |-
+                                defaultUser is Optional: The owner UID of the created files by default.
+                                The defaultUser field is only used as a fallback when the item-level user field is unset.
+                                (Alpha) This field requires the AtomicWriteVolumeUserFields feature gate to be enabled.
+                              format: int64
                               type: integer
                             sources:
                               description: |-
@@ -13614,6 +14325,13 @@ spec:
                                           Mutually-exclusive with name.  The contents of all selected
                                           ClusterTrustBundles will be unified and deduplicated.
                                         type: string
+                                      user:
+                                        description: |-
+                                          user is Optional: The owner UID of the created file.
+                                          If specified, the item-level user field takes precedence over defaultUser.
+                                          (Alpha) This field requires the AtomicWriteVolumeUserFields feature gate to be enabled.
+                                        format: int64
+                                        type: integer
                                     required:
                                     - path
                                     type: object
@@ -13654,6 +14372,13 @@ spec:
                                                 May not contain the path element '..'.
                                                 May not start with the string '..'.
                                               type: string
+                                            user:
+                                              description: |-
+                                                user is Optional: The owner UID of the created file.
+                                                If specified, the item-level user field takes precedence over defaultUser.
+                                                (Alpha) This field requires the AtomicWriteVolumeUserFields feature gate to be enabled.
+                                              format: int64
+                                              type: integer
                                           required:
                                           - key
                                           - path
@@ -13750,6 +14475,13 @@ spec:
                                               - resource
                                               type: object
                                               x-kubernetes-map-type: atomic
+                                            user:
+                                              description: |-
+                                                user is Optional: The owner UID of the created file.
+                                                If specified, the item-level user field takes precedence over defaultUser.
+                                                (Alpha) This field requires the AtomicWriteVolumeUserFields feature gate to be enabled.
+                                              format: int64
+                                              type: integer
                                           required:
                                           - path
                                           type: object
@@ -13857,6 +14589,13 @@ spec:
                                         description: Kubelet's generated CSRs will
                                           be addressed to this signer.
                                         type: string
+                                      user:
+                                        description: |-
+                                          user is Optional: The owner UID of the created file.
+                                          If specified, the item-level user field takes precedence over defaultUser.
+                                          (Alpha) This field requires the AtomicWriteVolumeUserFields feature gate to be enabled.
+                                        format: int64
+                                        type: integer
                                       userAnnotations:
                                         additionalProperties:
                                           type: string
@@ -13916,6 +14655,13 @@ spec:
                                                 May not contain the path element '..'.
                                                 May not start with the string '..'.
                                               type: string
+                                            user:
+                                              description: |-
+                                                user is Optional: The owner UID of the created file.
+                                                If specified, the item-level user field takes precedence over defaultUser.
+                                                (Alpha) This field requires the AtomicWriteVolumeUserFields feature gate to be enabled.
+                                              format: int64
+                                              type: integer
                                           required:
                                           - key
                                           - path
@@ -13963,6 +14709,13 @@ spec:
                                           path is the path relative to the mount point of the file to project the
                                           token into.
                                         type: string
+                                      user:
+                                        description: |-
+                                          user is Optional: The owner UID of the created file.
+                                          If specified, the item-level user field takes precedence over defaultUser.
+                                          (Alpha) This field requires the AtomicWriteVolumeUserFields feature gate to be enabled.
+                                        format: int64
+                                        type: integer
                                     required:
                                     - path
                                     type: object
@@ -14169,6 +14922,13 @@ spec:
                                 mode, like fsGroup, and the result can be other mode bits set.
                               format: int32
                               type: integer
+                            defaultUser:
+                              description: |-
+                                defaultUser is Optional: The owner UID of the created files by default.
+                                The defaultUser field is only used as a fallback when the item-level user field is unset.
+                                (Alpha) This field requires the AtomicWriteVolumeUserFields feature gate to be enabled.
+                              format: int64
+                              type: integer
                             items:
                               description: |-
                                 items If unspecified, each key-value pair in the Data field of the referenced
@@ -14202,6 +14962,13 @@ spec:
                                       May not contain the path element '..'.
                                       May not start with the string '..'.
                                     type: string
+                                  user:
+                                    description: |-
+                                      user is Optional: The owner UID of the created file.
+                                      If specified, the item-level user field takes precedence over defaultUser.
+                                      (Alpha) This field requires the AtomicWriteVolumeUserFields feature gate to be enabled.
+                                    format: int64
+                                    type: integer
                                 required:
                                 - key
                                 - path
@@ -14298,18 +15065,30 @@ spec:
                     type: array
                   failoverTimeout:
                     description: |-
-                      FailoverTimeout is how long to wait before promoting a replica when
-                      operator-managed failover is used (sentinel.enabled=false). Defaults to 10s.
+                      FailoverTimeout applies only when enabled is false. It is the time that the
+                      operator waits for a master that does not answer while its pod runs.
+                      Thus a short stall causes no failover. A master that is gone or not found
+                      gets no wait. Defaults to 10s; 0s disables the wait.
                     type: string
                   hostNetwork:
+                    description: HostNetwork runs the Sentinel pods in the network
+                      namespace of the node.
                     type: boolean
                   image:
+                    description: |-
+                      Image is the image of the Sentinel container and of the init container
+                      that copies sentinel.conf. Without a value, the operator uses its
+                      default Redis image.
                     type: string
                   imagePullPolicy:
-                    description: PullPolicy describes a policy for if/when to pull
-                      a container image
+                    description: |-
+                      ImagePullPolicy applies to the Sentinel container and to the init
+                      container that copies sentinel.conf. Defaults to Always.
                     type: string
                   imagePullSecrets:
+                    description: |-
+                      ImagePullSecrets are the Secrets that the Sentinel pods use to pull
+                      their images.
                     items:
                       description: |-
                         LocalObjectReference contains enough information to let you locate the
@@ -14328,6 +15107,8 @@ spec:
                       x-kubernetes-map-type: atomic
                     type: array
                   initContainers:
+                    description: InitContainers run after the init container that
+                      copies sentinel.conf.
                     items:
                       description: A single application container that you want to
                         run within a pod.
@@ -14393,7 +15174,9 @@ spec:
                                     description: Selects a key of a ConfigMap.
                                     properties:
                                       key:
-                                        description: The key to select.
+                                        description: |-
+                                          The key to select from the ConfigMap's Data field.
+                                          Keys in the BinaryData field are not currently propagated to container env vars.
                                         type: string
                                       name:
                                         default: ""
@@ -14664,6 +15447,11 @@ spec:
                                         Number must be in the range 1 to 65535.
                                         Name must be an IANA_SVC_NAME.
                                       x-kubernetes-int-or-string: true
+                                    protocol:
+                                      description: |-
+                                        Protocol selects the wire protocol for the probe connection.
+                                        Nil defaults to HTTP/1.1.
+                                      type: string
                                     scheme:
                                       description: |-
                                         Scheme to use for connecting to the host.
@@ -14777,6 +15565,11 @@ spec:
                                         Number must be in the range 1 to 65535.
                                         Name must be an IANA_SVC_NAME.
                                       x-kubernetes-int-or-string: true
+                                    protocol:
+                                      description: |-
+                                        Protocol selects the wire protocol for the probe connection.
+                                        Nil defaults to HTTP/1.1.
+                                      type: string
                                     scheme:
                                       description: |-
                                         Scheme to use for connecting to the host.
@@ -14859,6 +15652,13 @@ spec:
                             grpc:
                               description: GRPC specifies a GRPC HealthCheckRequest.
                               properties:
+                                mode:
+                                  description: |-
+                                    mode specifies the connection mode for the gRPC health probe.
+                                    Set to "TLS" to use TLS without certificate verification.
+                                    Set to "Plaintext" to use a plaintext (insecure) connection explicitly.
+                                    If not specified, the probe uses a plaintext (insecure) connection.
+                                  type: string
                                 port:
                                   description: Port number of the gRPC service. Number
                                     must be in the range 1 to 65535.
@@ -14917,6 +15717,11 @@ spec:
                                     Number must be in the range 1 to 65535.
                                     Name must be an IANA_SVC_NAME.
                                   x-kubernetes-int-or-string: true
+                                protocol:
+                                  description: |-
+                                    Protocol selects the wire protocol for the probe connection.
+                                    Nil defaults to HTTP/1.1.
+                                  type: string
                                 scheme:
                                   description: |-
                                     Scheme to use for connecting to the host.
@@ -15074,6 +15879,13 @@ spec:
                             grpc:
                               description: GRPC specifies a GRPC HealthCheckRequest.
                               properties:
+                                mode:
+                                  description: |-
+                                    mode specifies the connection mode for the gRPC health probe.
+                                    Set to "TLS" to use TLS without certificate verification.
+                                    Set to "Plaintext" to use a plaintext (insecure) connection explicitly.
+                                    If not specified, the probe uses a plaintext (insecure) connection.
+                                  type: string
                                 port:
                                   description: Port number of the gRPC service. Number
                                     must be in the range 1 to 65535.
@@ -15132,6 +15944,11 @@ spec:
                                     Number must be in the range 1 to 65535.
                                     Name must be an IANA_SVC_NAME.
                                   x-kubernetes-int-or-string: true
+                                protocol:
+                                  description: |-
+                                    Protocol selects the wire protocol for the probe connection.
+                                    Nil defaults to HTTP/1.1.
+                                  type: string
                                 scheme:
                                   description: |-
                                     Scheme to use for connecting to the host.
@@ -15433,7 +16250,6 @@ spec:
                                 procMount denotes the type of proc mount to use for the containers.
                                 The default value is Default which uses the container runtime defaults for
                                 readonly paths and masked paths.
-                                This requires the ProcMountType feature flag to be enabled.
                                 Note that this field cannot be set when spec.os.name is windows.
                               type: string
                             readOnlyRootFilesystem:
@@ -15588,6 +16404,13 @@ spec:
                             grpc:
                               description: GRPC specifies a GRPC HealthCheckRequest.
                               properties:
+                                mode:
+                                  description: |-
+                                    mode specifies the connection mode for the gRPC health probe.
+                                    Set to "TLS" to use TLS without certificate verification.
+                                    Set to "Plaintext" to use a plaintext (insecure) connection explicitly.
+                                    If not specified, the probe uses a plaintext (insecure) connection.
+                                  type: string
                                 port:
                                   description: Port number of the gRPC service. Number
                                     must be in the range 1 to 65535.
@@ -15646,6 +16469,11 @@ spec:
                                     Number must be in the range 1 to 65535.
                                     Name must be an IANA_SVC_NAME.
                                   x-kubernetes-int-or-string: true
+                                protocol:
+                                  description: |-
+                                    Protocol selects the wire protocol for the probe connection.
+                                    Nil defaults to HTTP/1.1.
+                                  type: string
                                 scheme:
                                   description: |-
                                     Scheme to use for connecting to the host.
@@ -15786,10 +16614,21 @@ spec:
                             description: VolumeMount describes a mounting of a Volume
                               within a container.
                             properties:
-                              mountPath:
+                              bindMountOptions:
                                 description: |-
-                                  Path within the container at which the volume should be mounted.  Must
-                                  not contain ':'.
+                                  bindMountOptions is the list of additional bind mount options to apply when
+                                  mounting this volume into the container. Allowed values are noexec,
+                                  nodev, and nosuid. These are Linux mount options and have no effect on
+                                  Windows nodes.
+                                  This field is not supported with image volumes.
+                                  This is an alpha field and requires enabling the VolumeBindMountOptions feature gate.
+                                items:
+                                  type: string
+                                type: array
+                                x-kubernetes-list-type: set
+                              mountPath:
+                                description: Path within the container at which the
+                                  volume should be mounted.
                                 type: string
                               mountPropagation:
                                 description: |-
@@ -15861,10 +16700,15 @@ spec:
                   nodeSelector:
                     additionalProperties:
                       type: string
+                    description: NodeSelector limits the Sentinel pods to the nodes
+                      with these labels.
                     type: object
                   podAnnotations:
                     additionalProperties:
                       type: string
+                    description: |-
+                      PodAnnotations are annotations that the operator adds to the Sentinel
+                      pods.
                     type: object
                   podDisruptionBudgetMinAvailable:
                     anyOf:
@@ -15876,13 +16720,19 @@ spec:
                       replicas <= 2).
                     x-kubernetes-int-or-string: true
                   priorityClassName:
+                    description: |-
+                      PriorityClassName is the PriorityClass of the Sentinel pods. The
+                      operator does not create the PriorityClass.
                     type: string
                   replicas:
+                    description: |-
+                      Replicas is the number of Sentinel pods. Defaults to 3. The quorum of
+                      the Sentinels is replicas / 2 + 1.
                     format: int32
                     type: integer
                   resources:
-                    description: ResourceRequirements describes the compute resource
-                      requirements.
+                    description: Resources are the compute resources of the Sentinel
+                      container.
                     properties:
                       claims:
                         description: |-
@@ -15942,9 +16792,9 @@ spec:
                     type: object
                   securityContext:
                     description: |-
-                      PodSecurityContext holds pod-level security attributes and common container settings.
-                      Some fields are also present in container.securityContext.  Field values of
-                      container.securityContext take precedence over field values of PodSecurityContext.
+                      SecurityContext is the pod security context of the Sentinel pods. A
+                      field that is not set keeps the default of the operator, as in
+                      redis.securityContext.
                     properties:
                       appArmorProfile:
                         description: |-
@@ -16037,11 +16887,8 @@ spec:
                           Eligible volumes are in-tree FibreChannel and iSCSI volumes, and all CSI volumes
                           whose CSI driver announces SELinux support by setting spec.seLinuxMount: true in their
                           CSIDriver instance. Other volumes are always re-labelled recursively.
-                          "MountOption" value is allowed only when SELinuxMount feature gate is enabled.
 
-                          If not specified and SELinuxMount feature gate is enabled, "MountOption" is used.
-                          If not specified and SELinuxMount feature gate is disabled, "MountOption" is used for ReadWriteOncePod volumes
-                          and "Recursive" for all other volumes.
+                          If not specified, "MountOption" is used.
 
                           This field affects only Pods that have SELinux label set, either in PodSecurityContext or in SecurityContext of all containers.
 
@@ -16176,18 +17023,29 @@ spec:
                         type: object
                     type: object
                   serviceAccountName:
+                    description: |-
+                      ServiceAccountName is the ServiceAccount of the Sentinel pods, which the
+                      user creates. Without a value, the operator creates the ServiceAccount
+                      rfs-sa-<NAME>, and the pods do not mount its token.
                     type: string
                   serviceAnnotations:
                     additionalProperties:
                       type: string
+                    description: |-
+                      ServiceAnnotations are annotations that the operator adds to the
+                      Sentinel Service rfs-<NAME>.
                     type: object
                   startupConfigMap:
+                    description: |-
+                      StartupConfigMap is the name of a ConfigMap with a startup.sh key. The
+                      operator mounts it at /sentinel-startup and runs the script as the
+                      startup probe, unless customStartupProbe is set.
                     type: string
                   strategy:
                     description: |-
-                      Strategy overrides the sentinel Deployment update strategy (e.g. to set
-                      rollingUpdate maxSurge/maxUnavailable). Defaults to the Kubernetes default
-                      RollingUpdate strategy when unset.
+                      Strategy overrides the update strategy of the sentinel Deployment, for
+                      example to set rollingUpdate maxSurge and maxUnavailable. Defaults to the
+                      Kubernetes default RollingUpdate strategy.
                     properties:
                       rollingUpdate:
                         description: |-
@@ -16234,6 +17092,7 @@ spec:
                         type: string
                     type: object
                   tolerations:
+                    description: Tolerations are the tolerations of the Sentinel pods.
                     items:
                       description: |-
                         The pod this Toleration is attached to tolerates any taint that matches
@@ -16273,6 +17132,9 @@ spec:
                       type: object
                     type: array
                   topologySpreadConstraints:
+                    description: |-
+                      TopologySpreadConstraints are the topology spread constraints of the
+                      Sentinel pods.
                     items:
                       description: TopologySpreadConstraint specifies how to spread
                         matching pods among the given topology.
@@ -16448,12 +17310,68 @@ spec:
                 type: object
             type: object
           status:
+            description: Status is the state that the operator found in its last reconcile.
             properties:
+              autoscaling:
+                description: |-
+                  Autoscaling is the last result of redis.autoscaling. It is empty when
+                  the mode is Off.
+                properties:
+                  effectiveMemory:
+                    description: |-
+                      EffectiveMemory is the memory limit of the redis container when it
+                      differs from redis.resources.limits.memory.
+                    type: string
+                  evaluatedAt:
+                    description: |-
+                      EvaluatedAt is the RFC3339 time, in full minutes, of the last change of
+                      the recommendation or of highWindows.
+                    type: string
+                  highWindows:
+                    description: |-
+                      HighWindows is the number of consecutive 5-minute windows with high
+                      memory use, 3 at most.
+                    format: int32
+                    type: integer
+                  lastStep:
+                    description: |-
+                      LastStep is the RFC3339 time, in full minutes, of the start of the
+                      last step.
+                    type: string
+                  phase:
+                    description: |-
+                      Phase is the phase of the last autoscaler step: Idle, Applying, Done,
+                      Reverted or Held.
+                    type: string
+                  reason:
+                    description: Reason tells why the autoscaler recommends a change
+                      or no change.
+                    type: string
+                  recommendedMemory:
+                    description: |-
+                      RecommendedMemory is the memory limit that the autoscaler recommends.
+                      It is empty when the autoscaler recommends no change.
+                    type: string
+                  retryAfter:
+                    description: |-
+                      RetryAfter is the RFC3339 time, in full minutes, after which a step
+                      can start again after a revert.
+                    type: string
+                  workload:
+                    description: Workload is Store or Cache.
+                    type: string
+                type: object
               lastChanged:
+                description: LastChanged is the RFC3339 time of the last change of
+                  state.
                 type: string
               message:
+                description: |-
+                  Message gives the reason for a NotHealthy state. With a Healthy state,
+                  it can show a wait of the operator, for example in a pod rollout.
                 type: string
               state:
+                description: State is Healthy or NotHealthy.
                 type: string
             type: object
         required:
@@ -16461,4 +17379,5 @@ spec:
         type: object
     served: true
     storage: true
-    subresources: {}
+    subresources:
+      status: {}

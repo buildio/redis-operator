@@ -1,4 +1,3 @@
-// Package run implements the instance manager run command.
 package run
 
 import (
@@ -7,18 +6,21 @@ import (
 	"fmt"
 	"net"
 	"net/http"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
 
 	"github.com/go-redis/redis/v8"
+
+	"github.com/saremox/redis-operator/version"
 )
 
 const (
-	defaultHealthPort    = 8080
-	healthCheckInterval  = time.Second
-	redisConnectTimeout  = 2 * time.Second
-	redisCommandTimeout  = time.Second
+	defaultHealthPort   = 8080
+	healthCheckInterval = time.Second
+	redisConnectTimeout = 2 * time.Second
+	redisCommandTimeout = time.Second
 )
 
 // HealthServer provides HTTP health endpoints for the instance manager.
@@ -30,22 +32,23 @@ type HealthServer struct {
 	redisPort     string
 	redisPassword string
 	server        *http.Server
+	listenAddr    net.Addr
 	client        *redis.Client
 
 	// Cached status (updated every healthCheckInterval)
-	mu            sync.RWMutex
-	lastCheck     time.Time
-	cachedInfo    map[string]string
-	redisPid      int
-	startTime     time.Time
-	cleanupDone   bool
+	mu          sync.RWMutex
+	lastCheck   time.Time
+	cachedInfo  map[string]string
+	redisPid    int
+	startTime   time.Time
+	cleanupDone bool
 
 	// Atomic flags
-	redisHealthy  atomic.Bool
-	redisReady    atomic.Bool
+	redisHealthy atomic.Bool
+	redisReady   atomic.Bool
 }
 
-// HealthResponse is the response for /healthz endpoint
+// HealthResponse is the response for /healthz endpoint.
 type HealthResponse struct {
 	Status        string `json:"status"`
 	RedisPID      int    `json:"redis_pid,omitempty"`
@@ -53,24 +56,24 @@ type HealthResponse struct {
 	Error         string `json:"error,omitempty"`
 }
 
-// ReadyResponse is the response for /readyz endpoint
+// ReadyResponse is the response for /readyz endpoint.
 type ReadyResponse struct {
-	Status           string `json:"status"`
-	Role             string `json:"role,omitempty"`
-	ConnectedClients int    `json:"connected_clients,omitempty"`
-	Loading          bool   `json:"loading"`
-	MasterSyncInProgress bool `json:"master_sync_in_progress,omitempty"`
-	Error            string `json:"error,omitempty"`
+	Status               string `json:"status"`
+	Role                 string `json:"role,omitempty"`
+	ConnectedClients     int    `json:"connected_clients,omitempty"`
+	Loading              bool   `json:"loading"`
+	MasterSyncInProgress bool   `json:"master_sync_in_progress,omitempty"`
+	Error                string `json:"error,omitempty"`
 }
 
-// StatusResponse is the detailed response for /status endpoint
+// StatusResponse is the detailed response for /status endpoint.
 type StatusResponse struct {
 	Redis           RedisStatus           `json:"redis"`
 	Replication     ReplicationStatus     `json:"replication"`
 	InstanceManager InstanceManagerStatus `json:"instance_manager"`
 }
 
-// RedisStatus contains Redis server status
+// RedisStatus contains Redis server status.
 type RedisStatus struct {
 	PID                  int    `json:"pid"`
 	Role                 string `json:"role"`
@@ -82,28 +85,28 @@ type RedisStatus struct {
 	AOFRewriteInProgress bool   `json:"aof_rewrite_in_progress"`
 }
 
-// ReplicationStatus contains replication information
+// ReplicationStatus contains replication information.
 type ReplicationStatus struct {
-	Role                  string `json:"role"`
-	ConnectedSlaves       int    `json:"connected_slaves,omitempty"`
-	MasterHost            string `json:"master_host,omitempty"`
-	MasterPort            int    `json:"master_port,omitempty"`
-	MasterLinkStatus      string `json:"master_link_status,omitempty"`
-	MasterSyncInProgress  bool   `json:"master_sync_in_progress,omitempty"`
-	SlaveReplOffset       int64  `json:"slave_repl_offset,omitempty"`
-	MasterReplOffset      int64  `json:"master_repl_offset,omitempty"`
+	Role                 string `json:"role"`
+	ConnectedSlaves      int    `json:"connected_slaves,omitempty"`
+	MasterHost           string `json:"master_host,omitempty"`
+	MasterPort           int    `json:"master_port,omitempty"`
+	MasterLinkStatus     string `json:"master_link_status,omitempty"`
+	MasterSyncInProgress bool   `json:"master_sync_in_progress,omitempty"`
+	SlaveReplOffset      int64  `json:"slave_repl_offset,omitempty"`
+	MasterReplOffset     int64  `json:"master_repl_offset,omitempty"`
 }
 
-// InstanceManagerStatus contains instance manager status
+// InstanceManagerStatus contains instance manager status.
 type InstanceManagerStatus struct {
-	Version               string `json:"version"`
-	UptimeSeconds         int64  `json:"uptime_seconds"`
-	StartupCleanupDone    bool   `json:"startup_cleanup_done"`
-	HealthPort            int    `json:"health_port"`
+	Version            string `json:"version"`
+	UptimeSeconds      int64  `json:"uptime_seconds"`
+	StartupCleanupDone bool   `json:"startup_cleanup_done"`
+	HealthPort         int    `json:"health_port"`
 }
 
-// NewHealthServer creates a new health server
-func NewHealthServer(port int, redisPort string, redisPassword string) *HealthServer {
+// NewHealthServer creates a new health server.
+func NewHealthServer(port int, redisPort, redisPassword string) *HealthServer {
 	return &HealthServer{
 		port:          port,
 		redisAddr:     "127.0.0.1",
@@ -114,22 +117,32 @@ func NewHealthServer(port int, redisPort string, redisPassword string) *HealthSe
 	}
 }
 
-// SetRedisPID updates the Redis process ID
+// SetRedisPID updates the Redis process ID.
 func (h *HealthServer) SetRedisPID(pid int) {
 	h.mu.Lock()
 	defer h.mu.Unlock()
 	h.redisPid = pid
 }
 
-// SetCleanupDone marks startup cleanup as complete
+// SetCleanupDone marks startup cleanup as complete.
 func (h *HealthServer) SetCleanupDone(done bool) {
 	h.mu.Lock()
 	defer h.mu.Unlock()
 	h.cleanupDone = done
 }
 
-// Start begins the health server and background health checker
+// Start begins the health server and background health checker.
+// It returns an error if it cannot bind the health port.
 func (h *HealthServer) Start(ctx context.Context) error {
+	// Bind before anything else, so that a bind failure gets to the caller
+	// and Start leaves nothing to clean up.
+	addr := fmt.Sprintf(":%d", h.port)
+	listener, err := (&net.ListenConfig{}).Listen(ctx, "tcp", addr)
+	if err != nil {
+		return fmt.Errorf("failed to listen on %s: %w", addr, err)
+	}
+	h.listenAddr = listener.Addr()
+
 	// Create Redis client
 	h.client = redis.NewClient(&redis.Options{
 		Addr:         net.JoinHostPort(h.redisAddr, h.redisPort),
@@ -146,7 +159,7 @@ func (h *HealthServer) Start(ctx context.Context) error {
 	mux.HandleFunc("/status", h.handleStatus)
 
 	h.server = &http.Server{
-		Addr:         fmt.Sprintf(":%d", h.port),
+		Addr:         addr,
 		Handler:      mux,
 		ReadTimeout:  5 * time.Second,
 		WriteTimeout: 5 * time.Second,
@@ -158,7 +171,7 @@ func (h *HealthServer) Start(ctx context.Context) error {
 	// Start HTTP server
 	fmt.Printf("redis-instance: starting health server on port %d\n", h.port)
 	go func() {
-		if err := h.server.ListenAndServe(); err != nil && err != http.ErrServerClosed {
+		if err := h.server.Serve(listener); err != nil && err != http.ErrServerClosed {
 			fmt.Printf("redis-instance: health server error: %v\n", err)
 		}
 	}()
@@ -166,7 +179,7 @@ func (h *HealthServer) Start(ctx context.Context) error {
 	return nil
 }
 
-// Stop gracefully stops the health server
+// Stop gracefully stops the health server.
 func (h *HealthServer) Stop(ctx context.Context) error {
 	if h.server != nil {
 		if err := h.server.Shutdown(ctx); err != nil {
@@ -181,7 +194,7 @@ func (h *HealthServer) Stop(ctx context.Context) error {
 	return nil
 }
 
-// runHealthChecker periodically checks Redis health and caches the results
+// runHealthChecker periodically checks Redis health and caches the results.
 func (h *HealthServer) runHealthChecker(ctx context.Context) {
 	ticker := time.NewTicker(healthCheckInterval)
 	defer ticker.Stop()
@@ -196,7 +209,7 @@ func (h *HealthServer) runHealthChecker(ctx context.Context) {
 	}
 }
 
-// updateHealthStatus checks Redis and updates cached status
+// updateHealthStatus checks Redis and updates cached status.
 func (h *HealthServer) updateHealthStatus(ctx context.Context) {
 	checkCtx, cancel := context.WithTimeout(ctx, redisCommandTimeout)
 	defer cancel()
@@ -241,7 +254,7 @@ func (h *HealthServer) updateHealthStatus(ctx context.Context) {
 	h.redisReady.Store(ready)
 }
 
-// handleHealthz handles the /healthz liveness endpoint
+// handleHealthz handles the /healthz liveness endpoint.
 func (h *HealthServer) handleHealthz(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodGet {
 		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
@@ -273,7 +286,7 @@ func (h *HealthServer) handleHealthz(w http.ResponseWriter, r *http.Request) {
 	_ = json.NewEncoder(w).Encode(resp)
 }
 
-// handleReadyz handles the /readyz readiness endpoint
+// handleReadyz handles the /readyz readiness endpoint.
 func (h *HealthServer) handleReadyz(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodGet {
 		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
@@ -318,7 +331,7 @@ func (h *HealthServer) handleReadyz(w http.ResponseWriter, r *http.Request) {
 	_ = json.NewEncoder(w).Encode(resp)
 }
 
-// handleStatus handles the /status detailed status endpoint
+// handleStatus handles the /status detailed status endpoint.
 func (h *HealthServer) handleStatus(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodGet {
 		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
@@ -348,7 +361,7 @@ func (h *HealthServer) handleStatus(w http.ResponseWriter, r *http.Request) {
 			MasterSyncInProgress: info["master_sync_in_progress"] == "1",
 		},
 		InstanceManager: InstanceManagerStatus{
-			Version:            "4.0.0",
+			Version:            version.Version,
 			UptimeSeconds:      int64(time.Since(h.startTime).Seconds()),
 			StartupCleanupDone: cleanupDone,
 			HealthPort:         h.port,
@@ -367,7 +380,7 @@ func (h *HealthServer) handleStatus(w http.ResponseWriter, r *http.Request) {
 	_ = json.NewEncoder(w).Encode(resp)
 }
 
-// parseRedisInfo parses Redis INFO command output into a map
+// parseRedisInfo parses Redis INFO command output into a map.
 func parseRedisInfo(info string) map[string]string {
 	result := make(map[string]string)
 	lines := splitLines(info)
@@ -379,7 +392,7 @@ func parseRedisInfo(info string) map[string]string {
 		}
 
 		// Parse key:value
-		idx := indexByte(line, ':')
+		idx := strings.IndexByte(line, ':')
 		if idx > 0 {
 			key := line[:idx]
 			value := line[idx+1:]
@@ -390,7 +403,7 @@ func parseRedisInfo(info string) map[string]string {
 	return result
 }
 
-// splitLines splits a string by newlines
+// splitLines splits a string by newlines.
 func splitLines(s string) []string {
 	var lines []string
 	start := 0
@@ -413,14 +426,4 @@ func splitLines(s string) []string {
 		lines = append(lines, line)
 	}
 	return lines
-}
-
-// indexByte returns the index of the first occurrence of c in s, or -1
-func indexByte(s string, c byte) int {
-	for i := 0; i < len(s); i++ {
-		if s[i] == c {
-			return i
-		}
-	}
-	return -1
 }

@@ -2,11 +2,11 @@
 
 ## Project Overview
 
-This repository is a Kubernetes operator that creates, configures, and manages Redis Failover clusters (Redis + Sentinel) on Kubernetes. It is a fork of `spotahome/redis-operator`.
+This repository is a Kubernetes operator that creates, configures, and manages Redis Failover clusters on Kubernetes. By default, the operator manages failover itself. With `sentinel.enabled: true`, Redis Sentinel does the failover. It is a fork of `spotahome/redis-operator`.
 
 - **Language**: Go (module: `github.com/saremox/redis-operator`)
 - **Go version**: See `go.mod` for the current version
-- **Kubernetes API**: Uses `k8s.io/client-go` and the custom CRD `RedisFailover` (group: `databases.spotahome.com/v1`)
+- **Kubernetes API**: Uses `k8s.io/client-go` and the custom CRD `RedisFailover` (group: `databases.spotahome.com`, version: `v1`)
 
 ## Repository Structure
 
@@ -34,7 +34,8 @@ make ci-unit-test
 # or directly:
 go test $(go list ./... | grep -v /vendor/) -v
 
-# Run integration tests (requires a running Kubernetes cluster)
+# Run integration tests. They need a Kubernetes cluster with the RedisFailover CRD,
+# and a host route to the pod IPs.
 make ci-integration-test
 
 # Lint
@@ -52,12 +53,13 @@ make helm-test
 - All Kubernetes resource manipulation must go through the service layer (`service/` package), not directly in the operator
 - Unit tests use `github.com/stretchr/testify` (assert/require); mock interfaces are in `mocks/` and generated with `go generate`
 - Keep generated code (`client/`, `mocks/`) separate from hand-written code; regenerate with `make update-codegen` or `make generate`
+- Write documentation, comments and pull request descriptions as `docs/writing.md` says (ASD-STE100: the why, short sentences, no fluff)
 
 ## CRD and API Changes
 
 - The `RedisFailover` CRD spec is defined in `api/redisfailover/v1/types.go`
-- Default values are set in `api/redisfailover/v1/defaults.go`
-- After changing the API types, regenerate the CRD manifest: `make generate-crd`
+- `Validate()` in `api/redisfailover/v1/validate.go` sets the defaults. `api/redisfailover/v1/defaults.go` holds the default values
+- After a change of the API types, regenerate the DeepCopy code and the CRD manifests: `make generate-api`. Stage the changes: `git add api/ manifests/ charts/redisoperator/crds/`. Then run `make verify-codegen`, the same check that CI runs. It compares with the staged files
 - After changing the API types, regenerate the client: `make update-codegen`
 - Keep backwards compatibility when changing the CRD spec; use optional fields with defaults
 
@@ -65,7 +67,7 @@ make helm-test
 
 - The controller is built directly on client-go informers and a workqueue (`operator/redisfailover/controller.go`)
 - The reconciliation loop is in `operator/redisfailover/`
-- All Kubernetes resources created by the operator carry owner references pointing to the `RedisFailover` CR
+- Each Kubernetes object that the operator creates has an owner reference to the `RedisFailover`. The exception is a PVC with `storage.keepAfterDeletion: true`
 - Redis Statefulsets use the prefix `rfr-<name>`; Sentinel Deployments use `rfs-<name>`
 - The maximum name length for a `RedisFailover` is 48 characters
 
@@ -73,10 +75,11 @@ make helm-test
 
 - Chart source is in `charts/redisoperator/`
 - CRDs are in `charts/redisoperator/crds/`
-- After changing the CRD, copy the updated manifest into `charts/redisoperator/crds/` and `manifests/kustomize/base/`
+- `make generate-crd` (part of `make generate-api`) copies the CRD manifest into `charts/redisoperator/crds/` and `manifests/kustomize/base/`. Do not edit these copies by hand
 
 ## CI / Workflow
 
-- CI is defined in `.github/workflows/ci.yaml`
-- All PRs must pass: build, lint (golangci-lint), unit tests, integration tests (multi-version Kubernetes matrix), and Helm chart tests
+- CI is defined in `.github/workflows/ci.yaml` and `.github/workflows/e2e.yml`. The `ci.yaml` file calls `e2e.yml`
+- A PR must pass these jobs: build, lint (golangci-lint), verify-codegen, unit tests, integration tests (multi-version Kubernetes matrix), Helm chart tests, the Docker build, and the e2e test (minikube, operator-managed mode)
+- The `changes` job in `ci.yaml` lists the paths that each job reads. The workflow skips a job when the PR changes none of its paths, for example a PR that changes only documentation. When a job reads a new path, add the path to the filter of the job
 - Docker images are built for `linux/amd64` and `linux/arm64`

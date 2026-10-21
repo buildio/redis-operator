@@ -3,9 +3,11 @@ package k8s_test
 import (
 	"context"
 	"errors"
+	"maps"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
 	kubeerrors "k8s.io/apimachinery/pkg/api/errors"
@@ -15,7 +17,6 @@ import (
 	"k8s.io/apimachinery/pkg/util/intstr"
 	kubernetes "k8s.io/client-go/kubernetes/fake"
 	kubetesting "k8s.io/client-go/testing"
-	"k8s.io/utils/ptr"
 
 	"github.com/saremox/redis-operator/log"
 	"github.com/saremox/redis-operator/metrics"
@@ -98,11 +99,11 @@ func TestDeploymentServiceGetCreateOrUpdate(t *testing.T) {
 			name: "An existent deployment should update the deployment.",
 			deployment: &appsv1.Deployment{
 				ObjectMeta: metav1.ObjectMeta{Name: "testdeployment1"},
-				Spec:       appsv1.DeploymentSpec{Replicas: ptr.To(int32(3))},
+				Spec:       appsv1.DeploymentSpec{Replicas: new(int32(3))},
 			},
 			getDeploymentResult: &appsv1.Deployment{
 				ObjectMeta: metav1.ObjectMeta{Name: "testdeployment1", ResourceVersion: "10"},
-				Spec:       appsv1.DeploymentSpec{Replicas: ptr.To(int32(1))},
+				Spec:       appsv1.DeploymentSpec{Replicas: new(int32(1))},
 			},
 			errorOnGet:      nil,
 			errorOnCreation: nil,
@@ -110,7 +111,7 @@ func TestDeploymentServiceGetCreateOrUpdate(t *testing.T) {
 				newDeploymentGetAction(testns, "testdeployment1"),
 				newDeploymentUpdateAction(testns, &appsv1.Deployment{
 					ObjectMeta: metav1.ObjectMeta{Name: "testdeployment1", ResourceVersion: "10"},
-					Spec:       appsv1.DeploymentSpec{Replicas: ptr.To(int32(3))},
+					Spec:       appsv1.DeploymentSpec{Replicas: new(int32(3))},
 				}),
 			},
 			expErr: false,
@@ -123,10 +124,10 @@ func TestDeploymentServiceGetCreateOrUpdate(t *testing.T) {
 
 			// Mock.
 			mcli := &kubernetes.Clientset{}
-			mcli.AddReactor("get", "deployments", func(action kubetesting.Action) (bool, runtime.Object, error) {
+			mcli.AddReactor("get", "deployments", func(_ kubetesting.Action) (bool, runtime.Object, error) {
 				return true, test.getDeploymentResult, test.errorOnGet
 			})
-			mcli.AddReactor("create", "deployments", func(action kubetesting.Action) (bool, runtime.Object, error) {
+			mcli.AddReactor("create", "deployments", func(_ kubetesting.Action) (bool, runtime.Object, error) {
 				return true, nil, test.errorOnCreation
 			})
 
@@ -136,7 +137,7 @@ func TestDeploymentServiceGetCreateOrUpdate(t *testing.T) {
 			if test.expErr {
 				assertTest.Error(err)
 			} else {
-				assertTest.NoError(err)
+				require.NoError(t, err)
 				// Check calls to kubernetes.
 				assertTest.Equal(test.expActions, mcli.Actions())
 			}
@@ -157,7 +158,7 @@ func realisticDeployment(replicas int32) *appsv1.Deployment {
 			Labels:    map[string]string{"app.kubernetes.io/name": "test", "app.kubernetes.io/component": "sentinel"},
 		},
 		Spec: appsv1.DeploymentSpec{
-			Replicas: ptr.To(replicas),
+			Replicas: new(replicas),
 			Selector: &metav1.LabelSelector{MatchLabels: map[string]string{"app.kubernetes.io/name": "test"}},
 			Template: corev1.PodTemplateSpec{
 				ObjectMeta: metav1.ObjectMeta{Labels: map[string]string{"app.kubernetes.io/name": "test"}},
@@ -181,8 +182,8 @@ func serverDefaulted(d *appsv1.Deployment) *appsv1.Deployment {
 		Type:          appsv1.RollingUpdateDeploymentStrategyType,
 		RollingUpdate: &appsv1.RollingUpdateDeployment{},
 	}
-	d.Spec.RevisionHistoryLimit = ptr.To(int32(10))
-	d.Spec.ProgressDeadlineSeconds = ptr.To(int32(600))
+	d.Spec.RevisionHistoryLimit = new(int32(10))
+	d.Spec.ProgressDeadlineSeconds = new(int32(600))
 	d.Spec.Template.Spec.RestartPolicy = corev1.RestartPolicyAlways
 	d.Spec.Template.Spec.SchedulerName = "default-scheduler"
 	d.Spec.Template.Spec.DeprecatedServiceAccount = d.Spec.Template.Spec.ServiceAccountName
@@ -227,7 +228,7 @@ func TestDeploymentServiceObjectUpToDate(t *testing.T) {
 		{
 			name: "server-defaulted fields the operator never sets do not trigger an update",
 			// stored is what a real API server would persist and return for
-			// exactly this desired object - if the comparison isn't
+			// exactly this desired object - if the comparison is not
 			// normalized, this looks different on every single field the
 			// server defaults, even though nothing meaningful changed.
 			stored:        serverDefaulted(realisticDeployment(3)),
@@ -267,13 +268,13 @@ func TestDeploymentServiceObjectUpToDate(t *testing.T) {
 		},
 		{
 			name:          "a partly configured strategy the server filled in is a no-op",
-			stored:        withStrategy(realisticDeployment(3), rollingUpdate(ptr.To(intstr.FromInt32(1)), ptr.To(intstr.FromString("25%")))),
-			desired:       withStrategy(realisticDeployment(3), rollingUpdate(ptr.To(intstr.FromInt32(1)), nil)),
+			stored:        withStrategy(realisticDeployment(3), rollingUpdate(new(intstr.FromInt32(1)), new(intstr.FromString("25%")))),
+			desired:       withStrategy(realisticDeployment(3), rollingUpdate(new(intstr.FromInt32(1)), nil)),
 			expectUpdates: 0,
 		},
 		{
 			name:          "a changed strategy triggers an update",
-			stored:        withStrategy(realisticDeployment(3), rollingUpdate(ptr.To(intstr.FromInt32(1)), ptr.To(intstr.FromString("25%")))),
+			stored:        withStrategy(realisticDeployment(3), rollingUpdate(new(intstr.FromInt32(1)), new(intstr.FromString("25%")))),
 			desired:       withStrategy(realisticDeployment(3), recreate()),
 			expectUpdates: 1,
 		},
@@ -308,7 +309,7 @@ func TestDeploymentServiceObjectUpToDate(t *testing.T) {
 			mcli := kubernetes.NewClientset(stored)
 
 			service := k8s.NewDeploymentService(mcli, log.Dummy, metrics.Dummy)
-			assert.NoError(service.CreateOrUpdateDeployment(testns, test.desired.DeepCopy()))
+			require.NoError(t, service.CreateOrUpdateDeployment(testns, test.desired.DeepCopy()))
 
 			updates := 0
 			for _, a := range mcli.Actions() {
@@ -319,6 +320,41 @@ func TestDeploymentServiceObjectUpToDate(t *testing.T) {
 			assert.Equal(test.expectUpdates, updates)
 		})
 	}
+}
+
+// The API server increments the generation of a Deployment when its
+// annotations change. An update must keep the annotations of the stored
+// Deployment, or each update starts a new generation.
+func TestDeploymentServiceUpdateKeepsTheStoredAnnotations(t *testing.T) {
+	stored := realisticDeployment(3)
+	stored.ResourceVersion = "1"
+	stored.Annotations = map[string]string{"deployment.kubernetes.io/revision": "3", "example.com/owner": "team"}
+	mcli := kubernetes.NewClientset(stored)
+
+	service := k8s.NewDeploymentService(mcli, log.Dummy, metrics.Dummy)
+	require.NoError(t, service.CreateOrUpdateDeployment("testns", realisticDeployment(5)))
+
+	got, err := service.GetDeployment("testns", "rfs-test")
+	require.NoError(t, err)
+	assert.Equal(t, int32(5), *got.Spec.Replicas)
+	assert.Equal(t, stored.Annotations, got.Annotations)
+}
+
+// A desired annotation replaces a stored annotation with the same key.
+func TestDeploymentServiceUpdateWritesTheDesiredAnnotations(t *testing.T) {
+	stored := realisticDeployment(3)
+	stored.ResourceVersion = "1"
+	stored.Annotations = map[string]string{"deployment.kubernetes.io/revision": "3", "example.com/owner": "team"}
+	mcli := kubernetes.NewClientset(stored)
+	desired := realisticDeployment(5)
+	desired.Annotations = map[string]string{"example.com/owner": "operator"}
+
+	service := k8s.NewDeploymentService(mcli, log.Dummy, metrics.Dummy)
+	require.NoError(t, service.CreateOrUpdateDeployment("testns", desired))
+
+	got, err := service.GetDeployment("testns", "rfs-test")
+	require.NoError(t, err)
+	assert.Equal(t, map[string]string{"deployment.kubernetes.io/revision": "3", "example.com/owner": "operator"}, got.Annotations)
 }
 
 func TestDeploymentServiceUpdate(t *testing.T) {
@@ -359,7 +395,7 @@ func TestDeploymentServiceUpdate(t *testing.T) {
 			assertTest := assert.New(t)
 
 			mcli := &kubernetes.Clientset{}
-			mcli.AddReactor("update", "deployments", func(action kubetesting.Action) (bool, runtime.Object, error) {
+			mcli.AddReactor("update", "deployments", func(_ kubetesting.Action) (bool, runtime.Object, error) {
 				return true, nil, test.errorOnUpdate
 			})
 
@@ -367,9 +403,9 @@ func TestDeploymentServiceUpdate(t *testing.T) {
 			err := service.UpdateDeployment(testns, testDeployment)
 
 			if test.expErr {
-				assertTest.Error(err)
+				require.Error(t, err)
 			} else {
-				assertTest.NoError(err)
+				require.NoError(t, err)
 			}
 			assertTest.Equal(test.expActions, mcli.Actions())
 		})
@@ -392,11 +428,11 @@ func TestDeploymentServiceDelete(t *testing.T) {
 		service := k8s.NewDeploymentService(mcli, log.Dummy, metrics.Dummy)
 
 		err := service.DeleteDeployment(testns, "testdeployment1")
-		assertTest.NoError(err)
+		require.NoError(t, err)
 		assertTest.Equal([]kubetesting.Action{newDeploymentDeleteAction(testns, "testdeployment1")}, mcli.Actions())
 
 		_, getErr := mcli.AppsV1().Deployments(testns).Get(context.TODO(), "testdeployment1", metav1.GetOptions{})
-		assertTest.Error(getErr)
+		require.Error(t, getErr)
 		assertTest.True(kubeerrors.IsNotFound(getErr))
 	})
 
@@ -407,7 +443,7 @@ func TestDeploymentServiceDelete(t *testing.T) {
 		service := k8s.NewDeploymentService(mcli, log.Dummy, metrics.Dummy)
 
 		err := service.DeleteDeployment(testns, "does-not-exist")
-		assertTest.Error(err)
+		require.Error(t, err)
 		assertTest.True(kubeerrors.IsNotFound(err))
 	})
 }
@@ -425,7 +461,7 @@ func TestDeploymentServiceList(t *testing.T) {
 		service := k8s.NewDeploymentService(mcli, log.Dummy, metrics.Dummy)
 
 		list, err := service.ListDeployments(testns)
-		assertTest.NoError(err)
+		require.NoError(t, err)
 		assertTest.Len(list.Items, 2)
 		names := []string{list.Items[0].Name, list.Items[1].Name}
 		assertTest.ElementsMatch([]string{"d1", "d2"}, names)
@@ -436,53 +472,95 @@ func TestDeploymentServiceList(t *testing.T) {
 
 		mcli := &kubernetes.Clientset{}
 		wantErr := errors.New("wanted error")
-		mcli.AddReactor("list", "deployments", func(action kubetesting.Action) (bool, runtime.Object, error) {
+		mcli.AddReactor("list", "deployments", func(_ kubetesting.Action) (bool, runtime.Object, error) {
 			return true, nil, wantErr
 		})
 		service := k8s.NewDeploymentService(mcli, log.Dummy, metrics.Dummy)
 
 		list, err := service.ListDeployments(testns)
-		assertTest.Error(err)
+		require.Error(t, err)
 		assertTest.Empty(list.Items)
 		assertTest.Equal([]kubetesting.Action{newDeploymentListAction(testns)}, mcli.Actions())
 	})
 }
 
+// replicaSetPod returns a pod with the pod-template-hash label and a
+// controller reference to the named ReplicaSet.
+func replicaSetPod(name, namespace, hash, replicaSet string, labels map[string]string) *corev1.Pod {
+	podLabels := map[string]string{}
+	maps.Copy(podLabels, labels)
+	if hash != "" {
+		podLabels[appsv1.DefaultDeploymentUniqueLabelKey] = hash
+	}
+	return &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      name,
+			Namespace: namespace,
+			Labels:    podLabels,
+			OwnerReferences: []metav1.OwnerReference{
+				{APIVersion: "apps/v1", Kind: "ReplicaSet", Name: replicaSet, UID: "rs-uid", Controller: new(true)},
+			},
+		},
+	}
+}
+
 func TestDeploymentServiceGetDeploymentPods(t *testing.T) {
 	testns := "testns"
 
-	t.Run("returns pods matching the deployment's selector", func(t *testing.T) {
+	t.Run("returns only the pods that a ReplicaSet of the deployment owns", func(t *testing.T) {
+		assertTest := assert.New(t)
+
+		selectorLabels := map[string]string{"app": "redis"}
+		deployment := &appsv1.Deployment{
+			ObjectMeta: metav1.ObjectMeta{Name: "testdeployment1", Namespace: testns},
+			Spec: appsv1.DeploymentSpec{
+				Selector: &metav1.LabelSelector{MatchLabels: selectorLabels},
+			},
+		}
+		// A rollout has pods of two ReplicaSets.
+		matchingPod := replicaSetPod("matchingpod", testns, "abc123", "testdeployment1-abc123", selectorLabels)
+		newerPod := replicaSetPod("newerpod", testns, "def456", "testdeployment1-def456", selectorLabels)
+		otherSelector := replicaSetPod("otherpod", testns, "abc123", "testdeployment1-abc123", map[string]string{"app": "other"})
+		otherNamespace := replicaSetPod("otherns", "otherns", "abc123", "testdeployment1-abc123", selectorLabels)
+		labelsOnly := &corev1.Pod{ObjectMeta: metav1.ObjectMeta{Name: "labelsonly", Namespace: testns, Labels: selectorLabels}}
+		otherReplicaSet := replicaSetPod("otherrs", testns, "abc123", "otherdeployment-abc123", selectorLabels)
+		hashMismatch := replicaSetPod("hashmismatch", testns, "zzz999", "testdeployment1-abc123", selectorLabels)
+		noHash := replicaSetPod("nohash", testns, "", "testdeployment1-", selectorLabels)
+		noHashLabelRS := replicaSetPod("nohashrs", testns, "", "testdeployment1-abc123", selectorLabels)
+		wrongKind := replicaSetPod("wrongkind", testns, "abc123", "testdeployment1-abc123", selectorLabels)
+		wrongKind.OwnerReferences[0].Kind = "StatefulSet"
+		wrongAPIVersion := replicaSetPod("wrongapiversion", testns, "abc123", "testdeployment1-abc123", selectorLabels)
+		wrongAPIVersion.OwnerReferences[0].APIVersion = "example.com/v1"
+		notController := replicaSetPod("notcontroller", testns, "abc123", "testdeployment1-abc123", selectorLabels)
+		notController.OwnerReferences[0].Controller = new(false)
+		mcli := kubernetes.NewClientset(deployment, matchingPod, newerPod, otherSelector, otherNamespace, labelsOnly, otherReplicaSet, hashMismatch, noHash, noHashLabelRS, wrongKind, wrongAPIVersion, notController)
+		service := k8s.NewDeploymentService(mcli, log.Dummy, metrics.Dummy)
+
+		pods, err := service.GetDeploymentPods(testns, "testdeployment1")
+		require.NoError(t, err)
+		names := make([]string, 0, len(pods.Items))
+		for _, pod := range pods.Items {
+			names = append(names, pod.Name)
+		}
+		assertTest.ElementsMatch([]string{"matchingpod", "newerpod"}, names)
+	})
+
+	t.Run("returns an error when the pod list fails", func(t *testing.T) {
 		assertTest := assert.New(t)
 
 		deployment := &appsv1.Deployment{
 			ObjectMeta: metav1.ObjectMeta{Name: "testdeployment1", Namespace: testns},
-			Spec: appsv1.DeploymentSpec{
-				Selector: &metav1.LabelSelector{
-					MatchLabels: map[string]string{"app": "redis"},
-				},
-			},
+			Spec:       appsv1.DeploymentSpec{Selector: &metav1.LabelSelector{MatchLabels: map[string]string{"app": "redis"}}},
 		}
-		matchingPod := &corev1.Pod{
-			ObjectMeta: metav1.ObjectMeta{
-				Name:      "matchingpod",
-				Namespace: testns,
-				Labels:    map[string]string{"app": "redis"},
-			},
-		}
-		otherPod := &corev1.Pod{
-			ObjectMeta: metav1.ObjectMeta{
-				Name:      "otherpod",
-				Namespace: testns,
-				Labels:    map[string]string{"app": "other"},
-			},
-		}
-		mcli := kubernetes.NewClientset(deployment, matchingPod, otherPod)
+		mcli := kubernetes.NewClientset(deployment)
+		mcli.PrependReactor("list", "pods", func(kubetesting.Action) (bool, runtime.Object, error) {
+			return true, nil, errors.New("list failed")
+		})
 		service := k8s.NewDeploymentService(mcli, log.Dummy, metrics.Dummy)
 
 		pods, err := service.GetDeploymentPods(testns, "testdeployment1")
-		assertTest.NoError(err)
-		assertTest.Len(pods.Items, 1)
-		assertTest.Equal("matchingpod", pods.Items[0].Name)
+		require.Error(t, err)
+		assertTest.Nil(pods)
 	})
 
 	t.Run("returns an error when the deployment does not exist", func(t *testing.T) {
@@ -492,7 +570,7 @@ func TestDeploymentServiceGetDeploymentPods(t *testing.T) {
 		service := k8s.NewDeploymentService(mcli, log.Dummy, metrics.Dummy)
 
 		pods, err := service.GetDeploymentPods(testns, "does-not-exist")
-		assertTest.Error(err)
+		require.Error(t, err)
 		assertTest.True(kubeerrors.IsNotFound(err))
 		assertTest.Nil(pods)
 	})

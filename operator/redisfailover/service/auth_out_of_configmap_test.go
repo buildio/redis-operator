@@ -6,6 +6,7 @@ import (
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/mock"
+	"github.com/stretchr/testify/require"
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -32,7 +33,7 @@ func TestRedisConfigMapExcludesPassword(t *testing.T) {
 	client := rfservice.NewRedisFailoverKubeClient(ms, log.Dummy, metrics.Dummy)
 	err := client.EnsureRedisConfigMap(rf, nil, []metav1.OwnerReference{})
 
-	assert.NoError(err)
+	require.NoError(t, err)
 	for key, value := range cm.Data {
 		assert.NotContains(value, "requirepass", "%s must not embed requirepass", key)
 		assert.NotContains(value, "masterauth", "%s must not embed masterauth", key)
@@ -62,11 +63,12 @@ func TestRedisCommandUsesEnvAuthWhenSecretConfigured(t *testing.T) {
 	client := rfservice.NewRedisFailoverKubeClient(ms, log.Dummy, metrics.Dummy)
 	err := client.EnsureRedisStatefulset(rf, nil, []metav1.OwnerReference{})
 
-	assert.NoError(err)
-	// This fork runs the instance manager as PID 1 instead of a shell wrapper.
-	// It reads REDIS_PASSWORD from the env and appends requirepass/masterauth
-	// when it execs redis-server, so the password still never reaches the
-	// ConfigMap. See cmd/instance/run.
+	require.NoError(t, err)
+	// This fork runs the instance manager as PID 1 instead of the shell
+	// wrapper that upstream Saremox uses. The manager reads REDIS_PASSWORD
+	// from the environment and appends requirepass and masterauth when it
+	// starts redis-server, so the password reaches no ConfigMap and no pod
+	// command. See cmd/instance/run.
 	joined := strings.Join(gotCommand, " ")
 	assert.Contains(joined, "redis-instance")
 	assert.Contains(joined, "run")

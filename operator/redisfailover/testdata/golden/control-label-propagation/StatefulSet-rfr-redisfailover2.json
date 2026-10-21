@@ -1,0 +1,272 @@
+{
+  "metadata": {
+    "labels": {
+      "app.example.com/label1": "value",
+      "app.example.com/label2": "value",
+      "app.kubernetes.io/component": "redis",
+      "app.kubernetes.io/managed-by": "redis-operator",
+      "app.kubernetes.io/name": "redisfailover2",
+      "app.kubernetes.io/part-of": "redis-failover",
+      "redisfailovers-role": "slave",
+      "redisfailovers.databases.spotahome.com/name": "redisfailover2"
+    },
+    "name": "rfr-redisfailover2",
+    "namespace": "default",
+    "ownerReferences": [
+      {
+        "apiVersion": "databases.spotahome.com/v1",
+        "blockOwnerDeletion": true,
+        "controller": true,
+        "kind": "RedisFailover",
+        "name": "redisfailover2",
+        "uid": ""
+      }
+    ]
+  },
+  "spec": {
+    "podManagementPolicy": "Parallel",
+    "replicas": 3,
+    "selector": {
+      "matchLabels": {
+        "app.kubernetes.io/component": "redis",
+        "app.kubernetes.io/name": "redisfailover2",
+        "app.kubernetes.io/part-of": "redis-failover"
+      }
+    },
+    "serviceName": "rfr-redisfailover2",
+    "template": {
+      "metadata": {
+        "annotations": {
+          "redisfailovers.databases.spotahome.com/secret-checksum": "b34e7ab052196bcad80dc8c457f62f6dc2f2b47be300e7d2f63102dbdfc65617"
+        },
+        "labels": {
+          "app.example.com/label1": "value",
+          "app.example.com/label2": "value",
+          "app.kubernetes.io/component": "redis",
+          "app.kubernetes.io/managed-by": "redis-operator",
+          "app.kubernetes.io/name": "redisfailover2",
+          "app.kubernetes.io/part-of": "redis-failover",
+          "redisfailovers-role": "slave",
+          "redisfailovers.databases.spotahome.com/name": "redisfailover2"
+        }
+      },
+      "spec": {
+        "affinity": {
+          "podAntiAffinity": {
+            "preferredDuringSchedulingIgnoredDuringExecution": [
+              {
+                "podAffinityTerm": {
+                  "labelSelector": {
+                    "matchLabels": {
+                      "app.example.com/label1": "value",
+                      "app.example.com/label2": "value",
+                      "app.kubernetes.io/component": "redis",
+                      "app.kubernetes.io/managed-by": "redis-operator",
+                      "app.kubernetes.io/name": "redisfailover2",
+                      "app.kubernetes.io/part-of": "redis-failover",
+                      "redisfailovers.databases.spotahome.com/name": "redisfailover2"
+                    }
+                  },
+                  "topologyKey": "kubernetes.io/hostname"
+                },
+                "weight": 100
+              }
+            ]
+          }
+        },
+        "automountServiceAccountToken": false,
+        "containers": [
+          {
+            "command": [
+              "/controller/redis-instance",
+              "run",
+              "--redis-conf",
+              "/redis/redis.conf"
+            ],
+            "env": [
+              {
+                "name": "REDIS_ADDR",
+                "value": "redis://127.0.0.1:6379"
+              },
+              {
+                "name": "REDIS_PORT",
+                "value": "6379"
+              },
+              {
+                "name": "REDIS_USER",
+                "value": "default"
+              }
+            ],
+            "image": "redis:7.2.12-alpine",
+            "imagePullPolicy": "Always",
+            "lifecycle": {
+              "preStop": {
+                "exec": {
+                  "command": [
+                    "/bin/sh",
+                    "/redis-shutdown/shutdown.sh"
+                  ]
+                }
+              }
+            },
+            "livenessProbe": {
+              "failureThreshold": 6,
+              "httpGet": {
+                "path": "/healthz",
+                "port": 8080
+              },
+              "initialDelaySeconds": 30,
+              "periodSeconds": 15,
+              "timeoutSeconds": 5
+            },
+            "name": "redis",
+            "ports": [
+              {
+                "containerPort": 6379,
+                "name": "redis",
+                "protocol": "TCP"
+              },
+              {
+                "containerPort": 8080,
+                "name": "health",
+                "protocol": "TCP"
+              }
+            ],
+            "readinessProbe": {
+              "failureThreshold": 3,
+              "httpGet": {
+                "path": "/readyz",
+                "port": 8080
+              },
+              "initialDelaySeconds": 30,
+              "periodSeconds": 10,
+              "timeoutSeconds": 5
+            },
+            "resources": {
+              "limits": {
+                "cpu": "400m",
+                "memory": "500Mi"
+              },
+              "requests": {
+                "cpu": "100m",
+                "memory": "100Mi"
+              }
+            },
+            "securityContext": {
+              "allowPrivilegeEscalation": false,
+              "capabilities": {
+                "drop": [
+                  "ALL"
+                ]
+              },
+              "privileged": false,
+              "readOnlyRootFilesystem": true,
+              "runAsGroup": 1000,
+              "runAsNonRoot": true,
+              "runAsUser": 1000
+            },
+            "volumeMounts": [
+              {
+                "mountPath": "/redis",
+                "name": "redis-config"
+              },
+              {
+                "mountPath": "/redis-shutdown",
+                "name": "redis-shutdown-config"
+              },
+              {
+                "mountPath": "/redis-readiness",
+                "name": "redis-readiness-config"
+              },
+              {
+                "mountPath": "/data",
+                "name": "redis-data"
+              },
+              {
+                "mountPath": "/controller",
+                "name": "instance-manager"
+              }
+            ]
+          }
+        ],
+        "dnsPolicy": "ClusterFirst",
+        "enableServiceLinks": false,
+        "initContainers": [
+          {
+            "command": [
+              "cp",
+              "/usr/local/bin/redis-instance",
+              "/controller/redis-instance"
+            ],
+            "image": "ghcr.io/buildio/redis-operator:4.1.0",
+            "imagePullPolicy": "Always",
+            "name": "instance-manager-init",
+            "resources": {
+              "limits": {
+                "cpu": "100m",
+                "memory": "64Mi"
+              },
+              "requests": {
+                "cpu": "10m",
+                "memory": "16Mi"
+              }
+            },
+            "volumeMounts": [
+              {
+                "mountPath": "/controller",
+                "name": "instance-manager"
+              }
+            ]
+          }
+        ],
+        "securityContext": {
+          "fsGroup": 1000,
+          "runAsGroup": 1000,
+          "runAsNonRoot": true,
+          "runAsUser": 1000,
+          "seccompProfile": {
+            "type": "RuntimeDefault"
+          }
+        },
+        "terminationGracePeriodSeconds": 30,
+        "volumes": [
+          {
+            "configMap": {
+              "name": "rfr-redisfailover2"
+            },
+            "name": "redis-config"
+          },
+          {
+            "configMap": {
+              "defaultMode": 484,
+              "name": "rfr-s-redisfailover2"
+            },
+            "name": "redis-shutdown-config"
+          },
+          {
+            "configMap": {
+              "defaultMode": 484,
+              "name": "rfr-readiness-redisfailover2"
+            },
+            "name": "redis-readiness-config"
+          },
+          {
+            "emptyDir": {},
+            "name": "redis-data"
+          },
+          {
+            "emptyDir": {},
+            "name": "instance-manager"
+          }
+        ]
+      }
+    },
+    "updateStrategy": {
+      "type": "OnDelete"
+    }
+  },
+  "status": {
+    "availableReplicas": 0,
+    "replicas": 0
+  }
+}

@@ -2,9 +2,9 @@ package k8s
 
 import (
 	"context"
+	"fmt"
 
 	policyv1 "k8s.io/api/policy/v1"
-	"k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/client-go/kubernetes"
 
@@ -12,7 +12,7 @@ import (
 	"github.com/saremox/redis-operator/metrics"
 )
 
-// PodDisruptionBudget the ServiceAccount service that knows how to interact with k8s to manage them
+// PodDisruptionBudget the PodDisruptionBudget service that knows how to interact with k8s to manage them.
 type PodDisruptionBudget interface {
 	GetPodDisruptionBudget(namespace string, name string) (*policyv1.PodDisruptionBudget, error)
 	CreatePodDisruptionBudget(namespace string, podDisruptionBudget *policyv1.PodDisruptionBudget) error
@@ -38,61 +38,50 @@ func NewPodDisruptionBudgetService(kubeClient kubernetes.Interface, logger log.L
 	}
 }
 
-func (p *PodDisruptionBudgetService) GetPodDisruptionBudget(namespace string, name string) (*policyv1.PodDisruptionBudget, error) {
+// GetPodDisruptionBudget returns the named PodDisruptionBudget.
+func (p *PodDisruptionBudgetService) GetPodDisruptionBudget(namespace, name string) (*policyv1.PodDisruptionBudget, error) {
 	podDisruptionBudget, err := p.kubeClient.PolicyV1().PodDisruptionBudgets(namespace).Get(context.TODO(), name, metav1.GetOptions{})
 	recordMetrics(namespace, "PodDisruptionBudget", name, "GET", err, p.metricsRecorder)
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("get poddisruptionbudget %s/%s: %w", namespace, name, err)
 	}
 	return podDisruptionBudget, nil
 }
 
+// CreatePodDisruptionBudget creates the given PodDisruptionBudget.
 func (p *PodDisruptionBudgetService) CreatePodDisruptionBudget(namespace string, podDisruptionBudget *policyv1.PodDisruptionBudget) error {
 	_, err := p.kubeClient.PolicyV1().PodDisruptionBudgets(namespace).Create(context.TODO(), podDisruptionBudget, metav1.CreateOptions{})
 	recordMetrics(namespace, "PodDisruptionBudget", podDisruptionBudget.GetName(), "CREATE", err, p.metricsRecorder)
-	if err != nil {
-		return err
-	}
-	p.logger.WithField("namespace", namespace).WithField("podDisruptionBudget", podDisruptionBudget.Name).Debugf("podDisruptionBudget created")
-	return nil
+	return writeResult(err, p.logger, namespace, "podDisruptionBudget", podDisruptionBudget.Name, "create poddisruptionbudget", "podDisruptionBudget created")
 }
 
+// UpdatePodDisruptionBudget replaces the stored PodDisruptionBudget with the given
+// PodDisruptionBudget.
 func (p *PodDisruptionBudgetService) UpdatePodDisruptionBudget(namespace string, podDisruptionBudget *policyv1.PodDisruptionBudget) error {
 	_, err := p.kubeClient.PolicyV1().PodDisruptionBudgets(namespace).Update(context.TODO(), podDisruptionBudget, metav1.UpdateOptions{})
 	recordMetrics(namespace, "PodDisruptionBudget", podDisruptionBudget.GetName(), "UPDATE", err, p.metricsRecorder)
-	if err != nil {
-		return err
-	}
-	p.logger.WithField("namespace", namespace).WithField("podDisruptionBudget", podDisruptionBudget.Name).Debugf("podDisruptionBudget updated")
-	return nil
+	return writeResult(err, p.logger, namespace, "podDisruptionBudget", podDisruptionBudget.Name, "update poddisruptionbudget", "podDisruptionBudget updated")
 }
 
+// CreateOrUpdatePodDisruptionBudget creates the PodDisruptionBudget, or
+// updates the stored PodDisruptionBudget when it is not up to date. It returns
+// a ControlledByOtherError when another controller controls the stored
+// PodDisruptionBudget.
 func (p *PodDisruptionBudgetService) CreateOrUpdatePodDisruptionBudget(namespace string, podDisruptionBudget *policyv1.PodDisruptionBudget) error {
-	storedPodDisruptionBudget, err := p.GetPodDisruptionBudget(namespace, podDisruptionBudget.Name)
-	if err != nil {
-		// If no resource we need to create.
-		if errors.IsNotFound(err) {
-			return p.CreatePodDisruptionBudget(namespace, podDisruptionBudget)
-		}
-		return err
-	}
-
-	// Already exists, need to Update.
-	// Set the correct resource version to ensure we are on the latest version. This way the only valid
-	// namespace is our spec(https://github.com/kubernetes/community/blob/master/contributors/devel/api-conventions.md#concurrency-control-and-consistency),
-	// we will replace the current namespace state.
-	podDisruptionBudget.ResourceVersion = storedPodDisruptionBudget.ResourceVersion
-
-	if podDisruptionBudgetUpToDate(storedPodDisruptionBudget, podDisruptionBudget) {
-		p.logger.WithField("namespace", namespace).WithField("podDisruptionBudget", podDisruptionBudget.Name).Debugf("pod disruption budget already up to date, skipping update")
-		return nil
-	}
-
-	return p.UpdatePodDisruptionBudget(namespace, podDisruptionBudget)
+	return createOrUpdate(namespace, podDisruptionBudget, objectCalls[*policyv1.PodDisruptionBudget]{
+		kind: "PodDisruptionBudget", get: p.GetPodDisruptionBudget, create: p.CreatePodDisruptionBudget, update: p.UpdatePodDisruptionBudget, upToDate: podDisruptionBudgetUpToDate,
+		skipped: func() {
+			p.logger.WithField("namespace", namespace).WithField("podDisruptionBudget", podDisruptionBudget.Name).Debugf("pod disruption budget already up to date, skipping update")
+		},
+	})
 }
 
-func (p *PodDisruptionBudgetService) DeletePodDisruptionBudget(namespace string, name string) error {
+// DeletePodDisruptionBudget deletes the named PodDisruptionBudget.
+func (p *PodDisruptionBudgetService) DeletePodDisruptionBudget(namespace, name string) error {
 	err := p.kubeClient.PolicyV1().PodDisruptionBudgets(namespace).Delete(context.TODO(), name, metav1.DeleteOptions{})
 	recordMetrics(namespace, "PodDisruptionBudget", name, "DELETE", err, p.metricsRecorder)
-	return err
+	if err != nil {
+		return fmt.Errorf("delete poddisruptionbudget %s/%s: %w", namespace, name, err)
+	}
+	return nil
 }

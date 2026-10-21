@@ -3,6 +3,9 @@ package redisfailover
 import (
 	"context"
 	"errors"
+	"fmt"
+	"net"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -14,16 +17,19 @@ import (
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/apimachinery/pkg/watch"
 	clientfeatures "k8s.io/client-go/features"
 	clientfeaturestesting "k8s.io/client-go/features/testing"
 	fakekubernetes "k8s.io/client-go/kubernetes/fake"
+	fakemetadata "k8s.io/client-go/metadata/fake"
 	k8stesting "k8s.io/client-go/testing"
 	"k8s.io/client-go/tools/cache"
 
 	redisfailoverv1 "github.com/saremox/redis-operator/api/redisfailover/v1"
 	"github.com/saremox/redis-operator/log"
 	"github.com/saremox/redis-operator/metrics"
+	redisclient "github.com/saremox/redis-operator/service/redis"
 )
 
 func staticRFs(items ...redisfailoverv1.RedisFailover) *cache.ListWatch {
@@ -37,9 +43,21 @@ func staticRFs(items ...redisfailoverv1.RedisFailover) *cache.ListWatch {
 	}
 }
 
+func staticSecrets() *cache.ListWatch {
+	return &cache.ListWatch{
+		ListWithContextFunc: func(context.Context, metav1.ListOptions) (runtime.Object, error) {
+			return &metav1.PartialObjectMetadataList{}, nil
+		},
+		WatchFuncWithContext: func(context.Context, metav1.ListOptions) (watch.Interface, error) {
+			return watch.NewFake(), nil
+		},
+	}
+}
+
 type recordingHandler struct {
 	mu      sync.Mutex
 	calls   []string
+	forgot  []string
 	running atomic.Int32
 	overlap atomic.Bool
 	delay   time.Duration
@@ -56,6 +74,18 @@ func (h *recordingHandler) Handle(_ context.Context, obj runtime.Object) error {
 	h.calls = append(h.calls, rf.Namespace+"/"+rf.Name)
 	h.mu.Unlock()
 	return nil
+}
+
+func (h *recordingHandler) Forget(key string) {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	h.forgot = append(h.forgot, key)
+}
+
+func (h *recordingHandler) forgotten() []string {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	return append([]string(nil), h.forgot...)
 }
 
 func (h *recordingHandler) count() int {
@@ -89,7 +119,7 @@ func startControllerWith(t *testing.T, h Handler, kube *fakekubernetes.Clientset
 		once.Do(func() { close(watching) })
 		return true, w, err
 	})
-	c, err := newRFController(h, staticRFs(rfs...), newPodListWatch(kube), resync, 3, nil, mrec, log.Dummy)
+	c, err := newRFController(h, staticRFs(rfs...), newPodListWatch(kube), staticSecrets(), resync, 3, nil, mrec, log.Dummy)
 	require.NoError(t, err)
 	ctx, cancel := context.WithCancel(context.Background())
 	done := make(chan error)
@@ -129,6 +159,175 @@ func TestRFControllerPodEventsReconcileTheirRedisFailover(t *testing.T) {
 	h.mu.Lock()
 	defer h.mu.Unlock()
 	assert.Equal(t, []string{"ns/rf", "ns/rf", "ns/rf", "ns/rf"}, h.calls)
+}
+
+func TestRFControllerSecretEventsReconcileTheRedisFailoversUsingIt(t *testing.T) {
+	clientfeaturestesting.SetFeatureDuringTest(t, clientfeatures.WatchListClient, false)
+	withAuth := func(name, secretPath string) redisfailoverv1.RedisFailover {
+		rf := redisfailoverv1.RedisFailover{ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: "ns"}}
+		rf.Spec.Auth.SecretPath = secretPath
+		return rf
+	}
+	secret := func(namespace, name, resourceVersion string) *metav1.PartialObjectMetadata {
+		return &metav1.PartialObjectMetadata{
+			TypeMeta: metav1.TypeMeta{APIVersion: "v1", Kind: "Secret"},
+			ObjectMeta: metav1.ObjectMeta{
+				Name:            name,
+				Namespace:       namespace,
+				ResourceVersion: resourceVersion,
+				Annotations:     map[string]string{"kubectl.kubernetes.io/last-applied-configuration": "{}"},
+			},
+		}
+	}
+	meta := fakemetadata.NewSimpleMetadataClient(fakemetadata.NewTestScheme())
+	watching := make(chan struct{})
+	var once sync.Once
+	meta.PrependWatchReactor("secrets", func(k8stesting.Action) (bool, watch.Interface, error) {
+		once.Do(func() { close(watching) })
+		return false, nil, nil
+	})
+	h := &recordingHandler{}
+	rfs := staticRFs(withAuth("a", "auth"), withAuth("b", "auth"), withAuth("c", "other-auth"), withAuth("d", ""))
+	c, err := newRFController(h, rfs, newPodListWatch(fakekubernetes.NewClientset()), newSecretListWatch(meta), time.Hour, 3, nil, metrics.Dummy, log.Dummy)
+	require.NoError(t, err)
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error)
+	go func() { done <- c.Run(ctx) }()
+	t.Cleanup(func() {
+		cancel()
+		require.NoError(t, <-done)
+	})
+	<-watching
+	require.Eventually(t, func() bool { return h.count() == 4 }, 5*time.Second, 10*time.Millisecond)
+
+	secrets := func(namespace string) fakemetadata.MetadataClient {
+		return meta.Resource(corev1.SchemeGroupVersion.WithResource("secrets")).Namespace(namespace).(fakemetadata.MetadataClient)
+	}
+	_, err = secrets("ns").CreateFake(secret("ns", "auth", "1"), metav1.CreateOptions{})
+	require.NoError(t, err)
+	require.Eventually(t, func() bool { return h.countFor("ns/a") == 2 && h.countFor("ns/b") == 2 }, 5*time.Second, 10*time.Millisecond)
+
+	_, err = secrets("ns").UpdateFake(secret("ns", "auth", "2"), metav1.UpdateOptions{})
+	require.NoError(t, err)
+	require.Eventually(t, func() bool { return h.countFor("ns/a") == 3 && h.countFor("ns/b") == 3 }, 5*time.Second, 10*time.Millisecond)
+
+	// No RedisFailover uses the first two Secrets. Events arrive in order, so
+	// the reconcile of c shows that the handler saw them.
+	_, err = secrets("ns").CreateFake(secret("ns", "unrelated", "3"), metav1.CreateOptions{})
+	require.NoError(t, err)
+	_, err = secrets("other-ns").CreateFake(secret("other-ns", "auth", "4"), metav1.CreateOptions{})
+	require.NoError(t, err)
+	_, err = secrets("ns").CreateFake(secret("ns", "other-auth", "5"), metav1.CreateOptions{})
+	require.NoError(t, err)
+	require.Eventually(t, func() bool { return h.countFor("ns/c") == 2 }, 5*time.Second, 10*time.Millisecond)
+	time.Sleep(200 * time.Millisecond)
+	assert.Equal(t, 3, h.countFor("ns/a"))
+	assert.Equal(t, 3, h.countFor("ns/b"))
+	assert.Equal(t, 1, h.countFor("ns/d"))
+
+	cached, exists, err := c.secretInformer.GetStore().GetByKey("ns/auth")
+	require.NoError(t, err)
+	require.True(t, exists)
+	assert.Empty(t, cached.(*metav1.PartialObjectMetadata).Annotations)
+}
+
+func TestRFControllerSecretEventHandler(t *testing.T) {
+	c, err := newRFController(&recordingHandler{}, staticRFs(), newPodListWatch(fakekubernetes.NewClientset()), staticSecrets(), time.Hour, 1, nil, metrics.Dummy, log.Dummy)
+	require.NoError(t, err)
+	withAuth := &redisfailoverv1.RedisFailover{ObjectMeta: metav1.ObjectMeta{Name: "rf", Namespace: "ns"}}
+	withAuth.Spec.Auth.SecretPath = "auth"
+	require.NoError(t, c.rfInformer.GetIndexer().Add(withAuth))
+	require.NoError(t, c.rfInformer.GetIndexer().Add(&redisfailoverv1.RedisFailover{ObjectMeta: metav1.ObjectMeta{Name: "none", Namespace: "ns"}}))
+	secret := func(resourceVersion string) *metav1.PartialObjectMetadata {
+		return &metav1.PartialObjectMetadata{ObjectMeta: metav1.ObjectMeta{Name: "auth", Namespace: "ns", ResourceVersion: resourceVersion}}
+	}
+	queued := func() []string {
+		var keys []string
+		for c.queue.Len() > 0 {
+			key, _ := c.queue.Get()
+			c.queue.Done(key)
+			keys = append(keys, key)
+		}
+		return keys
+	}
+	h := c.secretEventHandler()
+
+	h.OnAdd(secret("1"), false)
+	assert.Equal(t, []string{"ns/rf"}, queued())
+
+	h.OnUpdate(secret("1"), secret("1"))
+	assert.Empty(t, queued(), "a relist redelivers an unchanged Secret")
+
+	h.OnUpdate(secret("1"), secret("2"))
+	assert.Equal(t, []string{"ns/rf"}, queued())
+
+	h.OnDelete(cache.DeletedFinalStateUnknown{Key: "ns/auth", Obj: secret("2")})
+	assert.Equal(t, []string{"ns/rf"}, queued())
+
+	h.OnAdd("not an object", false)
+	assert.Empty(t, queued())
+}
+
+// An update of another type has no version to compare, so the handler
+// queues it.
+func TestRFControllerSecretEventHandlerQueuesAnUpdateOfAnotherType(t *testing.T) {
+	c, err := newRFController(&recordingHandler{}, staticRFs(), newPodListWatch(fakekubernetes.NewClientset()), staticSecrets(), time.Hour, 1, nil, metrics.Dummy, log.Dummy)
+	require.NoError(t, err)
+	withAuth := &redisfailoverv1.RedisFailover{ObjectMeta: metav1.ObjectMeta{Name: "rf", Namespace: "ns"}}
+	withAuth.Spec.Auth.SecretPath = "auth"
+	require.NoError(t, c.rfInformer.GetIndexer().Add(withAuth))
+	objectMeta := metav1.ObjectMeta{Name: "auth", Namespace: "ns", ResourceVersion: "1"}
+	partial := &metav1.PartialObjectMetadata{ObjectMeta: objectMeta}
+	secret := &corev1.Secret{ObjectMeta: objectMeta}
+	h := c.secretEventHandler()
+
+	for _, update := range [][2]any{{partial, secret}, {secret, partial}} {
+		h.OnUpdate(update[0], update[1])
+		require.Equal(t, 1, c.queue.Len())
+		key, _ := c.queue.Get()
+		c.queue.Done(key)
+		assert.Equal(t, "ns/rf", key)
+	}
+}
+
+func TestRFControllerWithoutSecretWatch(t *testing.T) {
+	clientfeaturestesting.SetFeatureDuringTest(t, clientfeatures.WatchListClient, false)
+	rf := redisfailoverv1.RedisFailover{ObjectMeta: metav1.ObjectMeta{Name: "rf", Namespace: "ns"}}
+	rf.Spec.Auth.SecretPath = "auth"
+	h := &recordingHandler{}
+	c, err := newRFController(h, staticRFs(rf), newPodListWatch(fakekubernetes.NewClientset()), nil, time.Hour, 1, nil, metrics.Dummy, log.Dummy)
+	require.NoError(t, err)
+	assert.Nil(t, c.secretInformer)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error)
+	go func() { done <- c.Run(ctx) }()
+	require.Eventually(t, func() bool { return h.count() == 1 }, 5*time.Second, 10*time.Millisecond)
+	cancel()
+	require.NoError(t, <-done)
+}
+
+func TestAuthSecretKey(t *testing.T) {
+	rf := &redisfailoverv1.RedisFailover{ObjectMeta: metav1.ObjectMeta{Name: "rf", Namespace: "ns"}}
+	keys, err := authSecretKey(rf)
+	require.NoError(t, err)
+	assert.Empty(t, keys)
+
+	rf.Spec.Auth.SecretPath = "auth"
+	keys, err = authSecretKey(rf)
+	require.NoError(t, err)
+	assert.Equal(t, []string{"ns/auth"}, keys)
+
+	keys, err = authSecretKey(&corev1.Pod{})
+	require.NoError(t, err)
+	assert.Empty(t, keys)
+}
+
+func TestSecretKeyOnlyKeepsOtherObjects(t *testing.T) {
+	pod := &corev1.Pod{ObjectMeta: metav1.ObjectMeta{Name: "p"}}
+	got, err := secretKeyOnly(pod)
+	require.NoError(t, err)
+	assert.Same(t, pod, got)
 }
 
 func TestRFControllerNeverReconcilesARedisFailoverConcurrently(t *testing.T) {
@@ -186,7 +385,7 @@ func (failingQueueMetrics) RegisterResourceQueueLengthFunc(string, func(context.
 }
 
 func TestNewRFControllerReturnsMetricsRegistrationError(t *testing.T) {
-	_, err := newRFController(&recordingHandler{}, staticRFs(), newPodListWatch(fakekubernetes.NewClientset()), 0, 0, nil, failingQueueMetrics{metrics.Dummy}, log.Dummy)
+	_, err := newRFController(&recordingHandler{}, staticRFs(), newPodListWatch(fakekubernetes.NewClientset()), staticSecrets(), 0, 0, nil, failingQueueMetrics{metrics.Dummy}, log.Dummy)
 	assert.EqualError(t, err, "already registered")
 }
 
@@ -210,14 +409,14 @@ func (r *recordingRunner) Run(ctx context.Context, f func(context.Context) error
 func TestRFControllerRunsUnderLeaderElection(t *testing.T) {
 	runner := &recordingRunner{}
 	mrec := &queueLengthMetrics{Recorder: metrics.Dummy}
-	c, err := newRFController(&recordingHandler{}, staticRFs(), newPodListWatch(fakekubernetes.NewClientset()), time.Hour, 1, runner, mrec, log.Dummy)
+	c, err := newRFController(&recordingHandler{}, staticRFs(), newPodListWatch(fakekubernetes.NewClientset()), staticSecrets(), time.Hour, 1, runner, mrec, log.Dummy)
 	require.NoError(t, err)
-	c.enqueue("ns/rf")
+	c.enqueue(context.Background(), "ns/rf")
 	assert.Equal(t, 1, mrec.queueLen(context.Background()))
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
 
-	assert.NoError(t, c.Run(ctx), "shutting down before the cache synced is not an error")
+	require.NoError(t, c.Run(ctx), "shutting down before the cache synced is not an error")
 	assert.True(t, runner.ran)
 }
 
@@ -227,6 +426,8 @@ type blockingHandler struct {
 	started chan struct{}
 	release chan struct{}
 }
+
+func (h *blockingHandler) Forget(string) {}
 
 func (h *blockingHandler) Handle(context.Context, runtime.Object) error {
 	h.calls.Add(1)
@@ -239,7 +440,7 @@ func TestRFControllerRunWaitsForInFlightReconciles(t *testing.T) {
 	rf := redisfailoverv1.RedisFailover{ObjectMeta: metav1.ObjectMeta{Name: "rf", Namespace: "ns"}}
 	clientfeaturestesting.SetFeatureDuringTest(t, clientfeatures.WatchListClient, false)
 	h := &blockingHandler{started: make(chan struct{}), release: make(chan struct{})}
-	c, err := newRFController(h, staticRFs(rf), newPodListWatch(fakekubernetes.NewClientset()), time.Hour, 1, nil, metrics.Dummy, log.Dummy)
+	c, err := newRFController(h, staticRFs(rf), newPodListWatch(fakekubernetes.NewClientset()), staticSecrets(), time.Hour, 1, nil, metrics.Dummy, log.Dummy)
 	require.NoError(t, err)
 	ctx, cancel := context.WithCancel(context.Background())
 	done := make(chan error)
@@ -258,12 +459,12 @@ func TestRFControllerRunWaitsForInFlightReconciles(t *testing.T) {
 
 func TestRFControllerStopsTakingQueuedReconcilesOnceCancelled(t *testing.T) {
 	clientfeaturestesting.SetFeatureDuringTest(t, clientfeatures.WatchListClient, false)
-	var rfs []redisfailoverv1.RedisFailover
+	rfs := make([]redisfailoverv1.RedisFailover, 0, 4)
 	for _, name := range []string{"a", "b", "c", "d"} {
 		rfs = append(rfs, redisfailoverv1.RedisFailover{ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: "ns"}})
 	}
 	h := &blockingHandler{started: make(chan struct{}), release: make(chan struct{})}
-	c, err := newRFController(h, staticRFs(rfs...), newPodListWatch(fakekubernetes.NewClientset()), time.Hour, 1, nil, metrics.Dummy, log.Dummy)
+	c, err := newRFController(h, staticRFs(rfs...), newPodListWatch(fakekubernetes.NewClientset()), staticSecrets(), time.Hour, 1, nil, metrics.Dummy, log.Dummy)
 	require.NoError(t, err)
 	ctx, cancel := context.WithCancel(context.Background())
 	done := make(chan error)
@@ -272,11 +473,13 @@ func TestRFControllerStopsTakingQueuedReconcilesOnceCancelled(t *testing.T) {
 	<-h.started
 	cancel()
 	close(h.release)
-	assert.NoError(t, <-done)
+	require.NoError(t, <-done)
 	assert.Equal(t, int32(1), h.calls.Load(), "the queued RedisFailovers are not reconciled after cancel")
 }
 
 type failingHandler struct{ calls atomic.Int32 }
+
+func (h *failingHandler) Forget(string) {}
 
 func (h *failingHandler) Handle(context.Context, runtime.Object) error {
 	h.calls.Add(1)
@@ -333,7 +536,7 @@ func TestRFControllerReconcilesWithoutPodAccess(t *testing.T) {
 		return true, nil, apierrors.NewForbidden(corev1.Resource("pods"), "", errors.New("denied"))
 	})
 	h := &recordingHandler{}
-	c, err := newRFController(h, staticRFs(rf), newPodListWatch(kube), time.Hour, 1, nil, metrics.Dummy, log.Dummy)
+	c, err := newRFController(h, staticRFs(rf), newPodListWatch(kube), staticSecrets(), time.Hour, 1, nil, metrics.Dummy, log.Dummy)
 	require.NoError(t, err)
 	ctx, cancel := context.WithCancel(context.Background())
 	done := make(chan error)
@@ -345,7 +548,7 @@ func TestRFControllerReconcilesWithoutPodAccess(t *testing.T) {
 }
 
 func TestRFControllerPodOwnerIgnoresUnhandledRedisFailovers(t *testing.T) {
-	c, err := newRFController(&recordingHandler{}, staticRFs(), newPodListWatch(fakekubernetes.NewClientset()), time.Hour, 1, nil, metrics.Dummy, log.Dummy)
+	c, err := newRFController(&recordingHandler{}, staticRFs(), newPodListWatch(fakekubernetes.NewClientset()), staticSecrets(), time.Hour, 1, nil, metrics.Dummy, log.Dummy)
 	require.NoError(t, err)
 	require.NoError(t, c.rfInformer.GetIndexer().Add(&redisfailoverv1.RedisFailover{ObjectMeta: metav1.ObjectMeta{Name: "rf", Namespace: "ns"}}))
 
@@ -360,13 +563,116 @@ func TestRFControllerPodOwnerIgnoresUnhandledRedisFailovers(t *testing.T) {
 	assert.False(t, ok)
 }
 
-func TestRFControllerSkipsDeletedRedisFailovers(t *testing.T) {
+func TestRFControllerForgetsDeletedRedisFailovers(t *testing.T) {
 	h := &recordingHandler{}
-	c, err := newRFController(h, staticRFs(), newPodListWatch(fakekubernetes.NewClientset()), time.Hour, 1, nil, metrics.Dummy, log.Dummy)
+	c, err := newRFController(h, staticRFs(), newPodListWatch(fakekubernetes.NewClientset()), staticSecrets(), time.Hour, 1, nil, metrics.Dummy, log.Dummy)
 	require.NoError(t, err)
 
 	assert.NoError(t, c.process(context.Background(), "ns/gone"))
 	assert.Zero(t, h.count())
+	assert.Equal(t, []string{"ns/gone"}, h.forgotten())
+}
+
+func TestRFControllerProcessRejectsAnObjectOfAnotherType(t *testing.T) {
+	h := &recordingHandler{}
+	c, err := newRFController(h, staticRFs(), newPodListWatch(fakekubernetes.NewClientset()), staticSecrets(), time.Hour, 1, nil, metrics.Dummy, log.Dummy)
+	require.NoError(t, err)
+	require.NoError(t, c.rfInformer.GetIndexer().Add(&metav1.ObjectMeta{Name: "rf", Namespace: "ns"}))
+
+	err = c.process(context.Background(), "ns/rf")
+
+	require.EqualError(t, err, "object ns/rf is a *v1.ObjectMeta, not a runtime.Object")
+	assert.Zero(t, h.count())
+	assert.Empty(t, h.forgotten())
+}
+
+type failingIndexer struct{ cache.Indexer }
+
+func (failingIndexer) GetByKey(string) (any, bool, error) {
+	return nil, false, errors.New("cache down")
+}
+
+type failingIndexInformer struct{ cache.SharedIndexInformer }
+
+func (failingIndexInformer) GetIndexer() cache.Indexer { return failingIndexer{} }
+
+func TestRFControllerProcessWrapsTheCacheError(t *testing.T) {
+	h := &recordingHandler{}
+	c, err := newRFController(h, staticRFs(), newPodListWatch(fakekubernetes.NewClientset()), staticSecrets(), time.Hour, 1, nil, metrics.Dummy, log.Dummy)
+	require.NoError(t, err)
+	c.rfInformer = failingIndexInformer{c.rfInformer}
+
+	err = c.process(context.Background(), "ns/rf")
+
+	require.EqualError(t, err, "get ns/rf from the informer cache: cache down")
+	assert.Zero(t, h.count())
+}
+
+func TestRFControllerKeepsLiveRedisFailovers(t *testing.T) {
+	h := &recordingHandler{}
+	c, err := newRFController(h, staticRFs(), newPodListWatch(fakekubernetes.NewClientset()), staticSecrets(), time.Hour, 1, nil, metrics.Dummy, log.Dummy)
+	require.NoError(t, err)
+	require.NoError(t, c.rfInformer.GetIndexer().Add(&redisfailoverv1.RedisFailover{ObjectMeta: metav1.ObjectMeta{Name: "rf", Namespace: "ns"}}))
+
+	assert.NoError(t, c.process(context.Background(), "ns/rf"))
+	assert.Equal(t, 1, h.count())
+	assert.Empty(t, h.forgotten())
+}
+
+// stateHandler keeps the password state of the real handler for each
+// RedisFailover that it reconciles.
+type stateHandler struct{ *RedisFailoverHandler }
+
+func (h stateHandler) Handle(_ context.Context, obj runtime.Object) error {
+	return h.applyPassword(obj.(*redisfailoverv1.RedisFailover))
+}
+
+// Someone can remove the finalizer by hand. The object is then gone without a
+// reconcile that sees the deletion timestamp.
+func TestRFControllerForgetsTheStateOfARedisFailoverRemovedWithoutTheFinalizer(t *testing.T) {
+	password := "v1"
+	handler, rf, mrfh := newPasswordTestHandler(&password)
+	mrfh.On("ApplyPassword", rf, "v1", []string{"v1"}).Return(true, false, nil)
+	mrfh.On("ApplySentinelPassword", rf, "v1").Return(true, nil)
+	c, err := newRFController(stateHandler{handler}, staticRFs(), newPodListWatch(fakekubernetes.NewClientset()), staticSecrets(), time.Hour, 1, nil, metrics.Dummy, log.Dummy)
+	require.NoError(t, err)
+	require.NoError(t, c.rfInformer.GetIndexer().Add(rf))
+
+	require.NoError(t, c.process(context.Background(), "testns/test"))
+	_, tracked := handler.passwords.Load("testns/test")
+	require.True(t, tracked)
+
+	require.NoError(t, c.rfInformer.GetIndexer().Delete(rf))
+	require.NoError(t, c.process(context.Background(), "testns/test"))
+	_, tracked = handler.passwords.Load("testns/test")
+	assert.False(t, tracked)
+}
+
+func TestRFControllerQueuesTheKeyOfADeletedRedisFailover(t *testing.T) {
+	clientfeaturestesting.SetFeatureDuringTest(t, clientfeatures.WatchListClient, false)
+	rf := redisfailoverv1.RedisFailover{ObjectMeta: metav1.ObjectMeta{Name: "rf", Namespace: "ns"}}
+	events := watch.NewFake()
+	rfs := &cache.ListWatch{
+		ListWithContextFunc: func(context.Context, metav1.ListOptions) (runtime.Object, error) {
+			return &redisfailoverv1.RedisFailoverList{Items: []redisfailoverv1.RedisFailover{rf}}, nil
+		},
+		WatchFuncWithContext: func(context.Context, metav1.ListOptions) (watch.Interface, error) {
+			return events, nil
+		},
+	}
+	h := &recordingHandler{}
+	c, err := newRFController(h, rfs, newPodListWatch(fakekubernetes.NewClientset()), staticSecrets(), time.Hour, 1, nil, metrics.Dummy, log.Dummy)
+	require.NoError(t, err)
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error)
+	go func() { done <- c.Run(ctx) }()
+	require.Eventually(t, func() bool { return h.count() == 1 }, 5*time.Second, 10*time.Millisecond)
+
+	events.Delete(&rf)
+	require.Eventually(t, func() bool { return len(h.forgotten()) == 1 }, 5*time.Second, 10*time.Millisecond)
+	assert.Equal(t, []string{"ns/rf"}, h.forgotten())
+	cancel()
+	require.NoError(t, <-done)
 }
 
 func TestRFControllerResyncsRedisFailovers(t *testing.T) {
@@ -378,7 +684,7 @@ func TestRFControllerResyncsRedisFailovers(t *testing.T) {
 }
 
 func TestNewRFControllerDefaultsWorkers(t *testing.T) {
-	c, err := newRFController(&recordingHandler{}, staticRFs(), newPodListWatch(fakekubernetes.NewClientset()), 0, 0, nil, metrics.Dummy, log.Dummy)
+	c, err := newRFController(&recordingHandler{}, staticRFs(), newPodListWatch(fakekubernetes.NewClientset()), staticSecrets(), 0, 0, nil, metrics.Dummy, log.Dummy)
 	require.NoError(t, err)
 	assert.Equal(t, 3, c.workers)
 }
@@ -440,7 +746,7 @@ func (m *recordingMetrics) ObserveResourceProcessingDuration(_ context.Context, 
 	m.processed = append(m.processed, success)
 }
 
-func (m *recordingMetrics) snapshot() (int, int, []bool) {
+func (m *recordingMetrics) snapshot() (queued, inQueue int, processed []bool) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	return m.queued, m.inQueue, append([]bool(nil), m.processed...)
@@ -462,7 +768,7 @@ func TestRFControllerRecordsMetrics(t *testing.T) {
 
 func TestRFControllerCountsOneEventPerUpdate(t *testing.T) {
 	mrec := &recordingMetrics{Recorder: metrics.Dummy}
-	c, err := newRFController(&recordingHandler{}, staticRFs(), newPodListWatch(fakekubernetes.NewClientset()), time.Hour, 1, nil, mrec, log.Dummy)
+	c, err := newRFController(&recordingHandler{}, staticRFs(), newPodListWatch(fakekubernetes.NewClientset()), staticSecrets(), time.Hour, 1, nil, mrec, log.Dummy)
 	require.NoError(t, err)
 	a := &redisfailoverv1.RedisFailover{ObjectMeta: metav1.ObjectMeta{Name: "a", Namespace: "ns"}}
 	b := &redisfailoverv1.RedisFailover{ObjectMeta: metav1.ObjectMeta{Name: "b", Namespace: "ns"}}
@@ -477,4 +783,247 @@ func TestRFControllerCountsOneEventPerUpdate(t *testing.T) {
 	queued, _, _ = mrec.snapshot()
 	assert.Equal(t, 3, queued)
 	assert.Equal(t, 2, c.queue.Len())
+}
+
+func TestRFControllerEnqueueAfter(t *testing.T) {
+	c, err := newRFController(&recordingHandler{}, staticRFs(), newPodListWatch(fakekubernetes.NewClientset()), staticSecrets(), time.Hour, 1, nil, metrics.Dummy, log.Dummy)
+	require.NoError(t, err)
+	c.enqueueAfter(context.Background(), "ns/rf", 50*time.Millisecond)
+	assert.Equal(t, 0, c.queue.Len())
+	assert.Eventually(t, func() bool { return c.queue.Len() == 1 }, 5*time.Second, 10*time.Millisecond)
+}
+
+// ctxMetrics records the context value that IncResourceEventQueued gets.
+type ctxMetrics struct {
+	metrics.Recorder
+	mu    sync.Mutex
+	value any
+}
+
+func (m *ctxMetrics) IncResourceEventQueued(ctx context.Context, _ string, _ bool) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.value = ctx.Value(ctxKey{})
+}
+
+func (m *ctxMetrics) get() any {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return m.value
+}
+
+func TestRFControllerRetryAfterAConflictKeepsTheReconcileContext(t *testing.T) {
+	mrec := &ctxMetrics{Recorder: metrics.Dummy}
+	h := errorHandler{err: apierrors.NewConflict(schema.GroupResource{Resource: "redisfailovers"}, "rf", errors.New("changed"))}
+	c, err := newRFController(h, staticRFs(), newPodListWatch(fakekubernetes.NewClientset()), staticSecrets(), time.Hour, 1, nil, mrec, log.Dummy)
+	require.NoError(t, err)
+	require.NoError(t, c.rfInformer.GetIndexer().Add(&redisfailoverv1.RedisFailover{ObjectMeta: metav1.ObjectMeta{Name: "rf", Namespace: "ns"}}))
+	c.queue.Add("ns/rf")
+
+	require.True(t, c.processNext(context.WithValue(context.Background(), ctxKey{}, "v")))
+
+	assert.Eventually(t, func() bool { return mrec.get() == "v" }, 5*time.Second, 10*time.Millisecond)
+}
+
+type mutatingHandler struct{}
+
+func (mutatingHandler) Forget(string) {}
+
+func (mutatingHandler) Handle(_ context.Context, obj runtime.Object) error {
+	obj.(*redisfailoverv1.RedisFailover).Status.State = redisfailoverv1.HealthyState
+	return nil
+}
+
+// The handler changes the RedisFailover, and the informer cache shares the
+// object with other goroutines.
+func TestRFControllerHandlesACopyOfTheCachedRedisFailover(t *testing.T) {
+	c, err := newRFController(mutatingHandler{}, staticRFs(), newPodListWatch(fakekubernetes.NewClientset()), staticSecrets(), time.Hour, 1, nil, metrics.Dummy, log.Dummy)
+	require.NoError(t, err)
+	require.NoError(t, c.rfInformer.GetIndexer().Add(&redisfailoverv1.RedisFailover{ObjectMeta: metav1.ObjectMeta{Name: "rf", Namespace: "ns"}}))
+
+	require.NoError(t, c.process(context.Background(), "ns/rf"))
+	cached, _, err := c.rfInformer.GetIndexer().GetByKey("ns/rf")
+	require.NoError(t, err)
+	assert.Empty(t, cached.(*redisfailoverv1.RedisFailover).Status.State)
+}
+
+type recordedLogs struct {
+	mu    sync.Mutex
+	lines []string
+}
+
+func (r *recordedLogs) add(line string) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.lines = append(r.lines, line)
+}
+
+func (r *recordedLogs) text() string {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return strings.Join(r.lines, "\n")
+}
+
+type recordingLogger struct {
+	log.DummyLogger
+	logs   *recordedLogs
+	fields string
+}
+
+func (l recordingLogger) WithField(key string, value any) log.Logger {
+	l.fields += fmt.Sprintf("%s=%v ", key, value)
+	return l
+}
+
+func (l recordingLogger) Errorf(format string, args ...any) {
+	l.logs.add(l.fields + fmt.Sprintf(format, args...))
+}
+
+func (l recordingLogger) Infof(format string, args ...any) {
+	l.logs.add("info: " + l.fields + fmt.Sprintf(format, args...))
+}
+
+func (l recordingLogger) Warningf(format string, args ...any) {
+	l.logs.add("warning: " + l.fields + fmt.Sprintf(format, args...))
+}
+
+type errorHandler struct{ err error }
+
+func (errorHandler) Forget(string) {}
+
+func (h errorHandler) Handle(context.Context, runtime.Object) error { return h.err }
+
+// A conflict tells that a write used an old copy of the RedisFailover, and a
+// new reconcile fixes it. Other errors wait for the next event or resync.
+func TestRFControllerRetriesAConflict(t *testing.T) {
+	tests := []struct {
+		name    string
+		err     error
+		expLog  string
+		requeue bool
+	}{
+		{
+			name:    "a conflict",
+			err:     apierrors.NewConflict(schema.GroupResource{Resource: "redisfailovers"}, "rf", errors.New("the object has been modified")),
+			expLog:  "info: object-key=ns/rf redisfailover=rf namespace=ns the object changed",
+			requeue: true,
+		},
+		{
+			name:   "another error",
+			err:    errors.New("boom"),
+			expLog: "object-key=ns/rf redisfailover=rf namespace=ns error on object processing: boom",
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			logs := &recordedLogs{}
+			c, err := newRFController(errorHandler{err: test.err}, staticRFs(), newPodListWatch(fakekubernetes.NewClientset()), staticSecrets(), time.Hour, 1, nil, metrics.Dummy, recordingLogger{logs: logs})
+			require.NoError(t, err)
+			require.NoError(t, c.rfInformer.GetIndexer().Add(&redisfailoverv1.RedisFailover{ObjectMeta: metav1.ObjectMeta{Name: "rf", Namespace: "ns"}}))
+
+			c.queue.Add("ns/rf")
+			require.True(t, c.processNext(context.Background()))
+			assert.Len(t, logs.lines, 1)
+			assert.True(t, strings.HasPrefix(logs.text(), test.expLog), logs.text())
+			if test.requeue {
+				assert.Eventually(t, func() bool { return c.queue.Len() == 1 }, 3*time.Second, 10*time.Millisecond)
+			} else {
+				assert.Never(t, func() bool { return c.queue.Len() > 0 }, 1500*time.Millisecond, 50*time.Millisecond)
+			}
+		})
+	}
+}
+
+// panickingHandler panics for the RedisFailover "bad" and records the others.
+type panickingHandler struct {
+	recordingHandler
+	bad atomic.Int32
+}
+
+func (h *panickingHandler) Handle(ctx context.Context, obj runtime.Object) error {
+	if obj.(*redisfailoverv1.RedisFailover).Name == "bad" {
+		h.bad.Add(1)
+		panic("boom")
+	}
+	return h.recordingHandler.Handle(ctx, obj)
+}
+
+func TestRFControllerProcessTurnsAPanicIntoAnError(t *testing.T) {
+	logs := &recordedLogs{}
+	c, err := newRFController(&panickingHandler{}, staticRFs(), newPodListWatch(fakekubernetes.NewClientset()), staticSecrets(), time.Hour, 1, nil, metrics.Dummy, recordingLogger{logs: logs})
+	require.NoError(t, err)
+	require.NoError(t, c.rfInformer.GetIndexer().Add(&redisfailoverv1.RedisFailover{ObjectMeta: metav1.ObjectMeta{Name: "bad", Namespace: "ns"}}))
+
+	require.Error(t, c.process(context.Background(), "ns/bad"))
+	assert.Contains(t, logs.text(), "object-key=ns/bad redisfailover=bad namespace=ns panic on object processing: boom")
+	assert.Contains(t, logs.text(), "panickingHandler")
+}
+
+func TestRFControllerKeepsWorkingAfterAHandlerPanic(t *testing.T) {
+	bad := redisfailoverv1.RedisFailover{ObjectMeta: metav1.ObjectMeta{Name: "bad", Namespace: "ns"}}
+	good := redisfailoverv1.RedisFailover{ObjectMeta: metav1.ObjectMeta{Name: "good", Namespace: "ns"}}
+	kube := fakekubernetes.NewClientset()
+	h := &panickingHandler{}
+	startController(t, h, kube, bad, good)
+	require.Eventually(t, func() bool { return h.bad.Load() == 1 && h.countFor("ns/good") == 1 }, 5*time.Second, 10*time.Millisecond)
+
+	// The queue is not stuck: the panicking item runs again on its next event.
+	_, err := kube.CoreV1().Pods("ns").Create(context.Background(), rfPod("rfr-bad-0", "bad"), metav1.CreateOptions{})
+	require.NoError(t, err)
+	require.Eventually(t, func() bool { return h.bad.Load() == 2 }, 5*time.Second, 10*time.Millisecond)
+}
+
+// sentinelHandler asks a Sentinel for its master, as a reconcile does.
+type sentinelHandler struct {
+	ip    string
+	calls atomic.Int32
+}
+
+func (h *sentinelHandler) Forget(string) {}
+
+func (h *sentinelHandler) Handle(context.Context, runtime.Object) error {
+	h.calls.Add(1)
+	_, _, err := redisclient.New(metrics.Dummy).GetSentinelMonitor(h.ip)
+	return err
+}
+
+// The Redis client library panics on a negative array length. A tenant image
+// can send such a reply.
+func TestRFControllerSurvivesANegativeLengthReply(t *testing.T) {
+	const ip = "127.0.0.4"
+	l, err := net.Listen("tcp", net.JoinHostPort(ip, "26379"))
+	if err != nil {
+		t.Skipf("cannot listen on %s: %v", ip, err)
+	}
+	t.Cleanup(func() { _ = l.Close() })
+	go func() {
+		for {
+			conn, err := l.Accept()
+			if err != nil {
+				return
+			}
+			go func() {
+				defer func() { _ = conn.Close() }()
+				buf := make([]byte, 4096)
+				for {
+					if _, err := conn.Read(buf); err != nil {
+						return
+					}
+					if _, err := conn.Write([]byte("*-5\r\n")); err != nil {
+						return
+					}
+				}
+			}()
+		}
+	}()
+
+	rf := redisfailoverv1.RedisFailover{ObjectMeta: metav1.ObjectMeta{Name: "rf", Namespace: "ns"}}
+	kube := fakekubernetes.NewClientset()
+	h := &sentinelHandler{ip: ip}
+	startController(t, h, kube, rf)
+	require.Eventually(t, func() bool { return h.calls.Load() == 1 }, 5*time.Second, 10*time.Millisecond)
+
+	_, err = kube.CoreV1().Pods("ns").Create(context.Background(), rfPod("rfr-rf-0", "rf"), metav1.CreateOptions{})
+	require.NoError(t, err)
+	require.Eventually(t, func() bool { return h.calls.Load() == 2 }, 5*time.Second, 10*time.Millisecond)
 }

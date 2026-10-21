@@ -5,9 +5,9 @@ import (
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/mock"
+	"github.com/stretchr/testify/require"
 	appsv1 "k8s.io/api/apps/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
-	"k8s.io/utils/ptr"
 
 	"github.com/saremox/redis-operator/log"
 	"github.com/saremox/redis-operator/metrics"
@@ -33,7 +33,7 @@ func TestRedisStatefulSetDisablesServiceLinks(t *testing.T) {
 	client := rfservice.NewRedisFailoverKubeClient(ms, log.Dummy, metrics.Dummy)
 	err := client.EnsureRedisStatefulset(generateRF(), nil, []metav1.OwnerReference{})
 
-	assert.NoError(err)
+	require.NoError(t, err)
 	if assert.NotNil(gotSS) {
 		links := gotSS.Spec.Template.Spec.EnableServiceLinks
 		if assert.NotNil(links, "enableServiceLinks should be set explicitly, not left to the default") {
@@ -46,7 +46,7 @@ func TestSentinelDeploymentDisablesServiceLinks(t *testing.T) {
 	assert := assert.New(t)
 
 	rf := generateRF()
-	rf.Spec.Sentinel.Enabled = ptr.To(true)
+	rf.Spec.Sentinel.Enabled = new(true)
 
 	var gotD *appsv1.Deployment
 	ms := &mK8SService.Services{}
@@ -61,7 +61,7 @@ func TestSentinelDeploymentDisablesServiceLinks(t *testing.T) {
 	client := rfservice.NewRedisFailoverKubeClient(ms, log.Dummy, metrics.Dummy)
 	err := client.EnsureSentinelDeployment(rf, nil, []metav1.OwnerReference{})
 
-	assert.NoError(err)
+	require.NoError(t, err)
 	if assert.NotNil(gotD) {
 		links := gotD.Spec.Template.Spec.EnableServiceLinks
 		if assert.NotNil(links, "enableServiceLinks should be set explicitly, not left to the default") {

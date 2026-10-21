@@ -14,25 +14,27 @@ const (
 	defaultDBFilename = "dump.rdb"
 )
 
+// readDir is a variable so that tests can inject directory read faults.
+var readDir = os.ReadDir
+
 var (
 	dataDir    string
 	dbFilename string
 	dryRun     bool
 )
 
-// NewCmd creates the cleanup command
+// NewCmd creates the cleanup command.
 func NewCmd() *cobra.Command {
 	cmd := &cobra.Command{
 		Use:   "cleanup",
-		Short: "Clean up stale RDB tempfiles",
-		Long: `Clean up stale RDB tempfiles before Redis starts.
+		Short: "Remove old RDB tempfiles",
+		Long: `Remove old RDB tempfiles before Redis starts.
 
-During BGSAVE operations, Redis creates temporary files named temp-<pid>.rdb.
-If Redis crashes during a BGSAVE, these files are left behind and can accumulate,
-eventually filling the disk and causing further failures.
+A BGSAVE writes temp-<pid>.rdb. When Redis stops during a BGSAVE, the file
+stays. The files collect until the disk is full, and then each BGSAVE fails.
 
-This command removes all .rdb files except the main database file (default: dump.rdb)
-from the data directory.`,
+This command removes all the .rdb files in the data directory, except the
+--db-filename file (default dump.rdb).`,
 		RunE: runCleanup,
 	}
 
@@ -43,12 +45,10 @@ from the data directory.`,
 	return cmd
 }
 
-func runCleanup(cmd *cobra.Command, args []string) error {
-	// Validate data directory exists
+func runCleanup(_ *cobra.Command, _ []string) error {
 	info, err := os.Stat(dataDir)
 	if err != nil {
 		if os.IsNotExist(err) {
-			// Data directory doesn't exist yet, nothing to clean
 			fmt.Printf("Data directory %s does not exist, skipping cleanup\n", dataDir)
 			return nil
 		}
@@ -58,8 +58,7 @@ func runCleanup(cmd *cobra.Command, args []string) error {
 		return fmt.Errorf("%s is not a directory", dataDir)
 	}
 
-	// Find and remove stale RDB files
-	entries, err := os.ReadDir(dataDir)
+	entries, err := readDir(dataDir)
 	if err != nil {
 		return fmt.Errorf("failed to read data directory: %w", err)
 	}
@@ -68,43 +67,10 @@ func runCleanup(cmd *cobra.Command, args []string) error {
 	var totalSize int64
 
 	for _, entry := range entries {
-		if entry.IsDir() {
-			continue
+		if size, ok := cleanEntry(entry); ok {
+			cleaned++
+			totalSize += size
 		}
-
-		name := entry.Name()
-
-		// Skip non-RDB files
-		if !strings.HasSuffix(name, ".rdb") {
-			continue
-		}
-
-		// Preserve the main database file
-		if name == dbFilename {
-			continue
-		}
-
-		filePath := filepath.Join(dataDir, name)
-
-		// Get file size for reporting
-		fileInfo, err := entry.Info()
-		if err != nil {
-			fmt.Printf("Warning: failed to get info for %s: %v\n", name, err)
-			continue
-		}
-
-		if dryRun {
-			fmt.Printf("Would delete: %s (%d bytes)\n", filePath, fileInfo.Size())
-		} else {
-			if err := os.Remove(filePath); err != nil {
-				fmt.Printf("Warning: failed to remove %s: %v\n", filePath, err)
-				continue
-			}
-			fmt.Printf("Deleted: %s (%d bytes)\n", filePath, fileInfo.Size())
-		}
-
-		cleaned++
-		totalSize += fileInfo.Size()
 	}
 
 	if cleaned > 0 {
@@ -118,4 +84,43 @@ func runCleanup(cmd *cobra.Command, args []string) error {
 	}
 
 	return nil
+}
+
+// cleanEntry removes the entry if it is a stale RDB file, or prints it in a
+// dry run. It returns the size of the file, and whether the file counts as
+// cleaned.
+func cleanEntry(entry os.DirEntry) (int64, bool) {
+	if entry.IsDir() {
+		return 0, false
+	}
+
+	name := entry.Name()
+
+	if !strings.HasSuffix(name, ".rdb") {
+		return 0, false
+	}
+
+	if name == dbFilename {
+		return 0, false
+	}
+
+	filePath := filepath.Join(dataDir, name)
+
+	fileInfo, err := entry.Info()
+	if err != nil {
+		fmt.Printf("Warning: failed to get info for %s: %v\n", name, err)
+		return 0, false
+	}
+
+	if dryRun {
+		fmt.Printf("Would delete: %s (%d bytes)\n", filePath, fileInfo.Size())
+	} else {
+		if err := os.Remove(filePath); err != nil {
+			fmt.Printf("Warning: failed to remove %s: %v\n", filePath, err)
+			return 0, false
+		}
+		fmt.Printf("Deleted: %s (%d bytes)\n", filePath, fileInfo.Size())
+	}
+
+	return fileInfo.Size(), true
 }

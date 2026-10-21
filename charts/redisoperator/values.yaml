@@ -1,55 +1,60 @@
 # Default values for redis-operator.
-# This is a YAML-formatted file.
-# Declare variables to be passed into your templates.
 
-# Name of the image repository to pull the container image from.
+# The image of the operator.
 image:
   repository: ghcr.io/buildio/redis-operator
   pullPolicy: IfNotPresent
-  # Image tag. If not specified, defaults to Chart appVersion (e.g., "4.1.0").
-  # Note: Starting with 4.0.0, tags do NOT have a leading "v" (4.0.0, not v4.0.0).
+  # An empty tag uses the appVersion of the chart.
   tag: ""
-  cli_args: ""
+  # Extra arguments of the operator, one flag in each item. A string is split
+  # at whitespace. The chart sets `--listen-address` from container.port.
+  cli_args: []
 
 imageCredentials:
+  # true gives image pull Secrets to the operator pod and the CRD upgrade hook pod.
+  # These are the existsSecrets. If existsSecrets is empty, the chart creates a
+  # Secret from registry, username, password and email. The chart stops when
+  # username or password has the placeholder value below.
   create: false
   registry: url.private.registry
   username: someone
   password: somepassword
   email: someone@example.com
-  # Use exists secrets in namespace
-  existsSecrets:
-    - registrysecret
+  # Names of pull Secrets that exist in the namespace. Example: [registrysecret]
+  existsSecrets: []
 
 updateStrategy:
   type: RollingUpdate
 
 replicas: 1
 
-# A name in place of the chart name for `app:` labels.
+# A name in place of the chart name in the resource names and in the
+# `app.kubernetes.io/name` label.
 nameOverride: ""
 
 # A name to substitute for the full names of resources.
 fullnameOverride: ""
 
-# The name of the Namespace to deploy
-# If not set, `.Release.Namespace` is used
+# The namespace of the operator. Defaults to the namespace of the release.
 namespace: null
 
 serviceAccount:
-  # Enable service account creation.
+  # true creates the ServiceAccount and its RBAC objects (ClusterRole, Role and
+  # bindings). false skips them. You must then give the operator its RBAC permissions.
   create: true
   # Annotations to be added to the service account.
   annotations: {}
-  # The name of the service account to use.
-  # If not set and create is true, a name is generated using the fullname template.
+  # The name of the ServiceAccount. If it is empty, the chart uses the full
+  # name of the release with create true, and `default` with create false.
   name: ""
 
 service:
   type: ClusterIP
+  # The Service forwards this port to container.port.
   port: 9710
 
 container:
+  # The operator serves its metrics on this port. The probes use it too.
   port: 9710
 
 # Container [security context](https://kubernetes.io/docs/tasks/configure-pod-container/security-context/#set-the-security-context-for-a-container).
@@ -82,17 +87,30 @@ resources: {}
 #     cpu: 100m
 #     memory: 128Mi
 
+# true applies an auth Secret (spec.auth.secretPath) change immediately, not at
+# the next sync (30s by default). The operator then needs list and watch on
+# secrets in all namespaces, which can read every Secret. That is why it is
+# false by default. With serviceAccount.create=false, add these verbs to your
+# own ClusterRole.
+watchAuthSecrets: false
+
 ### Monitoring
 ###############
 monitoring:
-  # Enable Prometheus PodMonitor to monitor the operator.
+  # The chart always creates a metrics Service. true adds the Service
+  # `<fullname>-prometheus` with the label `prometheus: <prometheus.name>`.
+  # serviceMonitor adds a Prometheus ServiceMonitor that selects that Service.
+  # It needs enabled: true.
   enabled: false
   serviceMonitor: false
   serviceAnnotations: {}
   prometheus:
+    # The value of the `prometheus` label. Set it to match the
+    # serviceMonitorSelector of your Prometheus.
     name: unknown
 
-# Annotations to be added to pods and deployments.
+# Annotations of the operator Deployment, its pods, the operator Service and
+# the registry Secret.
 annotations: {}
 
 nodeSelector: {}
@@ -107,25 +125,25 @@ priorityClassName: ""
 
 # CustomResourceDefinition lifecycle.
 crds:
-  # Helm only installs the contents of a chart's crds/ directory on the first
-  # `helm install` - it never touches them again on `helm upgrade`
+  # Helm installs the crds/ directory of a chart only on `helm install`, not
+  # on `helm upgrade`
   # (https://helm.sh/docs/chart_best_practices/custom_resource_definitions/).
-  # On a long-lived cluster this lets the live CRD schema silently drift
-  # behind the chart: the API server prunes spec fields it doesn't recognize
-  # (e.g. a newly added field) instead of erroring, which looks like the
-  # operator ignoring your changes rather than a stale CRD.
+  # The CRD in the cluster then gets older than the chart. The API server
+  # removes the spec fields that the old CRD does not know, and shows no error.
   #
-  # Enabling this runs `kubectl apply` on the CRD bundled with this chart
-  # version as a pre-install/pre-upgrade Helm hook, using the operator's own
-  # ServiceAccount (which already needs customresourcedefinitions RBAC for
-  # the operator itself). Disabled by default because it grants a Helm hook
-  # Job permission to modify a cluster-scoped resource - review before
-  # enabling on a shared cluster.
+  # true runs `kubectl apply` on the CRD of this chart version in a
+  # pre-install and pre-upgrade Helm hook. The hook Job has its own
+  # ServiceAccount and ClusterRole. The default is false, because the Job can
+  # change a cluster-scoped resource. Examine it before you enable it on a
+  # shared cluster.
+  #
+  # The hook Job uses the securityContext and podSecurityContext of the operator,
+  # so it can run in a namespace where the operator can run.
   upgradeHook:
     enabled: false
     image:
       repository: rancher/kubectl
-      # Defaults to a kubectl release tracking this chart's kubeVersion.
+      # Defaults to v1.36.2.
       tag: ""
       pullPolicy: IfNotPresent
     # Resource requests and limits for the hook Job's container.

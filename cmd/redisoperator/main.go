@@ -4,7 +4,7 @@ import (
 	"context"
 	"fmt"
 	"net/http"
-	_ "net/http/pprof"
+	"net/http/pprof"
 	"os"
 	"os/signal"
 	"strings"
@@ -21,6 +21,7 @@ import (
 	"github.com/saremox/redis-operator/operator/redisfailover"
 	"github.com/saremox/redis-operator/service/k8s"
 	"github.com/saremox/redis-operator/service/redis"
+	"github.com/saremox/redis-operator/version"
 )
 
 const (
@@ -52,6 +53,8 @@ func New(logger log.Logger) Main {
 func (m *Main) Run() error {
 	errC := make(chan error, 1)
 
+	m.logger.Infof("Starting redis-operator %s", version.Version)
+
 	// Set correct logging.
 	err := m.logger.Set(log.Level(strings.ToLower(m.flags.LogLevel)))
 	if err != nil {
@@ -64,15 +67,14 @@ func (m *Main) Run() error {
 	// Serve metrics.
 	go func() {
 		log.Infof("Listening on %s for metrics exposure on URL %s", m.flags.ListenAddr, m.flags.MetricsPath)
-		http.Handle(m.flags.MetricsPath, promhttp.Handler())
-		err := http.ListenAndServe(m.flags.ListenAddr, nil)
+		err := newHTTPServer(m.flags.ListenAddr, newHTTPHandler(m.flags.MetricsPath, m.flags.EnablePprof)).ListenAndServe()
 		if err != nil {
 			log.Fatal(err)
 		}
 	}()
 
 	// Kubernetes clients.
-	k8sClient, customClient, err := utils.CreateKubernetesClients(m.flags)
+	k8sClient, customClient, metadataClient, err := utils.CreateKubernetesClients(m.flags)
 	if err != nil {
 		return err
 	}
@@ -87,7 +89,7 @@ func (m *Main) Run() error {
 	lockNamespace := getNamespace()
 
 	// Create operator and run.
-	redisfailoverOperator, err := redisfailover.New(m.flags.ToRedisOperatorConfig(), k8sservice, k8sClient, lockNamespace, redisClient, metricsRecorder, m.logger)
+	redisfailoverOperator, err := redisfailover.New(m.flags.ToRedisOperatorConfig(), k8sservice, k8sClient, metadataClient, lockNamespace, redisClient, metricsRecorder, m.logger)
 	if err != nil {
 		return err
 	}
@@ -118,23 +120,49 @@ func (m *Main) Run() error {
 	}
 }
 
+// newHTTPServer limits the time and the size of a request, so that the server
+// closes idle and slow connections. It sets no write timeout, because a CPU
+// profile and a large scrape can take a long time.
+func newHTTPServer(addr string, handler http.Handler) *http.Server {
+	return &http.Server{
+		Addr:              addr,
+		Handler:           handler,
+		ReadHeaderTimeout: 5 * time.Second,
+		ReadTimeout:       10 * time.Second,
+		IdleTimeout:       60 * time.Second,
+		MaxHeaderBytes:    64 << 10,
+	}
+}
+
+// newHTTPHandler serves the metrics, and the profiler only when enabled,
+// because the profiler has no authentication.
+func newHTTPHandler(metricsPath string, enablePprof bool) http.Handler {
+	mux := http.NewServeMux()
+	mux.Handle(metricsPath, promhttp.Handler())
+	if enablePprof {
+		mux.HandleFunc("/debug/pprof/", pprof.Index)
+		mux.HandleFunc("/debug/pprof/cmdline", pprof.Cmdline)
+		mux.HandleFunc("/debug/pprof/profile", pprof.Profile)
+		mux.HandleFunc("/debug/pprof/symbol", pprof.Symbol)
+		mux.HandleFunc("/debug/pprof/trace", pprof.Trace)
+	}
+	return mux
+}
+
 func (m *Main) createSignalCapturer() <-chan os.Signal {
 	sigC := make(chan os.Signal, 1)
 	signal.Notify(sigC, syscall.SIGTERM, syscall.SIGINT)
 	return sigC
 }
 
+// getNamespace returns the namespace of the leader-election lease: the
+// POD_NAMESPACE env var, else the namespace of the service account token,
+// else "default".
 func getNamespace() string {
-	// This way assumes you've set the POD_NAMESPACE environment
-	// variable using the downward API.  This check has to be done first
-	// for backwards compatibility with the way InClusterConfig was
-	// originally set up
 	if ns, ok := os.LookupEnv("POD_NAMESPACE"); ok {
 		return ns
 	}
 
-	// Fall back to the namespace associated with the service account
-	// token, if available
 	if data, err := os.ReadFile("/var/run/secrets/kubernetes.io/serviceaccount/namespace"); err == nil {
 		if ns := strings.TrimSpace(string(data)); len(ns) > 0 {
 			return ns

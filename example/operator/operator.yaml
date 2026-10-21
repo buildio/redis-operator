@@ -19,13 +19,19 @@ spec:
       serviceAccountName: redisoperator
       enableServiceLinks: false
       containers:
-      - image: ghcr.io/saremox/redis-operator:4.0.0-rc2
+      - image: ghcr.io/buildio/redis-operator:4.2.0-rc2
         imagePullPolicy: IfNotPresent
         name: app
         securityContext:
+          allowPrivilegeEscalation: false
+          capabilities:
+            drop:
+              - ALL
           readOnlyRootFilesystem: true
           runAsNonRoot: true
           runAsUser: 1000
+          seccompProfile:
+            type: RuntimeDefault
         resources:
           limits:
             cpu: 100m

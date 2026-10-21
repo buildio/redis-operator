@@ -1,6 +1,7 @@
 package v1
 
 import (
+	"fmt"
 	"time"
 
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -15,8 +16,12 @@ const (
 	defaultRedisPort             = 6379
 	defaultMaxMemoryPercent      = 75
 	defaultMaxMemoryPolicy       = "noeviction"
-	HealthyState                 = "Healthy"
-	NotHealthyState              = "NotHealthy"
+	// HealthyState is the status.state of a RedisFailover that passed each check.
+	HealthyState = "Healthy"
+	// NotHealthyState is the status.state of a RedisFailover that failed a
+	// check or the validation, or that has an object name conflict. The
+	// status.message usually gives the reason.
+	NotHealthyState = "NotHealthy"
 
 	// DefaultInstanceManagerImage is the default image used for the instance manager.
 	// This image contains the redis-instance binary that runs as PID 1.
@@ -24,19 +29,33 @@ const (
 	DefaultInstanceManagerImage = "ghcr.io/buildio/redis-operator:4.1.0"
 )
 
+// The Sentinel timeouts that apply when sentinel.customConfig does not set them.
+// sentinel.conf and the readiness script of the Redis pods use the same values.
+const (
+	// DefaultSentinelDownAfterMilliseconds is the default of
+	// down-after-milliseconds.
+	DefaultSentinelDownAfterMilliseconds = 5000
+	// DefaultSentinelFailoverTimeoutMilliseconds is the default of
+	// failover-timeout.
+	DefaultSentinelFailoverTimeoutMilliseconds = 10000
+)
+
+// DefaultSentinelMasterName is the name of the master that the Sentinels
+// monitor. The clients, the probes and the shutdown script use it too.
+const DefaultSentinelMasterName = "mymaster"
+
 var (
-	// DefaultSentinelEnabled is the default value for sentinel.enabled
-	// Starting with 4.0.0, sentinel is DISABLED by default (operator-managed failover)
-	// Set sentinel.enabled: true to use Redis Sentinel for failover
+	// DefaultSentinelEnabled is the value of sentinel.enabled when it is not
+	// set. Without Sentinel, the operator does the failover.
 	DefaultSentinelEnabled = false
-	// DefaultFailoverTimeout is the default timeout for operator-managed failover
+	// DefaultFailoverTimeout is the value of sentinel.failoverTimeout when it is not set.
 	DefaultFailoverTimeout = metav1.Duration{Duration: 10 * time.Second}
 )
 
 var (
 	defaultSentinelCustomConfig = []string{
-		"down-after-milliseconds 5000",
-		"failover-timeout 10000",
+		fmt.Sprintf("down-after-milliseconds %d", DefaultSentinelDownAfterMilliseconds),
+		fmt.Sprintf("failover-timeout %d", DefaultSentinelFailoverTimeoutMilliseconds),
 	}
 	defaultRedisCustomConfig = []string{
 		"replica-priority 100",

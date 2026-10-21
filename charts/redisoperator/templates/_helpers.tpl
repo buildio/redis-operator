@@ -8,9 +8,9 @@ Expand the name of the chart.
 {{- end -}}
 
 {{/*
-Create a default fully qualified app name.
-We truncate at 63 chars because some Kubernetes name fields are limited to this (by the DNS naming spec).
-If release name contains chart name it will be used as a full name.
+Create a default fully qualified app name. Some Kubernetes name fields are
+limited to 63 characters (DNS naming spec), so the name is cut at 63.
+A release name that contains the chart name is the full name.
 */}}
 {{- define "chart.fullname" -}}
 {{- if .Values.fullnameOverride -}}
@@ -35,7 +35,6 @@ Create chart name and version as used by the chart label.
 
 {{/*
 Common labels
-timestamp: {{ now | date "2006-01-02_15-04-05" | quote }}
 */}}
 {{- define "chart.labels" -}}
 helm.sh/chart: {{ include "chart.chart" . }}
@@ -70,12 +69,34 @@ Create the name of the service account to use
   {{- end -}}
 {{- end -}}
 
-{{/* Expands data for image pull secret. */}}
+{{/*
+Expands data for image pull secret. A pull Secret with the placeholder
+credentials of values.yaml cannot pull an image, so the chart stops instead.
+*/}}
 {{- define "imagePullSecret" }}
 {{- with .Values.imageCredentials }}
+{{- if or (eq .username "someone") (eq .password "somepassword") }}
+{{- fail "imageCredentials.create is true, so the chart creates a pull Secret, but imageCredentials.username or password has the placeholder value. Set both, or set imageCredentials.existsSecrets to your pull Secrets, for example [registrysecret]." }}
+{{- end }}
 {{- printf "{\"auths\":{\"%s\":{\"username\":\"%s\",\"password\":\"%s\",\"email\":\"%s\",\"auth\":\"%s\"}}}" .registry .username .password .email (printf "%s:%s" .username .password | b64enc) | b64enc }}
 {{- end }}
 {{- end }}
+
+{{/*
+The imagePullSecrets key of a pod spec. Takes the root context as "root" and
+the name of the Secret that the chart creates from imageCredentials as
+"secret". A pod spec must have the key only once, because a YAML decoder
+keeps only the last copy of a key.
+*/}}
+{{- define "chart.imagePullSecrets" -}}
+{{- $creds := .root.Values.imageCredentials -}}
+{{- if $creds.create -}}
+imagePullSecrets:
+{{- range ($creds.existsSecrets | default (list .secret)) }}
+  - name: {{ . }}
+{{- end }}
+{{- end }}
+{{- end -}}
 
 {{/*
 Create the name of the namespace

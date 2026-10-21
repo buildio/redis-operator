@@ -1,13 +1,19 @@
 package service_test
 
 import (
+	"errors"
+	"maps"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 	corev1 "k8s.io/api/core/v1"
+	policyv1 "k8s.io/api/policy/v1"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/runtime"
 	kubefake "k8s.io/client-go/kubernetes/fake"
-	"k8s.io/utils/ptr"
+	k8stesting "k8s.io/client-go/testing"
 
 	redisfailoverv1 "github.com/saremox/redis-operator/api/redisfailover/v1"
 	redisfailoverfake "github.com/saremox/redis-operator/client/k8s/clientset/versioned/fake"
@@ -32,7 +38,7 @@ func sentinelLifecycleRF() *redisfailoverv1.RedisFailover {
 				Replicas: int32(3),
 			},
 			Sentinel: redisfailoverv1.SentinelSettings{
-				Enabled:  ptr.To(true),
+				Enabled:  new(true),
 				Replicas: int32(3),
 			},
 		},
@@ -53,15 +59,15 @@ func sentinelResourceInventory(t *testing.T, kubecli *kubefake.Clientset, rf *re
 	listOpts := metav1.ListOptions{LabelSelector: selector}
 
 	deployments, err := kubecli.AppsV1().Deployments(rf.Namespace).List(t.Context(), listOpts)
-	assert.NoError(t, err)
+	require.NoError(t, err)
 	services, err := kubecli.CoreV1().Services(rf.Namespace).List(t.Context(), listOpts)
-	assert.NoError(t, err)
+	require.NoError(t, err)
 	configMaps, err := kubecli.CoreV1().ConfigMaps(rf.Namespace).List(t.Context(), listOpts)
-	assert.NoError(t, err)
+	require.NoError(t, err)
 	pdbs, err := kubecli.PolicyV1().PodDisruptionBudgets(rf.Namespace).List(t.Context(), listOpts)
-	assert.NoError(t, err)
+	require.NoError(t, err)
 	serviceAccounts, err := kubecli.CoreV1().ServiceAccounts(rf.Namespace).List(t.Context(), listOpts)
-	assert.NoError(t, err)
+	require.NoError(t, err)
 
 	return map[string]int{
 		"Deployment":          len(deployments.Items),
@@ -81,7 +87,9 @@ func sentinelResourceInventory(t *testing.T, kubecli *kubefake.Clientset, rf *re
 func TestSentinelResourceLifecycleSymmetry(t *testing.T) {
 	rf := sentinelLifecycleRF()
 	labels := map[string]string{}
-	ownerRefs := []metav1.OwnerReference{}
+	// The cleanup deletes only objects that the RedisFailover controls.
+	rf.UID = "uid-lifecycle"
+	ownerRefs := ownerRefsOf(rf)
 
 	kubecli := kubefake.NewClientset()
 	crdcli := redisfailoverfake.NewSimpleClientset()
@@ -100,7 +108,7 @@ func TestSentinelResourceLifecycleSymmetry(t *testing.T) {
 	}
 
 	// Disable Sentinel the way Ensure() does when sentinelsAllowed flips to false.
-	assert.NoError(t, client.EnsureNotPresentSentinelResources(rf))
+	require.NoError(t, client.EnsureNotPresentSentinelResources(rf))
 
 	after := sentinelResourceInventory(t, kubecli, rf)
 	for kind, count := range after {
@@ -117,7 +125,9 @@ func TestSentinelResourceLifecycleSymmetryPreservesUserServiceAccount(t *testing
 	rf := sentinelLifecycleRF()
 	rf.Spec.Sentinel.ServiceAccountName = "user-managed-sa"
 	labels := map[string]string{}
-	ownerRefs := []metav1.OwnerReference{}
+	// The cleanup deletes only objects that the RedisFailover controls.
+	rf.UID = "uid-lifecycle"
+	ownerRefs := ownerRefsOf(rf)
 
 	kubecli := kubefake.NewClientset()
 	crdcli := redisfailoverfake.NewSimpleClientset()
@@ -145,13 +155,265 @@ func TestSentinelResourceLifecycleSymmetryPreservesUserServiceAccount(t *testing
 	inventory := sentinelResourceInventory(t, kubecli, rf)
 	assert.Equal(t, 0, inventory["ServiceAccount"], "no operator-owned ServiceAccount should be created when ServiceAccountName is user-supplied")
 
-	assert.NoError(t, client.EnsureNotPresentSentinelResources(rf))
+	require.NoError(t, client.EnsureNotPresentSentinelResources(rf))
 
 	_, err = kubecli.CoreV1().ServiceAccounts(rf.Namespace).Get(t.Context(), "user-managed-sa", metav1.GetOptions{})
-	assert.NoError(t, err, "the user's own ServiceAccount must survive cleanup")
+	require.NoError(t, err, "the user's own ServiceAccount must survive cleanup")
 
 	after := sentinelResourceInventory(t, kubecli, rf)
 	for kind, count := range after {
 		assert.Equalf(t, 0, count, "expected no operator-owned %s to remain after cleanup, found %d", kind, count)
+	}
+}
+
+// ownedLifecycleRF returns sentinelLifecycleRF with a UID, and the owner
+// reference that the handler gives to the objects of this RF.
+func ownedLifecycleRF() (*redisfailoverv1.RedisFailover, []metav1.OwnerReference) {
+	rf := sentinelLifecycleRF()
+	rf.UID = "lifecycle-uid"
+	return rf, []metav1.OwnerReference{*metav1.NewControllerRef(rf, redisfailoverv1.VersionKind(redisfailoverv1.RFKind))}
+}
+
+// TestDisablePodDisruptionBudgetDeletesExistingPDB covers a PDB that the
+// operator created before the user disabled it. A PDB that stays blocks the
+// node drains that the user disabled it for.
+func TestDisablePodDisruptionBudgetDeletesExistingPDB(t *testing.T) {
+	tests := []struct {
+		name    string
+		pdbName string
+		flag    func(rf *redisfailoverv1.RedisFailover) *bool
+		ensure  func(client *rfservice.RedisFailoverKubeClient, rf *redisfailoverv1.RedisFailover, ownerRefs []metav1.OwnerReference) error
+	}{
+		{
+			name:    "redis",
+			pdbName: "rfr-lifecycle",
+			flag:    func(rf *redisfailoverv1.RedisFailover) *bool { return &rf.Spec.Redis.DisablePodDisruptionBudget },
+			ensure: func(client *rfservice.RedisFailoverKubeClient, rf *redisfailoverv1.RedisFailover, ownerRefs []metav1.OwnerReference) error {
+				return client.EnsureRedisStatefulset(rf, map[string]string{}, ownerRefs)
+			},
+		},
+		{
+			name:    "sentinel",
+			pdbName: "rfs-lifecycle",
+			flag:    func(rf *redisfailoverv1.RedisFailover) *bool { return &rf.Spec.Sentinel.DisablePodDisruptionBudget },
+			ensure: func(client *rfservice.RedisFailoverKubeClient, rf *redisfailoverv1.RedisFailover, ownerRefs []metav1.OwnerReference) error {
+				return client.EnsureSentinelDeployment(rf, map[string]string{}, ownerRefs)
+			},
+		},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			rf, ownerRefs := ownedLifecycleRF()
+			kubecli := kubefake.NewClientset()
+			k8sService := k8s.New(kubecli, redisfailoverfake.NewSimpleClientset(), log.Dummy, metrics.Dummy)
+			client := rfservice.NewRedisFailoverKubeClient(k8sService, log.Dummy, metrics.Dummy)
+			pdbExists := func() bool {
+				_, err := kubecli.PolicyV1().PodDisruptionBudgets(rf.Namespace).Get(t.Context(), test.pdbName, metav1.GetOptions{})
+				return err == nil
+			}
+
+			// A PDB that another RedisFailover or the user owns stays.
+			require.NoError(t, test.ensure(client, rf, nil))
+			*test.flag(rf) = true
+			require.NoError(t, test.ensure(client, rf, ownerRefs))
+			assert.True(t, pdbExists(), "a PDB that the RedisFailover does not own must stay")
+
+			require.NoError(t, kubecli.PolicyV1().PodDisruptionBudgets(rf.Namespace).Delete(t.Context(), test.pdbName, metav1.DeleteOptions{}))
+			*test.flag(rf) = false
+			require.NoError(t, test.ensure(client, rf, ownerRefs))
+			assert.True(t, pdbExists())
+
+			*test.flag(rf) = true
+			require.NoError(t, test.ensure(client, rf, ownerRefs))
+			assert.False(t, pdbExists(), "the disabled PDB must be deleted")
+
+			// The next reconcile finds no PDB, which is not an error.
+			require.NoError(t, test.ensure(client, rf, ownerRefs))
+
+			// A missing RBAC verb does not stop the reconcile.
+			kubecli.PrependReactor("get", "poddisruptionbudgets", func(k8stesting.Action) (bool, runtime.Object, error) {
+				return true, nil, apierrors.NewForbidden(policyv1.Resource("poddisruptionbudgets"), test.pdbName, errors.New("no get"))
+			})
+			require.NoError(t, test.ensure(client, rf, ownerRefs))
+
+			kubecli.PrependReactor("get", "poddisruptionbudgets", func(k8stesting.Action) (bool, runtime.Object, error) {
+				return true, nil, errors.New("get failed")
+			})
+			assert.Error(t, test.ensure(client, rf, ownerRefs))
+		})
+	}
+}
+
+// TestDisablePodDisruptionBudgetIgnoresForbiddenDelete covers a ClusterRole
+// without the delete verb. The cleanup is optional, so the reconcile goes on.
+func TestDisablePodDisruptionBudgetIgnoresForbiddenDelete(t *testing.T) {
+	rf, ownerRefs := ownedLifecycleRF()
+	kubecli := kubefake.NewClientset()
+	k8sService := k8s.New(kubecli, redisfailoverfake.NewSimpleClientset(), log.Dummy, metrics.Dummy)
+	client := rfservice.NewRedisFailoverKubeClient(k8sService, log.Dummy, metrics.Dummy)
+	require.NoError(t, client.EnsureRedisStatefulset(rf, map[string]string{}, ownerRefs))
+
+	kubecli.PrependReactor("delete", "poddisruptionbudgets", func(k8stesting.Action) (bool, runtime.Object, error) {
+		return true, nil, apierrors.NewForbidden(policyv1.Resource("poddisruptionbudgets"), "rfr-lifecycle", errors.New("no delete"))
+	})
+	rf.Spec.Redis.DisablePodDisruptionBudget = true
+	assert.NoError(t, client.EnsureRedisStatefulset(rf, map[string]string{}, ownerRefs))
+}
+
+// TestEnsureSentinelDeploymentDeletesUnusedServiceAccount covers a
+// ServiceAccount that the operator created before the user set
+// sentinel.serviceAccountName.
+func TestEnsureSentinelDeploymentDeletesUnusedServiceAccount(t *testing.T) {
+	rf, ownerRefs := ownedLifecycleRF()
+	autoName := rfservice.GetSentinelServiceAccountName(rf)
+	kubecli := kubefake.NewClientset()
+	k8sService := k8s.New(kubecli, redisfailoverfake.NewSimpleClientset(), log.Dummy, metrics.Dummy)
+	client := rfservice.NewRedisFailoverKubeClient(k8sService, log.Dummy, metrics.Dummy)
+	ensure := func() error {
+		return client.EnsureSentinelDeployment(rf, map[string]string{}, ownerRefs)
+	}
+	saExists := func() bool {
+		_, err := kubecli.CoreV1().ServiceAccounts(rf.Namespace).Get(t.Context(), autoName, metav1.GetOptions{})
+		return err == nil
+	}
+
+	require.NoError(t, ensure())
+	assert.True(t, saExists())
+	d, err := kubecli.AppsV1().Deployments(rf.Namespace).Get(t.Context(), rfservice.GetSentinelName(rf), metav1.GetOptions{})
+	assert.NoError(t, err)
+
+	// A user ServiceAccount with this name is the one that the pods use.
+	rf.Spec.Sentinel.ServiceAccountName = autoName
+	assert.NoError(t, ensure())
+	assert.True(t, saExists())
+
+	// A pod of the old ReplicaSet still uses the ServiceAccount.
+	podLabels := map[string]string{"pod-template-hash": "oldhash"}
+	maps.Copy(podLabels, d.Spec.Selector.MatchLabels)
+	oldPod := &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "rfs-lifecycle-old",
+			Namespace: rf.Namespace,
+			Labels:    podLabels,
+			OwnerReferences: []metav1.OwnerReference{
+				{APIVersion: "apps/v1", Kind: "ReplicaSet", Name: d.Name + "-oldhash", UID: "old-rs-uid", Controller: new(true)},
+			},
+		},
+		Spec: corev1.PodSpec{ServiceAccountName: autoName},
+	}
+	_, err = kubecli.CoreV1().Pods(rf.Namespace).Create(t.Context(), oldPod, metav1.CreateOptions{})
+	require.NoError(t, err)
+	// A pod with the labels but without the owner does not keep the ServiceAccount.
+	foreignPod := oldPod.DeepCopy()
+	foreignPod.Name = "rfs-lifecycle-foreign"
+	foreignPod.OwnerReferences = nil
+	_, err = kubecli.CoreV1().Pods(rf.Namespace).Create(t.Context(), foreignPod, metav1.CreateOptions{})
+	assert.NoError(t, err)
+	rf.Spec.Sentinel.ServiceAccountName = "user-managed-sa"
+	assert.NoError(t, ensure())
+	assert.True(t, saExists(), "the ServiceAccount must stay while a Sentinel pod uses it")
+
+	assert.NoError(t, kubecli.CoreV1().Pods(rf.Namespace).Delete(t.Context(), oldPod.Name, metav1.DeleteOptions{}))
+	assert.NoError(t, ensure())
+	assert.False(t, saExists(), "the unused ServiceAccount must be deleted")
+
+	// The next reconcile finds no ServiceAccount, which is not an error.
+	assert.NoError(t, ensure())
+}
+
+// TestEnsureSentinelDeploymentKeepsServiceAccount covers the cases where the
+// operator must not delete the ServiceAccount, or where the delete fails.
+func TestEnsureSentinelDeploymentKeepsServiceAccount(t *testing.T) {
+	tests := []struct {
+		name      string
+		ownerRefs func(ownerRefs []metav1.OwnerReference) []metav1.OwnerReference
+		reactor   func(kubecli *kubefake.Clientset)
+		expErr    bool
+		expExists bool
+		// noDelete is true when no DELETE may be sent.
+		noDelete bool
+	}{
+		{
+			name:      "the RedisFailover does not own it",
+			ownerRefs: func([]metav1.OwnerReference) []metav1.OwnerReference { return nil },
+			expExists: true,
+			noDelete:  true,
+		},
+		{
+			name: "the Deployment update fails",
+			reactor: func(kubecli *kubefake.Clientset) {
+				kubecli.PrependReactor("update", "deployments", func(k8stesting.Action) (bool, runtime.Object, error) {
+					return true, nil, errors.New("update failed")
+				})
+			},
+			expErr:    true,
+			expExists: true,
+			noDelete:  true,
+		},
+		{
+			name: "the operator cannot list the Sentinel pods",
+			reactor: func(kubecli *kubefake.Clientset) {
+				kubecli.PrependReactor("list", "pods", func(k8stesting.Action) (bool, runtime.Object, error) {
+					return true, nil, apierrors.NewForbidden(corev1.Resource("pods"), "", errors.New("no list"))
+				})
+			},
+			expExists: true,
+			noDelete:  true,
+		},
+		{
+			name: "the operator cannot delete it",
+			reactor: func(kubecli *kubefake.Clientset) {
+				kubecli.PrependReactor("delete", "serviceaccounts", func(k8stesting.Action) (bool, runtime.Object, error) {
+					return true, nil, apierrors.NewForbidden(corev1.Resource("serviceaccounts"), "rfs-sa-lifecycle", errors.New("no delete"))
+				})
+			},
+			expExists: true,
+		},
+		{
+			name: "the delete fails",
+			reactor: func(kubecli *kubefake.Clientset) {
+				kubecli.PrependReactor("delete", "serviceaccounts", func(k8stesting.Action) (bool, runtime.Object, error) {
+					return true, nil, errors.New("delete failed")
+				})
+			},
+			expErr:    true,
+			expExists: true,
+		},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			rf, ownerRefs := ownedLifecycleRF()
+			kubecli := kubefake.NewClientset()
+			k8sService := k8s.New(kubecli, redisfailoverfake.NewSimpleClientset(), log.Dummy, metrics.Dummy)
+			client := rfservice.NewRedisFailoverKubeClient(k8sService, log.Dummy, metrics.Dummy)
+			createRefs := ownerRefs
+			if test.ownerRefs != nil {
+				createRefs = test.ownerRefs(ownerRefs)
+			}
+			require.NoError(t, client.EnsureSentinelDeployment(rf, map[string]string{}, createRefs))
+
+			if test.reactor != nil {
+				test.reactor(kubecli)
+			}
+			kubecli.ClearActions()
+			rf.Spec.Sentinel.ServiceAccountName = "user-managed-sa"
+			rf.Spec.Sentinel.Replicas = 5
+			err := client.EnsureSentinelDeployment(rf, map[string]string{}, ownerRefs)
+			if test.expErr {
+				require.Error(t, err)
+			} else {
+				require.NoError(t, err)
+			}
+
+			_, err = kubecli.CoreV1().ServiceAccounts(rf.Namespace).Get(t.Context(), rfservice.GetSentinelServiceAccountName(rf), metav1.GetOptions{})
+			assert.Equal(t, test.expExists, err == nil)
+			if test.noDelete {
+				for _, action := range kubecli.Actions() {
+					assert.False(t, action.Matches("delete", "serviceaccounts"), "unexpected DELETE of the ServiceAccount")
+				}
+			}
+		})
 	}
 }

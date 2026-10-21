@@ -1,25 +1,34 @@
 package metrics
 
-// Dummy is a handy instnce of a dummy instrumenter, most of the times it will be used on tests.
+// Dummy is a Recorder that discards all the metrics. The tests use it.
 var Dummy = &dummy{
 	ControllerRecorder: dummyControllerRecorder{},
 }
 
-// dummy is a dummy implementation of Instrumenter.
+// dummy implements Recorder and does nothing.
 type dummy struct {
 	ControllerRecorder
 }
 
-func (d *dummy) SetClusterOK(namespace string, name string)    {}
-func (d *dummy) SetClusterError(namespace string, name string) {}
-func (d *dummy) DeleteCluster(namespace string, name string)   {}
-func (d *dummy) RecordEnsureOperation(objectNamespace string, objectName string, objectKind string, resourceName string, status string) {
+func (d *dummy) SetClusterOK(_, _ string)    {}
+func (d *dummy) SetClusterError(_, _ string) {}
+func (d *dummy) DeleteCluster(_, _ string)   {}
+func (d *dummy) SetAutoscaler(_, _ string, _ int64, _ float64, _ int32, _ int64) {
 }
-func (d *dummy) RecordRedisCheck(namespace string, resource string, indicator string, instance string, status string) {
+func (d *dummy) SetAutoscalerPhase(_, _ string, _ int) {}
+func (d *dummy) CountAutoscalerStep(_, _, _ string)    {}
+func (d *dummy) DeleteAutoscaler(_, _ string)          {}
+func (d *dummy) SetSentinelUnknownAddrs(_, _ string, _ int, _ bool) {
 }
-func (d *dummy) RecordSentinelCheck(namespace string, resource string, indicator string, instance string, status string) {
+func (d *dummy) RecordEnsureOperation(_, _, _, _, _ string) {
 }
-func (d dummy) RecordK8sOperation(namespace string, kind string, object string, operation string, status string, err string) {
+func (d *dummy) RecordRedisCheck(_, _, _, _, _ string) {
 }
-func (d dummy) RecordRedisOperation(kind string, IP string, operation string, status string, err string) {
+func (d *dummy) RecordSentinelCheck(_, _, _, _, _ string) {
+}
+func (d *dummy) RecordK8sOperation(_, _, _, _, _, _ string) {
+}
+func (d *dummy) RecordRedisOperation(_, _, _, _, _ string) {
+}
+func (d *dummy) SetPodIP(_, _, _, _ string) {
 }

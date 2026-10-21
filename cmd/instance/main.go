@@ -1,11 +1,8 @@
-// Package main provides the redis-instance binary, which serves as the instance
-// manager for Redis pods managed by redis-operator.
-//
-// This follows the CloudNativePG (CNPG) model where the instance manager runs as
-// PID 1 and manages the database process. This architecture has proven reliable
-// at scale in production Kubernetes environments.
-//
-// See: https://cloudnative-pg.io/documentation/current/instance_manager/
+// Package main provides the redis-instance binary, an instance manager that
+// runs as PID 1 and starts redis-server as a child process. In this fork the
+// operator uses it: an init container copies the binary out of the operator
+// image, and each Redis pod runs it. Upstream Saremox builds the binary but
+// does not use it.
 package main
 
 import (
@@ -16,24 +13,20 @@ import (
 
 	"github.com/saremox/redis-operator/cmd/instance/cleanup"
 	"github.com/saremox/redis-operator/cmd/instance/run"
+	"github.com/saremox/redis-operator/version"
 )
 
 var rootCmd = &cobra.Command{
-	Use:   "redis-instance",
-	Short: "Redis instance manager for redis-operator",
-	Long: `Redis instance manager handles lifecycle operations for Redis instances
-managed by redis-operator.
+	Use:     "redis-instance",
+	Version: version.Version,
+	Short:   "Redis instance manager for redis-operator",
+	Long: `The Redis instance manager runs as PID 1 in a container and starts
+redis-server as a child process. It removes old RDB tempfiles before Redis
+starts, serves health endpoints, forwards the stop signals and reaps zombie
+processes.
 
-This tool follows the CloudNativePG (CNPG) model where the instance manager
-runs as PID 1 in the container and manages the Redis process as a child.
-This architecture provides:
-
-  - Full lifecycle control over the Redis process
-  - Clean signal handling and graceful shutdown
-  - Startup tasks (RDB cleanup) before Redis starts
-  - Foundation for health checks, metrics, and monitoring
-
-See: https://cloudnative-pg.io/documentation/current/instance_manager/`,
+In this fork, the Redis pods that the operator creates run this binary, and
+not redis-server directly. Upstream Saremox does not use it.`,
 	SilenceUsage: true,
 }
 
@@ -42,9 +35,12 @@ func init() {
 	rootCmd.AddCommand(run.NewCmd())
 }
 
+// exit is a variable so that tests can see the exit code without exiting.
+var exit = os.Exit
+
 func main() {
 	if err := rootCmd.Execute(); err != nil {
 		fmt.Fprintln(os.Stderr, err)
-		os.Exit(1)
+		exit(1)
 	}
 }

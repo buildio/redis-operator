@@ -1,6 +1,7 @@
 package service
 
 import (
+	"k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/util/intstr"
 
@@ -11,8 +12,8 @@ import (
 	"github.com/saremox/redis-operator/service/k8s"
 )
 
-// RedisFailoverClient has the minimumm methods that a Redis failover controller needs to satisfy
-// in order to talk with K8s
+// RedisFailoverClient creates, updates and deletes the Kubernetes resources
+// of a RedisFailover.
 type RedisFailoverClient interface {
 	EnsureSentinelService(rFailover *redisfailoverv1.RedisFailover, labels map[string]string, ownerRefs []metav1.OwnerReference) error
 	EnsureSentinelConfigMap(rFailover *redisfailoverv1.RedisFailover, labels map[string]string, ownerRefs []metav1.OwnerReference) error
@@ -28,14 +29,14 @@ type RedisFailoverClient interface {
 	EnsureNotPresentSentinelResources(rFailover *redisfailoverv1.RedisFailover) error
 }
 
-// RedisFailoverKubeClient implements the required methods to talk with kubernetes
+// RedisFailoverKubeClient implements the required methods to talk with kubernetes.
 type RedisFailoverKubeClient struct {
 	K8SService    k8s.Services
 	logger        log.Logger
 	metricsClient metrics.Recorder
 }
 
-// NewRedisFailoverKubeClient creates a new RedisFailoverKubeClient
+// NewRedisFailoverKubeClient creates a new RedisFailoverKubeClient.
 func NewRedisFailoverKubeClient(k8sService k8s.Services, logger log.Logger, metricsClient metrics.Recorder) *RedisFailoverKubeClient {
 	return &RedisFailoverKubeClient{
 		K8SService:    k8sService,
@@ -68,7 +69,7 @@ func generateRedisSlaveRoleLabel() map[string]string {
 	}
 }
 
-// EnsureSentinelService makes sure the sentinel service exists
+// EnsureSentinelService makes sure the sentinel service exists.
 func (r *RedisFailoverKubeClient) EnsureSentinelService(rf *redisfailoverv1.RedisFailover, labels map[string]string, ownerRefs []metav1.OwnerReference) error {
 	svc := generateSentinelService(rf, labels, ownerRefs)
 	err := r.K8SService.CreateOrUpdateService(rf.Namespace, svc)
@@ -76,7 +77,7 @@ func (r *RedisFailoverKubeClient) EnsureSentinelService(rf *redisfailoverv1.Redi
 	return err
 }
 
-// EnsureSentinelConfigMap makes sure the sentinel configmap exists
+// EnsureSentinelConfigMap makes sure the sentinel configmap exists.
 func (r *RedisFailoverKubeClient) EnsureSentinelConfigMap(rf *redisfailoverv1.RedisFailover, labels map[string]string, ownerRefs []metav1.OwnerReference) error {
 	cm := generateSentinelConfigMap(rf, labels, ownerRefs)
 	err := r.K8SService.CreateOrUpdateConfigMap(rf.Namespace, cm)
@@ -84,17 +85,18 @@ func (r *RedisFailoverKubeClient) EnsureSentinelConfigMap(rf *redisfailoverv1.Re
 	return err
 }
 
-// EnsureSentinelDeployment makes sure the sentinel deployment exists in the desired state
+// EnsureSentinelDeployment makes sure the sentinel deployment exists in the desired state.
 func (r *RedisFailoverKubeClient) EnsureSentinelDeployment(rf *redisfailoverv1.RedisFailover, labels map[string]string, ownerRefs []metav1.OwnerReference) error {
 	if !rf.Spec.Sentinel.DisablePodDisruptionBudget {
 		if err := r.ensurePodDisruptionBudget(rf, sentinelName, sentinelRoleName, rf.Spec.Sentinel.PodDisruptionBudgetMinAvailable, labels, ownerRefs, rf.Spec.Sentinel.Replicas); err != nil {
 			return err
 		}
+	} else if err := r.deletePodDisruptionBudget(rf, sentinelName); err != nil {
+		return err
 	}
 
-	// Only auto-provision a ServiceAccount when the user hasn't set one themselves:
-	// if they did, it's their responsibility to have already created it, and we must
-	// not touch it.
+	// The operator creates a ServiceAccount only when the user did not set
+	// one. The user creates and manages a ServiceAccount that the user sets.
 	if rf.Spec.Sentinel.ServiceAccountName == "" {
 		if err := r.ensureSentinelServiceAccount(rf, labels, ownerRefs); err != nil {
 			return err
@@ -105,7 +107,34 @@ func (r *RedisFailoverKubeClient) EnsureSentinelDeployment(rf *redisfailoverv1.R
 	err := r.K8SService.CreateOrUpdateDeployment(rf.Namespace, d)
 
 	r.setEnsureOperationMetrics(d.Namespace, d.Name, "Deployment", rf.Name, err)
-	return err
+	if err != nil {
+		return err
+	}
+	return r.deleteUnusedSentinelServiceAccount(rf)
+}
+
+// deleteUnusedSentinelServiceAccount removes the ServiceAccount that the operator
+// created before the user set sentinel.serviceAccountName. It waits until no
+// Sentinel pod uses it, because the old ReplicaSet cannot recreate a pod without it.
+func (r *RedisFailoverKubeClient) deleteUnusedSentinelServiceAccount(rf *redisfailoverv1.RedisFailover) error {
+	name := GetSentinelServiceAccountName(rf)
+	if rf.Spec.Sentinel.ServiceAccountName == "" || rf.Spec.Sentinel.ServiceAccountName == name {
+		return nil
+	}
+	sa, err := r.K8SService.GetServiceAccount(rf.Namespace, name)
+	if err != nil || !metav1.IsControlledBy(sa, rf) {
+		return r.cleanupError(rf, "ServiceAccount", name, err)
+	}
+	pods, err := r.K8SService.GetDeploymentPods(rf.Namespace, GetSentinelName(rf))
+	if err != nil {
+		return r.cleanupError(rf, "ServiceAccount", name, err)
+	}
+	for _, pod := range pods.Items {
+		if pod.Spec.ServiceAccountName == name {
+			return nil
+		}
+	}
+	return r.cleanupError(rf, "ServiceAccount", name, r.K8SService.DeleteServiceAccount(rf.Namespace, name))
 }
 
 // ensureSentinelServiceAccount makes sure the auto-provisioned Sentinel ServiceAccount exists.
@@ -116,12 +145,14 @@ func (r *RedisFailoverKubeClient) ensureSentinelServiceAccount(rf *redisfailover
 	return err
 }
 
-// EnsureRedisStatefulset makes sure the redis statefulset exists in the desired state
+// EnsureRedisStatefulset makes sure the redis statefulset exists in the desired state.
 func (r *RedisFailoverKubeClient) EnsureRedisStatefulset(rf *redisfailoverv1.RedisFailover, labels map[string]string, ownerRefs []metav1.OwnerReference) error {
 	if !rf.Spec.Redis.DisablePodDisruptionBudget {
 		if err := r.ensurePodDisruptionBudget(rf, redisName, redisRoleName, rf.Spec.Redis.PodDisruptionBudgetMinAvailable, labels, ownerRefs, rf.Spec.Redis.Replicas); err != nil {
 			return err
 		}
+	} else if err := r.deletePodDisruptionBudget(rf, redisName); err != nil {
+		return err
 	}
 
 	password, err := k8s.GetRedisPassword(r.K8SService, rf)
@@ -136,10 +167,10 @@ func (r *RedisFailoverKubeClient) EnsureRedisStatefulset(rf *redisfailoverv1.Red
 	return err
 }
 
-// EnsureRedisConfigMap makes sure the Redis ConfigMap exists
+// EnsureRedisConfigMap makes sure the Redis ConfigMap exists.
 func (r *RedisFailoverKubeClient) EnsureRedisConfigMap(rf *redisfailoverv1.RedisFailover, labels map[string]string, ownerRefs []metav1.OwnerReference) error {
-	// The password is passed to redis-server via env-backed command args, not
-	// written into this ConfigMap, so it is not fetched here.
+	// The password is not in this ConfigMap. Without a custom redis.command,
+	// redis-server gets it as arguments from the REDIS_PASSWORD env var.
 	cm := generateRedisConfigMap(rf, labels, ownerRefs)
 	err := r.K8SService.CreateOrUpdateConfigMap(rf.Namespace, cm)
 
@@ -147,7 +178,7 @@ func (r *RedisFailoverKubeClient) EnsureRedisConfigMap(rf *redisfailoverv1.Redis
 	return err
 }
 
-// EnsureRedisShutdownConfigMap makes sure the redis configmap with shutdown script exists
+// EnsureRedisShutdownConfigMap makes sure the redis configmap with shutdown script exists.
 func (r *RedisFailoverKubeClient) EnsureRedisShutdownConfigMap(rf *redisfailoverv1.RedisFailover, labels map[string]string, ownerRefs []metav1.OwnerReference) error {
 	if rf.Spec.Redis.ShutdownConfigMap != "" {
 		if _, err := r.K8SService.GetConfigMap(rf.Namespace, rf.Spec.Redis.ShutdownConfigMap); err != nil {
@@ -162,7 +193,7 @@ func (r *RedisFailoverKubeClient) EnsureRedisShutdownConfigMap(rf *redisfailover
 	return nil
 }
 
-// EnsureRedisReadinessConfigMap makes sure the redis configmap with shutdown script exists
+// EnsureRedisReadinessConfigMap makes sure the redis configmap with readiness script exists.
 func (r *RedisFailoverKubeClient) EnsureRedisReadinessConfigMap(rf *redisfailoverv1.RedisFailover, labels map[string]string, ownerRefs []metav1.OwnerReference) error {
 	cm := generateRedisReadinessConfigMap(rf, labels, ownerRefs)
 	err := r.K8SService.CreateOrUpdateConfigMap(rf.Namespace, cm)
@@ -170,7 +201,7 @@ func (r *RedisFailoverKubeClient) EnsureRedisReadinessConfigMap(rf *redisfailove
 	return err
 }
 
-// EnsureRedisService makes sure the redis statefulset exists
+// EnsureRedisService makes sure the headless redis service exists.
 func (r *RedisFailoverKubeClient) EnsureRedisService(rf *redisfailoverv1.RedisFailover, labels map[string]string, ownerRefs []metav1.OwnerReference) error {
 	svc := generateRedisService(rf, labels, ownerRefs)
 	err := r.K8SService.CreateOrUpdateService(rf.Namespace, svc)
@@ -179,41 +210,46 @@ func (r *RedisFailoverKubeClient) EnsureRedisService(rf *redisfailoverv1.RedisFa
 	return err
 }
 
-// EnsureNotPresentRedisService makes sure the redis service is not present
+// EnsureNotPresentRedisService makes sure the redis service is not present.
 func (r *RedisFailoverKubeClient) EnsureNotPresentRedisService(rf *redisfailoverv1.RedisFailover) error {
 	name := GetRedisName(rf)
 	namespace := rf.Namespace
-	// If the service exists (no get error), delete it
-	if _, err := r.K8SService.GetService(namespace, name); err == nil {
+	// Delete the service only when this RedisFailover controls it. The name
+	// can also belong to another RedisFailover.
+	if svc, err := r.K8SService.GetService(namespace, name); err == nil && metav1.IsControlledBy(svc, rf) {
 		return r.K8SService.DeleteService(namespace, name)
 	}
 	return nil
 }
 
-// EnsureNotPresentSentinelResources cleans up Sentinel resources when sentinel.enabled is false
+// EnsureNotPresentSentinelResources deletes the Sentinel resources when
+// SentinelsAllowed is false: with sentinel.enabled false, or during a
+// bootstrap without bootstrapNode.allowSentinels.
 func (r *RedisFailoverKubeClient) EnsureNotPresentSentinelResources(rf *redisfailoverv1.RedisFailover) error {
 	name := GetSentinelName(rf)
 	namespace := rf.Namespace
 
+	// Each delete requires that this RedisFailover controls the object. The
+	// name can also belong to another RedisFailover.
 	// Delete Sentinel Deployment
-	if _, err := r.K8SService.GetDeployment(namespace, name); err == nil {
-		r.logger.WithField("namespace", namespace).WithField("name", name).Info("Deleting Sentinel Deployment")
+	if d, err := r.K8SService.GetDeployment(namespace, name); err == nil && metav1.IsControlledBy(d, rf) {
+		r.logger.WithField("redisfailover", rf.Name).WithField("namespace", namespace).WithField("name", name).Info("Deleting Sentinel Deployment")
 		if err := r.K8SService.DeleteDeployment(namespace, name); err != nil {
 			return err
 		}
 	}
 
 	// Delete Sentinel Service
-	if _, err := r.K8SService.GetService(namespace, name); err == nil {
-		r.logger.WithField("namespace", namespace).WithField("name", name).Info("Deleting Sentinel Service")
+	if svc, err := r.K8SService.GetService(namespace, name); err == nil && metav1.IsControlledBy(svc, rf) {
+		r.logger.WithField("redisfailover", rf.Name).WithField("namespace", namespace).WithField("name", name).Info("Deleting Sentinel Service")
 		if err := r.K8SService.DeleteService(namespace, name); err != nil {
 			return err
 		}
 	}
 
 	// Delete Sentinel ConfigMap
-	if _, err := r.K8SService.GetConfigMap(namespace, name); err == nil {
-		r.logger.WithField("namespace", namespace).WithField("name", name).Info("Deleting Sentinel ConfigMap")
+	if cm, err := r.K8SService.GetConfigMap(namespace, name); err == nil && metav1.IsControlledBy(cm, rf) {
+		r.logger.WithField("redisfailover", rf.Name).WithField("namespace", namespace).WithField("name", name).Info("Deleting Sentinel ConfigMap")
 		if err := r.K8SService.DeleteConfigMap(namespace, name); err != nil {
 			return err
 		}
@@ -221,8 +257,8 @@ func (r *RedisFailoverKubeClient) EnsureNotPresentSentinelResources(rf *redisfai
 
 	// Delete Sentinel PodDisruptionBudget
 	pdbName := generateName(sentinelName, rf.Name)
-	if _, err := r.K8SService.GetPodDisruptionBudget(namespace, pdbName); err == nil {
-		r.logger.WithField("namespace", namespace).WithField("name", pdbName).Info("Deleting Sentinel PodDisruptionBudget")
+	if pdb, err := r.K8SService.GetPodDisruptionBudget(namespace, pdbName); err == nil && metav1.IsControlledBy(pdb, rf) {
+		r.logger.WithField("redisfailover", rf.Name).WithField("namespace", namespace).WithField("name", pdbName).Info("Deleting Sentinel PodDisruptionBudget")
 		if err := r.K8SService.DeletePodDisruptionBudget(namespace, pdbName); err != nil {
 			return err
 		}
@@ -233,8 +269,8 @@ func (r *RedisFailoverKubeClient) EnsureNotPresentSentinelResources(rf *redisfai
 	// ServiceAccountName is theirs to manage, not ours to delete.
 	if rf.Spec.Sentinel.ServiceAccountName == "" {
 		saName := GetSentinelServiceAccountName(rf)
-		if _, err := r.K8SService.GetServiceAccount(namespace, saName); err == nil {
-			r.logger.WithField("namespace", namespace).WithField("name", saName).Info("Deleting Sentinel ServiceAccount")
+		if sa, err := r.K8SService.GetServiceAccount(namespace, saName); err == nil && metav1.IsControlledBy(sa, rf) {
+			r.logger.WithField("redisfailover", rf.Name).WithField("namespace", namespace).WithField("name", saName).Info("Deleting Sentinel ServiceAccount")
 			if err := r.K8SService.DeleteServiceAccount(namespace, saName); err != nil {
 				return err
 			}
@@ -244,7 +280,7 @@ func (r *RedisFailoverKubeClient) EnsureNotPresentSentinelResources(rf *redisfai
 	return nil
 }
 
-// EnsureRedisMasterService makes sure the redis master service exists
+// EnsureRedisMasterService makes sure the redis master service exists.
 func (r *RedisFailoverKubeClient) EnsureRedisMasterService(rf *redisfailoverv1.RedisFailover, labels map[string]string, ownerRefs []metav1.OwnerReference) error {
 	svc := generateRedisMasterService(rf, labels, ownerRefs)
 	err := r.K8SService.CreateOrUpdateService(rf.Namespace, svc)
@@ -253,7 +289,7 @@ func (r *RedisFailoverKubeClient) EnsureRedisMasterService(rf *redisfailoverv1.R
 	return err
 }
 
-// EnsureRedisSlaveService makes sure the redis slave service exists
+// EnsureRedisSlaveService makes sure the redis slave service exists.
 func (r *RedisFailoverKubeClient) EnsureRedisSlaveService(rf *redisfailoverv1.RedisFailover, labels map[string]string, ownerRefs []metav1.OwnerReference) error {
 	svc := generateRedisSlaveService(rf, labels, ownerRefs)
 	err := r.K8SService.CreateOrUpdateService(rf.Namespace, svc)
@@ -265,7 +301,7 @@ func (r *RedisFailoverKubeClient) EnsureRedisSlaveService(rf *redisfailoverv1.Re
 // ensurePodDisruptionBudget creates or updates a PDB for the given component.
 // replicas must be the replica count of the component being protected (not a different component).
 // minAvailableOverride, when non-nil, replaces the replicas-derived default.
-func (r *RedisFailoverKubeClient) ensurePodDisruptionBudget(rf *redisfailoverv1.RedisFailover, name string, component string, minAvailableOverride *intstr.IntOrString, labels map[string]string, ownerRefs []metav1.OwnerReference, replicas int32) error {
+func (r *RedisFailoverKubeClient) ensurePodDisruptionBudget(rf *redisfailoverv1.RedisFailover, name, component string, minAvailableOverride *intstr.IntOrString, labels map[string]string, ownerRefs []metav1.OwnerReference, replicas int32) error {
 	name = generateName(name, rf.Name)
 	namespace := rf.Namespace
 
@@ -282,13 +318,39 @@ func (r *RedisFailoverKubeClient) ensurePodDisruptionBudget(rf *redisfailoverv1.
 
 	pdb := generatePodDisruptionBudget(name, namespace, metaLabels, ownerRefs, minAvailable, selectorLabels)
 	err := r.K8SService.CreateOrUpdatePodDisruptionBudget(namespace, pdb)
-	r.setEnsureOperationMetrics(pdb.Namespace, pdb.Name, "PodDisruptionBudget" /* pdb.TypeMeta.Kind isnt working;  pdb.Kind isnt working either */, rf.Name, err)
+	r.setEnsureOperationMetrics(pdb.Namespace, pdb.Name, "PodDisruptionBudget" /* the generated object has no TypeMeta.Kind */, rf.Name, err)
 	return err
 }
 
-func (r *RedisFailoverKubeClient) setEnsureOperationMetrics(objectNamespace string, objectName string, objectKind string, ownerName string, err error) {
+// deletePodDisruptionBudget removes the PDB of a component whose PDB the user disabled.
+// A PDB that stays blocks the node drains that the user disabled it for.
+func (r *RedisFailoverKubeClient) deletePodDisruptionBudget(rf *redisfailoverv1.RedisFailover, name string) error {
+	pdbName := generateName(name, rf.Name)
+	pdb, err := r.K8SService.GetPodDisruptionBudget(rf.Namespace, pdbName)
+	if err != nil || !metav1.IsControlledBy(pdb, rf) {
+		return r.cleanupError(rf, "PodDisruptionBudget", pdbName, err)
+	}
+	return r.cleanupError(rf, "PodDisruptionBudget", pdbName, r.K8SService.DeletePodDisruptionBudget(rf.Namespace, pdbName))
+}
+
+// cleanupError ignores a missing object, and logs a missing RBAC verb. The
+// RedisFailover works with an unused object, so the cleanup must not stop the reconcile.
+func (r *RedisFailoverKubeClient) cleanupError(rf *redisfailoverv1.RedisFailover, kind, name string, err error) error {
+	if errors.IsForbidden(err) {
+		r.logger.WithField("namespace", rf.Namespace).WithField("redisfailover", rf.Name).
+			Warningf("cannot delete the unused %s %s: %v", kind, name, err)
+		return nil
+	}
+	if errors.IsNotFound(err) {
+		return nil
+	}
+	return err
+}
+
+func (r *RedisFailoverKubeClient) setEnsureOperationMetrics(objectNamespace, objectName, objectKind, ownerName string, err error) {
 	if nil != err {
 		r.metricsClient.RecordEnsureOperation(objectNamespace, objectName, objectKind, ownerName, metrics.FAIL)
+		return
 	}
 	r.metricsClient.RecordEnsureOperation(objectNamespace, objectName, objectKind, ownerName, metrics.SUCCESS)
 }
