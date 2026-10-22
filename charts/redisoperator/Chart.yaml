@@ -3,11 +3,11 @@ name: redis-operator
 version: 4.2.0-rc2
 appVersion: "4.2.0-rc2"
 description: A Helm chart for the Redis Operator
-home: https://github.com/saremox/redis-operator
+home: https://github.com/buildio/redis-operator
 keywords:
   - "golang"
   - "operator"
   - "cluster"
 sources:
-  - https://github.com/saremox/redis-operator
+  - https://github.com/buildio/redis-operator
 kubeVersion: ">=1.32.0-0"
