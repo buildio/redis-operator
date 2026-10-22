@@ -6,5 +6,5 @@ labels:
       app.kubernetes.io/version: "4.2.0-rc2"
 
 images:
-  - name: ghcr.io/saremox/redis-operator
+  - name: ghcr.io/buildio/redis-operator
     newTag: "4.2.0-rc2"

@@ -1,6 +1,22 @@
 # redis-operator
 
-This is a fork of the `spotahome/redis-operator` repository.
+This is the buildio fork of `Saremox/redis-operator`, which is itself a fork of
+the archived `spotahome/redis-operator`.
+
+## Differences from Saremox/redis-operator
+
+The rest of this README comes from upstream. These points apply only to this
+fork:
+
+- **The instance manager is always on.** Since 4.0.0, an init container runs
+  `redis-instance bootstrap` to put the binary of the operator image on a
+  shared volume, and the Redis container runs `redis-instance run` as PID 1.
+  The liveness and the readiness probes are HTTP probes against its health
+  server. Upstream builds the same binary but does not use it. Set
+  `spec.redis.instanceManagerImage` to give a different image; the default is
+  `DefaultInstanceManagerImage` in `api/redisfailover/v1/defaults.go`.
+- **The images and the charts are at `ghcr.io/buildio`**, not at
+  `ghcr.io/saremox`. Each upstream link below has a buildio equivalent.
 
 [![Build Status](https://github.com/Saremox/redis-operator/actions/workflows/ci.yaml/badge.svg?branch=main)](https://github.com/Saremox/redis-operator)
 [![Go Report Card](https://goreportcard.com/badge/github.com/Saremox/redis-operator)](https://goreportcard.com/report/github.com/Saremox/redis-operator)

@@ -2,7 +2,7 @@
 
 # The image of the operator.
 image:
-  repository: ghcr.io/saremox/redis-operator
+  repository: ghcr.io/buildio/redis-operator
   pullPolicy: IfNotPresent
   # An empty tag uses the appVersion of the chart.
   tag: ""
