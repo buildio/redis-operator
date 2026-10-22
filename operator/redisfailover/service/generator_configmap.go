@@ -220,6 +220,9 @@ func generateRedisShutdownConfigMap(rf *redisfailoverv1.RedisFailover, labels ma
 	namespace := rf.Namespace
 
 	labels = util.MergeLabels(labels, generateSelectorLabels(redisRoleName, rf.Name))
+	// In operator-managed mode this fork attaches no preStop hook, so nothing
+	// runs this script. The ConfigMap and its mount stay the same in both
+	// modes. See redisLifecycle in generator_statefulset.go.
 	shutdownContent := ""
 	if rf.SentinelsAllowed() {
 		shutdownContent = fmt.Sprintf(redisShutdownFailoverScript, GetSentinelName(rf), port, SentinelMasterName(rf))

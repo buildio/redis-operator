@@ -138,16 +138,10 @@ func generateRedisContainer(rf *redisfailoverv1.RedisFailover) corev1.Container 
 				Protocol:      corev1.ProtocolTCP,
 			},
 		},
-		VolumeMounts: getRedisVolumeMounts(rf),
-		Command:      getRedisCommand(rf),
-		Resources:    rf.Spec.Redis.Resources,
-		Lifecycle: &corev1.Lifecycle{
-			PreStop: &corev1.LifecycleHandler{
-				Exec: &corev1.ExecAction{
-					Command: []string{"/bin/sh", "/redis-shutdown/shutdown.sh"},
-				},
-			},
-		},
+		VolumeMounts:   getRedisVolumeMounts(rf),
+		Command:        getRedisCommand(rf),
+		Resources:      rf.Spec.Redis.Resources,
+		Lifecycle:      redisLifecycle(rf),
 		LivenessProbe:  redisLivenessProbe(rf),
 		ReadinessProbe: redisReadinessProbe(rf),
 		StartupProbe:   redisStartupProbe(rf),
@@ -156,6 +150,35 @@ func generateRedisContainer(rf *redisfailoverv1.RedisFailover) corev1.Container 
 		container.Ports = append(container.Ports, instanceManagerPort())
 	}
 	return container
+}
+
+// redisLifecycle returns the preStop hook of the Redis container, or nil.
+//
+// In Sentinel mode the hook asks Sentinel to fail over before the master
+// stops, which nothing else does.
+//
+// In operator-managed mode this fork attaches no hook. The hook ran a
+// synchronous SAVE, and that was wrong three times. It was not necessary:
+// Redis saves on SIGTERM by itself because the configuration has save points,
+// and the instance manager runs as PID 1 and forwards SIGTERM to Redis. It
+// was harmful: the terminationGracePeriodSeconds starts before the hook, so
+// each second of the hook came out of the 25s window of the manager. It was
+// also fragile: SAVE is synchronous, so against an instance already in a
+// BGSAVE it never returned. A production replica stopped this way.
+//
+// The test is SentinelsAllowed, not instanceManagerEnabled, because the
+// manager also runs in Sentinel mode.
+func redisLifecycle(rf *redisfailoverv1.RedisFailover) *corev1.Lifecycle {
+	if instanceManagerEnabled(rf) && !rf.SentinelsAllowed() {
+		return nil
+	}
+	return &corev1.Lifecycle{
+		PreStop: &corev1.LifecycleHandler{
+			Exec: &corev1.ExecAction{
+				Command: []string{"/bin/sh", "/redis-shutdown/shutdown.sh"},
+			},
+		},
+	}
 }
 
 func redisVolumeClaimTemplates(rf *redisfailoverv1.RedisFailover, ownerRefs []metav1.OwnerReference) []corev1.PersistentVolumeClaim {
