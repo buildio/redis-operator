@@ -132,19 +132,39 @@ func generateRedisContainer(rf *redisfailoverv1.RedisFailover) corev1.Container 
 				Protocol:      corev1.ProtocolTCP,
 			},
 		},
-		VolumeMounts: getRedisVolumeMounts(rf),
-		Command:      getRedisCommand(rf),
-		Resources:    rf.Spec.Redis.Resources,
-		Lifecycle: &corev1.Lifecycle{
-			PreStop: &corev1.LifecycleHandler{
-				Exec: &corev1.ExecAction{
-					Command: []string{"/bin/sh", "/redis-shutdown/shutdown.sh"},
-				},
-			},
-		},
+		VolumeMounts:   getRedisVolumeMounts(rf),
+		Command:        getRedisCommand(rf),
+		Resources:      rf.Spec.Redis.Resources,
+		Lifecycle:      redisLifecycle(rf),
 		LivenessProbe:  redisLivenessProbe(rf),
 		ReadinessProbe: redisReadinessProbe(rf),
 		StartupProbe:   redisStartupProbe(rf),
+	}
+}
+
+// redisLifecycle returns the preStop hook of the Redis container, or nil.
+//
+// With Sentinel the hook asks Sentinel to fail the master over before it
+// stops, and nothing else does this.
+//
+// Without Sentinel the script is only "redis-cli save", and that is wrong
+// three times. It is not needed: redis.conf has save points and getRedisCommand
+// keeps redis-server as PID 1, so Redis saves on SIGTERM by itself. It is
+// costly: the terminationGracePeriodSeconds countdown starts before the hook
+// runs, so every second in the hook comes out of the window that Redis has to
+// stop cleanly. It is fragile: SAVE is synchronous, so against an instance
+// that is already in a BGSAVE it does not return, and the kubelet then kills
+// the pod at the end of the grace period.
+func redisLifecycle(rf *redisfailoverv1.RedisFailover) *corev1.Lifecycle {
+	if !rf.SentinelsAllowed() {
+		return nil
+	}
+	return &corev1.Lifecycle{
+		PreStop: &corev1.LifecycleHandler{
+			Exec: &corev1.ExecAction{
+				Command: []string{"/bin/sh", "/redis-shutdown/shutdown.sh"},
+			},
+		},
 	}
 }
 
