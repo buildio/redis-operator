@@ -93,16 +93,6 @@
             ],
             "image": "redis:7.2.12-alpine",
             "imagePullPolicy": "Always",
-            "lifecycle": {
-              "preStop": {
-                "exec": {
-                  "command": [
-                    "/bin/sh",
-                    "/redis-shutdown/shutdown.sh"
-                  ]
-                }
-              }
-            },
             "livenessProbe": {
               "failureThreshold": 6,
               "httpGet": {
