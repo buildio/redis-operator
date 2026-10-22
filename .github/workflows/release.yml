@@ -272,7 +272,7 @@ jobs:
       - name: Generate deployment manifests
         run: |
           cd manifests/kustomize/overlays/default
-          kustomize edit set image ghcr.io/saremox/redis-operator=${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ github.ref_name }}
+          kustomize edit set image ghcr.io/buildio/redis-operator=${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ github.ref_name }}
           cd ../../../..
 
           kustomize build manifests/kustomize/overlays/default > release-artifacts/redis-operator.yaml

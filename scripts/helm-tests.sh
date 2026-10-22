@@ -39,7 +39,7 @@ version=$(sed -n 's/^version: //p' ${chart}/Chart.yaml)
 tar -cf - scripts/release.sh example/operator manifests/kustomize ${chart}/Chart.yaml \
     | tar -xf - -C "${check_tree}"
 "${check_tree}/scripts/release.sh" check-version "${version}" >/dev/null
-sed -i 's|ghcr.io/saremox/redis-operator:|ghcr.io/example/redis-operator:|' \
+sed -i 's|ghcr.io/buildio/redis-operator:|ghcr.io/example/redis-operator:|' \
     "${check_tree}/example/operator/operator.yaml"
 if "${check_tree}/scripts/release.sh" check-version "${version}" >/dev/null 2>&1; then
     echo "check-version passed with a renamed image in example/operator/operator.yaml." >&2
